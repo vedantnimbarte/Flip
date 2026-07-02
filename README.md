@@ -77,6 +77,7 @@ asynchronously, so disk I/O and copies hide under GPU compute.
 | Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) |
 | PagedAttention block-paged KV cache | [`src/cache/paged.rs`](src/cache/paged.rs) |
 | Tiered CPU-RAM LRU layer cache | [`src/cache/ram.rs`](src/cache/ram.rs) |
+| Residual activation pool (buffer reuse) | [`src/activation`](src/activation) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
@@ -236,6 +237,7 @@ src/
 ├── swap/             # linear layer-swap cycle (windows over the model)
 ├── pipeline/         # double-buffered A/B schedule + host executor
 ├── cache/            # PagedAttention KV cache + tiered CPU-RAM layer cache
+├── activation/       # residual activation pool (buffer reuse)
 └── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
 tests/
 └── phase1.rs         # integration tests
