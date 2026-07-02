@@ -5,6 +5,8 @@
 
 pub mod error;
 pub mod model;
+pub mod storage;
 
 pub use error::{FlipError, Result};
 pub use model::{ModelConfig, QuantScheme};
+pub use storage::{MmapShard, MmapStore};
