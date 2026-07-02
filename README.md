@@ -67,6 +67,11 @@ The transformer math itself sits behind a `ComputeKernel` trait, and a
 whole orchestration testable off-GPU; a real CUDA/HIP matmul/attention kernel
 drops in behind the same trait for actual inference.
 
+[`src/forward/cpu.rs`](src/forward/cpu.rs) provides the real math as a CPU
+reference — a Llama-style single-token decode block (RMSNorm, RoPE, grouped-query
+attention over the KV history, SwiGLU MLP). It is the correctness oracle and
+porting spec the GPU kernel mirrors, not the production path.
+
 ## Components
 
 | Component | Module |
@@ -85,6 +90,7 @@ drops in behind the same trait for actual inference.
 | Tiered CPU-RAM LRU layer cache | [`src/cache/ram.rs`](src/cache/ram.rs) |
 | Residual activation pool (buffer reuse) | [`src/activation`](src/activation) |
 | Forward-pass orchestration (`ComputeKernel` trait + stub) | [`src/forward`](src/forward) |
+| CPU transformer-block reference (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
