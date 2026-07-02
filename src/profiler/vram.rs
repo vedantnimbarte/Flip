@@ -1,0 +1,162 @@
+//! Dynamic VRAM profiling math engine (`specs.md` §3.1).
+//!
+//! Implements the layer-budget formula:
+//!
+//! ```text
+//!                    ⌊ M_free − M_safety − M_kv_total ⌋
+//! LayersToLoad  =    ────────────────────────────────
+//!                            M_layer_weight
+//! ```
+//!
+//! * `M_free`        — runtime free VRAM from `cudaMemGetInfo` (`crate::cuda`).
+//! * `M_safety`      — fixed cushion for activation spikes (default 1.5 GiB).
+//! * `M_kv_total`    — bytes the PagedAttention KV cache holds for the *whole*
+//!   target context. In a layer-streaming engine the KV history for every layer
+//!   stays resident in the Cache Zone even as weights are swapped, so this term
+//!   sums across `num_layers` — see [`VramProfiler::kv_total_bytes`].
+//! * `M_layer_weight`— average bytes of one streamed transformer block.
+//!
+//! All arithmetic is done in `u64`/`f64` with saturating subtraction so an
+//! over-subscribed device yields a zero/one-layer budget instead of underflow.
+
+use crate::cuda;
+use crate::error::Result;
+use crate::model::ModelConfig;
+
+/// Default safety cushion: 1.5 GiB, per `specs.md` §3.1 (`M_safety`).
+pub const DEFAULT_SAFETY_MARGIN_BYTES: u64 = 3 * 512 * 1024 * 1024; // 1.5 * 2^30
+
+/// Bytes per KV element. KV cache is stored FP16 (`specs.md` §3.1: "2 bytes").
+const KV_BYTES_PER_ELEMENT: u64 = 2;
+
+/// Configurable inputs to the VRAM math.
+#[derive(Debug, Clone)]
+pub struct VramProfiler {
+    /// Target context length `L_context` (tokens) the KV cache is sized for.
+    pub target_context: u32,
+    /// `M_safety` cushion in bytes.
+    pub safety_margin_bytes: u64,
+}
+
+impl Default for VramProfiler {
+    fn default() -> Self {
+        Self {
+            target_context: 8192,
+            safety_margin_bytes: DEFAULT_SAFETY_MARGIN_BYTES,
+        }
+    }
+}
+
+/// A fully itemized profiling result. Every term is exposed so the decision is
+/// auditable in logs rather than a bare layer count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VramPlan {
+    /// `M_free` observed at profile time.
+    pub free_bytes: u64,
+    /// `M_safety` applied.
+    pub safety_bytes: u64,
+    /// `M_kv_total` reserved for the KV cache across all layers.
+    pub kv_total_bytes: u64,
+    /// `M_layer_weight` — size of one streamed block.
+    pub per_layer_weight_bytes: u64,
+    /// `M_free − M_safety − M_kv_total`, saturated at 0.
+    pub usable_bytes: u64,
+    /// Final `LayersToLoad`, clamped to `[1, num_layers]`.
+    pub layers_to_load: u32,
+    /// The model's total layer count, for context.
+    pub num_layers: u32,
+}
+
+impl VramPlan {
+    /// Fraction of the model resident in VRAM at once (0.0–1.0).
+    pub fn resident_fraction(&self) -> f64 {
+        if self.num_layers == 0 {
+            0.0
+        } else {
+            self.layers_to_load as f64 / self.num_layers as f64
+        }
+    }
+
+    /// How many streaming passes one full forward pass requires.
+    pub fn stream_passes(&self) -> u32 {
+        if self.layers_to_load == 0 {
+            0
+        } else {
+            self.num_layers.div_ceil(self.layers_to_load)
+        }
+    }
+}
+
+impl VramProfiler {
+    /// Construct a profiler for a given context length using the default safety
+    /// margin.
+    pub fn new(target_context: u32) -> Self {
+        Self {
+            target_context,
+            ..Self::default()
+        }
+    }
+
+    /// Override the safety cushion (builder-style).
+    pub fn with_safety_margin_bytes(mut self, bytes: u64) -> Self {
+        self.safety_margin_bytes = bytes;
+        self
+    }
+
+    /// KV-cache bytes for a **single** layer across the full target context:
+    /// `2 (K,V) × N_kv_heads × D_head × 2 bytes × L_context`.
+    pub fn kv_bytes_per_layer(&self, config: &ModelConfig) -> u64 {
+        let per_token = 2 * config.num_kv_heads as u64
+            * config.head_dim() as u64
+            * KV_BYTES_PER_ELEMENT;
+        per_token * self.target_context as u64
+    }
+
+    /// Total KV-cache footprint (`M_kv_total`) — per-layer KV summed over every
+    /// layer, since all layers' histories stay resident while weights stream.
+    pub fn kv_total_bytes(&self, config: &ModelConfig) -> u64 {
+        self.kv_bytes_per_layer(config) * config.num_layers as u64
+    }
+
+    /// Average bytes of one streamed transformer block (`M_layer_weight`).
+    pub fn per_layer_weight_bytes(&self, config: &ModelConfig) -> u64 {
+        let model_total_bytes =
+            config.estimated_total_params() as f64 * config.quant.bytes_per_param();
+        (model_total_bytes / config.num_layers as f64).ceil() as u64
+    }
+
+    /// Pure profiling step: compute the plan from an explicit `free_bytes`.
+    /// Kept side-effect-free so it can be unit-tested without a GPU.
+    pub fn plan_with_free(&self, config: &ModelConfig, free_bytes: u64) -> VramPlan {
+        let kv_total = self.kv_total_bytes(config);
+        let per_layer_weight = self.per_layer_weight_bytes(config).max(1);
+
+        let usable = free_bytes
+            .saturating_sub(self.safety_margin_bytes)
+            .saturating_sub(kv_total);
+
+        let raw = usable / per_layer_weight;
+        // Streaming requires at least one layer slot resident; cap at the model
+        // size. Matches `specs.md` §3.1 `max(1, min(calc, num_layers))`.
+        let layers_to_load = raw
+            .clamp(1, config.num_layers as u64) as u32;
+
+        VramPlan {
+            free_bytes,
+            safety_bytes: self.safety_margin_bytes,
+            kv_total_bytes: kv_total,
+            per_layer_weight_bytes: per_layer_weight,
+            usable_bytes: usable,
+            layers_to_load,
+            num_layers: config.num_layers,
+        }
+    }
+
+    /// Profile against the live device, querying `M_free` via `cudaMemGetInfo`.
+    /// Errors with [`crate::error::FlipError::CudaUnavailable`] on a non-CUDA
+    /// build — use [`plan_with_free`](Self::plan_with_free) for off-GPU planning.
+    pub fn profile(&self, config: &ModelConfig) -> Result<VramPlan> {
+        let dev = cuda::mem_get_info()?;
+        Ok(self.plan_with_free(config, dev.free))
+    }
+}
