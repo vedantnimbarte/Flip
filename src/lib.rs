@@ -3,6 +3,7 @@
 //! Phase 1 (Local Foundation) library surface. Modules are added
 //! bottom-up as the engine is built; see `PRD.md` §5 for the phase map.
 
+pub mod cache;
 pub mod error;
 pub mod gpu;
 pub mod memory;
@@ -12,6 +13,7 @@ pub mod profiler;
 pub mod storage;
 pub mod swap;
 
+pub use cache::{KvCacheConfig, PagedKvCache};
 pub use error::{FlipError, Result};
 pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};

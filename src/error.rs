@@ -51,6 +51,13 @@ pub enum FlipError {
     #[error("host memory allocation failed for {bytes} bytes (align {align})")]
     HostAlloc { bytes: usize, align: usize },
 
+    #[error("KV cache pool exhausted: need {requested} more block(s), {free} free of {total}")]
+    KvCacheExhausted {
+        requested: u32,
+        free: u32,
+        total: u32,
+    },
+
     #[error("GPU runtime error ({api}): code {code}")]
     Gpu { api: &'static str, code: i32 },
 
