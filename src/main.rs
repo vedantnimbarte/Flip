@@ -1,60 +1,119 @@
-//! `flip` binary — Phase 1 demonstration entry point.
+//! `flip` binary — command-line entry point (`specs.md` §4).
 //!
-//! The full `flip serve` CLI (clap-based argument parsing, the OpenAI-compatible
-//! server) lands in Phase 2/3. For now this binary exercises the Phase 1
-//! foundation end-to-end with no GPU required: it profiles a representative
-//! 70B-class model against a simulated 16 GiB card and prints the resulting
-//! layer-streaming schedule. Pass a model directory to profile real weights.
+//! Two subcommands:
+//! * `flip profile` — map/estimate a model and print the VRAM plan, KV-cache
+//!   sizing, and streaming schedule. No GPU required.
+//! * `flip serve`   — resolve the full serving configuration and prepare the
+//!   engine. The inference/serving loop itself is Phase 3; this validates the
+//!   config and runs the planning pipeline so the setup is verifiable today.
 
+use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
+use flip::cli::{Cli, Command, ProfileArgs, ServeArgs};
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
-use flip::profiler::VramProfiler;
-use flip::storage::{LayerCatalog, MmapStore};
 use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource};
+use flip::profiler::{VramPlan, VramProfiler};
+use flip::storage::{LayerCatalog, MmapStore};
 use flip::swap::LayerSwapPlan;
 use flip::{gpu, Result};
+use std::path::Path;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
 fn main() -> Result<()> {
-    println!("flip v{} — Phase 1 (Local Foundation)", env!("CARGO_PKG_VERSION"));
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Profile(args) => run_profile(args),
+        Command::Serve(args) => run_serve(args),
+    }
+}
+
+/// Print the shared startup banner (backend + host page size).
+fn banner() {
+    println!("flip v{}", env!("CARGO_PKG_VERSION"));
     println!("  gpu backend  : {}", gpu::active_vendor().label());
     println!("  host page    : {} bytes", page_size());
     println!();
+}
 
-    let args: Vec<String> = std::env::args().collect();
+/// `flip profile` — profile a real or sample model and print the full plan.
+fn run_profile(args: ProfileArgs) -> Result<()> {
+    banner();
 
-    // Either profile a real model directory, or a representative built-in config.
-    let (config, source) = match args.get(1) {
+    let quant = args.quant.to_scheme();
+    let (config, source) = match &args.model_path {
         Some(dir) => (
-            ModelConfig::from_path(dir, QuantScheme::Int4)?,
-            format!("config.json in {dir}"),
+            ModelConfig::from_path(dir, quant)?,
+            format!("config.json in {}", dir.display()),
         ),
-        None => (sample_70b_config(), "built-in Llama-3-70B-class sample".to_string()),
+        None => (
+            sample_70b_config(quant),
+            "built-in Llama-3-70B-class sample".to_string(),
+        ),
     };
 
     println!("model source : {source}");
-    println!(
-        "geometry     : {} layers, hidden {}, {} q-heads / {} kv-heads, head_dim {}",
-        config.num_layers,
-        config.hidden_size,
-        config.num_attention_heads,
-        config.num_kv_heads,
-        config.head_dim(),
-    );
-    println!(
-        "quantization : {:?} ({} bytes/param), ~{:.1} B params",
-        config.quant,
-        config.quant.bytes_per_param(),
-        config.estimated_total_params() as f64 / 1e9,
-    );
+    print_geometry(&config);
+
+    report_plan(
+        &config,
+        args.model_path.as_deref(),
+        args.context_length,
+        args.vram_budget_gb,
+    )
+}
+
+/// `flip serve` — resolve the serving config, then run the planning pipeline.
+fn run_serve(args: ServeArgs) -> Result<()> {
+    banner();
+
+    println!("serve config :");
+    println!("  model      : {}", args.model_path.display());
+    println!("  api        : http://{}:{}", args.host, args.port);
+    println!("  context    : {} tokens", args.context_length);
+    println!("  quant      : {:?}", args.quant.to_scheme());
+    println!("  mode       : {:?}", args.distributed_mode);
+    if let Some(draft) = &args.draft_model_path {
+        println!("  draft model: {}", draft.display());
+    }
+    if !args.multi_gpu_ids.is_empty() {
+        println!("  gpu ids    : {:?}", args.multi_gpu_ids);
+    }
+    if !args.worker_nodes.is_empty() {
+        println!("  workers    : {}", args.worker_nodes.join(", "));
+    }
     println!();
 
-    // If a model dir was given, map its shards and measure real weight sizes.
-    // Keep the store alive alongside the catalog so we can stream from it below.
+    let config = ModelConfig::from_path(&args.model_path, args.quant.to_scheme())?;
+    println!("model source : config.json in {}", args.model_path.display());
+    print_geometry(&config);
+
+    report_plan(
+        &config,
+        Some(&args.model_path),
+        args.context_length,
+        args.vram_budget_gb,
+    )?;
+
+    println!();
+    println!("note         : model prepared; the inference serving loop is not yet");
+    println!("               implemented (Phase 3 — OpenAI-compatible API server).");
+    Ok(())
+}
+
+/// Shared planner/reporter: map the model (if a dir is given), profile it, size
+/// the KV cache, and print the streaming schedule — streaming real weights when
+/// a mapped model is available.
+fn report_plan(
+    config: &ModelConfig,
+    model_dir: Option<&Path>,
+    context_length: u32,
+    vram_budget_gb: Option<f64>,
+) -> Result<()> {
+    // Map shards + measure real weight sizes when a directory is supplied.
     let mut mapped: Option<(MmapStore, LayerCatalog)> = None;
-    if let Some(dir) = args.get(1) {
+    if let Some(dir) = model_dir {
         if let Ok(store) = MmapStore::open_dir(dir) {
             let cat = LayerCatalog::build(&store);
             println!(
@@ -75,28 +134,19 @@ fn main() -> Result<()> {
     }
     let catalog = mapped.as_ref().map(|(_, cat)| cat);
 
-    // Determine free VRAM: live device when CUDA is present, else simulate 16 GiB.
-    let profiler = VramProfiler::new(8192);
-    let (free_bytes, live) = match gpu::mem_get_info() {
-        Ok(dev) => (dev.free, true),
-        Err(_) => (16 * GIB, false),
-    };
-    if live {
-        println!("free VRAM    : live device query ({})", gpu::active_vendor().label());
-    } else {
-        println!("free VRAM    : simulated {} GiB (no GPU device)", free_bytes / GIB);
-    }
+    // Resolve free VRAM: explicit budget > live device query > simulated 16 GiB.
+    let profiler = VramProfiler::new(context_length);
+    let (free_bytes, free_source) = resolve_free_bytes(vram_budget_gb);
+    println!("free VRAM    : {free_source}");
 
-    // Prefer measured catalog sizes; fall back to the parameter estimate.
     let plan = match catalog {
-        Some(cat) if !cat.is_empty() => profiler.plan_from_catalog(&config, cat, free_bytes),
-        _ => profiler.plan_with_free(&config, free_bytes),
+        Some(cat) if !cat.is_empty() => profiler.plan_from_catalog(config, cat, free_bytes),
+        _ => profiler.plan_with_free(config, free_bytes),
     };
-
     print_plan(&plan);
 
     // Size the PagedAttention KV pool from the plan's KV budget (Cache Zone).
-    let kv_cfg = KvCacheConfig::from_model(&config, 16);
+    let kv_cfg = KvCacheConfig::from_model(config, 16);
     let kv_cache = PagedKvCache::with_budget(kv_cfg, plan.kv_total_bytes);
     println!();
     println!(
@@ -114,54 +164,25 @@ fn main() -> Result<()> {
         swap.num_passes(),
         swap.window_size,
     );
-    for pass in swap.passes.iter().take(4) {
-        println!(
-            "  pass {:>2} → layers {:>3}..={:<3} ({} layers)",
-            pass.pass_index,
-            pass.first_layer,
-            pass.last_layer,
-            pass.layer_count(),
-        );
-    }
-    if swap.num_passes() > 4 {
-        println!("  … {} more pass(es)", swap.num_passes() - 4);
-    }
 
     // Allocate the pinned staging buffer the pipeline will DMA from.
     let staging: PinnedBuffer = swap.allocate_staging_buffer(plan.per_layer_weight_bytes)?;
-    println!();
     println!(
-        "staging buf  : {:.1} MiB pinned ({:?}), page-aligned base {:p}",
+        "staging buf  : {:.1} MiB pinned ({:?})",
         staging.capacity() as f64 / (1024.0 * 1024.0),
         staging.kind(),
-        staging.as_ptr(),
     );
 
-    // Build the double-buffered A/B schedule (Phase 2 §3.2).
+    // Build the double-buffered A/B schedule (specs §3.2).
     let sched = DoubleBufferSchedule::from_swap_plan(&swap);
-    println!();
     println!(
         "pipeline     : {} steps, {} overlapped (DMA hidden under compute)",
         sched.num_steps(),
         sched.overlapping_steps(),
     );
-    for step in sched.steps.iter().take(4) {
-        let compute = step
-            .compute
-            .map(|p| format!("compute p{} [{:?}]", p.pass_index, step.compute_buffer))
-            .unwrap_or_else(|| "compute —".to_string());
-        let prefetch = step
-            .prefetch
-            .map(|p| format!("prefetch p{} → [{:?}]", p.pass_index, step.prefetch_buffer))
-            .unwrap_or_else(|| "prefetch —".to_string());
-        println!("  A:{compute:<22} | B:{prefetch}");
-    }
-    if sched.num_steps() > 4 {
-        println!("  … {} more step(s)", sched.num_steps() - 4);
-    }
 
-    // With a real mapped model, stream its weights end-to-end through the
-    // double-buffered host pipeline (disk → pinned → device → compute).
+    // With a real mapped model, stream its weights end-to-end through the host
+    // pipeline (disk → pinned → device → compute).
     if let Some((store, catalog)) = mapped.as_ref().filter(|(_, c)| !c.is_empty()) {
         let source = MmapWeightSource::new(store, catalog);
         let max_window = swap
@@ -174,7 +195,6 @@ fn main() -> Result<()> {
         let mut pipeline = HostPipeline::new(max_window as usize)?;
         let trace = pipeline.execute(&sched, &source)?;
         let moved: usize = trace.iter().map(|t| t.byte_len).sum();
-        println!();
         println!(
             "streamed     : {} window(s) executed, {:.2} GiB moved through pinned staging",
             trace.len(),
@@ -185,7 +205,40 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_plan(plan: &flip::profiler::VramPlan) {
+/// Resolve the free-VRAM figure and a human-readable description of its source.
+fn resolve_free_bytes(vram_budget_gb: Option<f64>) -> (u64, String) {
+    if let Some(gb) = vram_budget_gb {
+        let bytes = (gb * GIB as f64) as u64;
+        return (bytes, format!("{gb} GiB manual budget"));
+    }
+    match gpu::mem_get_info() {
+        Ok(dev) => (
+            dev.free,
+            format!("live device query ({})", gpu::active_vendor().label()),
+        ),
+        Err(_) => (16 * GIB, "simulated 16 GiB (no GPU device)".to_string()),
+    }
+}
+
+fn print_geometry(config: &ModelConfig) {
+    println!(
+        "geometry     : {} layers, hidden {}, {} q-heads / {} kv-heads, head_dim {}",
+        config.num_layers,
+        config.hidden_size,
+        config.num_attention_heads,
+        config.num_kv_heads,
+        config.head_dim(),
+    );
+    println!(
+        "quantization : {:?} ({} bytes/param), ~{:.1} B params",
+        config.quant,
+        config.quant.bytes_per_param(),
+        config.estimated_total_params() as f64 / 1e9,
+    );
+    println!();
+}
+
+fn print_plan(plan: &VramPlan) {
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!();
     println!("── VRAM PLAN ─────────────────────────────────");
@@ -201,7 +254,7 @@ fn print_plan(plan: &flip::profiler::VramPlan) {
 }
 
 /// A representative Llama-3-70B-class configuration for off-GPU demonstration.
-fn sample_70b_config() -> ModelConfig {
+fn sample_70b_config(quant: QuantScheme) -> ModelConfig {
     let json = br#"{
         "hidden_size": 8192,
         "num_attention_heads": 64,
@@ -211,6 +264,5 @@ fn sample_70b_config() -> ModelConfig {
         "intermediate_size": 28672,
         "max_position_embeddings": 8192
     }"#;
-    ModelConfig::from_json_bytes(json, QuantScheme::Int4)
-        .expect("built-in sample config is valid")
+    ModelConfig::from_json_bytes(json, quant).expect("built-in sample config is valid")
 }
