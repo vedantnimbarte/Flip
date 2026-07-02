@@ -69,6 +69,7 @@ asynchronously, so disk I/O and copies hide under GPU compute.
 | Sharded checkpoint support + tensor index | [`src/storage/mmap_store.rs`](src/storage/mmap_store.rs) |
 | Layer catalog (real per-layer + pinned byte sizes) | [`src/storage/catalog.rs`](src/storage/catalog.rs) |
 | `config.json` geometry + quantization parsing | [`src/model`](src/model) |
+| 4-bit group-affine dequantization kernel (AWQ/GPTQ-style) | [`src/quant`](src/quant) |
 | Tensor role classification (pinned vs. streamed) | [`src/model/naming.rs`](src/model/naming.rs) |
 | Dynamic VRAM profiling math | [`src/profiler`](src/profiler) |
 | Page-locked host staging buffers | [`src/memory`](src/memory) |
@@ -230,6 +231,7 @@ src/
 ├── model/            # config.json parsing, quant schemes, tensor naming
 ├── storage/          # mmap engine, safetensors parser, layer catalog
 ├── profiler/         # dynamic VRAM budget math
+├── quant/            # 4-bit group-affine dequantization kernel
 ├── memory/           # page-size discovery + page-locked staging buffers
 ├── swap/             # linear layer-swap cycle (windows over the model)
 ├── pipeline/         # double-buffered A/B schedule + host executor
