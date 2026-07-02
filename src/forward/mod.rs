@@ -5,8 +5,10 @@
 //! math is abstracted behind [`ComputeKernel`] so a real GPU kernel replaces the
 //! [`StubKernel`] without touching the orchestration.
 
+pub mod cpu;
 pub mod kernel;
 pub mod orchestrator;
 
+pub use cpu::{decode_block, BlockConfig, KvLayerCache, LayerTensors};
 pub use kernel::{ComputeKernel, LayerWeights, StubKernel};
 pub use orchestrator::{ForwardConfig, ForwardOrchestrator};
