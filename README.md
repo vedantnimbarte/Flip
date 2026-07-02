@@ -61,16 +61,22 @@ layers resident across token steps so they skip the disk read; and the
 page-locked (pinned) host buffer lets the PCIe controller DMA straight to VRAM
 asynchronously, so disk I/O and copies hide under GPU compute.
 
-The transformer math itself sits behind a `ComputeKernel` trait, and a
-`ForwardOrchestrator` wires it together per layer: **dequantize → kernel
-(attention + MLP) → residual add → KV append**. A CPU stub kernel makes the
-whole orchestration testable off-GPU; a real CUDA/HIP matmul/attention kernel
-drops in behind the same trait for actual inference.
+The transformer math sits behind a block-level `ComputeKernel` trait (`run_block`
+runs one decoder block for one token), and a `ForwardOrchestrator` drives a
+sequence through the model autoregressively: per token it reserves KV budget,
+then calls the kernel for each layer, threading each layer's real K/V history.
 
-[`src/forward/cpu.rs`](src/forward/cpu.rs) provides the real math as a CPU
-reference — a Llama-style single-token decode block (RMSNorm, RoPE, grouped-query
-attention over the KV history, SwiGLU MLP). It is the correctness oracle and
-porting spec the GPU kernel mirrors, not the production path.
+Three interchangeable kernels sit behind the trait:
+
+- **`CpuKernel`** — the real math: a Llama-style decode block (RMSNorm, RoPE,
+  grouped-query attention over the KV history, SwiGLU MLP) in
+  [`src/forward/cpu.rs`](src/forward/cpu.rs). Plugged into the orchestrator it
+  gives a fully-connected — if slow, single-token — **CPU forward path**, and
+  serves as the correctness oracle and porting spec for the GPU kernel.
+- **`StubKernel`** — a trivial deterministic kernel for testing the
+  orchestration (KV growth, per-layer iteration) in isolation.
+- **GPU kernel** — a CUDA/HIP `run_block` implementation for production
+  inference (not yet built; the hardware-gated piece).
 
 ## Components
 
@@ -89,8 +95,8 @@ porting spec the GPU kernel mirrors, not the production path.
 | PagedAttention block-paged KV cache | [`src/cache/paged.rs`](src/cache/paged.rs) |
 | Tiered CPU-RAM LRU layer cache | [`src/cache/ram.rs`](src/cache/ram.rs) |
 | Residual activation pool (buffer reuse) | [`src/activation`](src/activation) |
-| Forward-pass orchestration (`ComputeKernel` trait + stub) | [`src/forward`](src/forward) |
-| CPU transformer-block reference (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
+| Forward-pass orchestration (block-level `ComputeKernel` trait) | [`src/forward`](src/forward) |
+| CPU forward path — real decode block (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
