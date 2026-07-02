@@ -20,7 +20,7 @@ ability to run models many times larger than the card.
 - [Running the tests](#running-the-tests)
 - [The VRAM budget math](#the-vram-budget-math)
 - [Project layout](#project-layout)
-- [Building with CUDA](#building-with-cuda)
+- [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
 
 ---
 
@@ -69,11 +69,12 @@ and copies hide under GPU compute.
 | Page-locked host staging buffers | [`src/memory`](src/memory) |
 | Linear layer-swap cycle | [`src/swap`](src/swap) |
 | Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) |
-| CUDA runtime FFI (mem-info, host-alloc, streams, async memcpy) | [`src/cuda`](src/cuda) |
+| GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
-The CUDA-specific paths are behind a `cuda` [feature flag](#building-with-cuda);
-with it off, the engine uses a page-aligned host fallback with the same layout
-contract, so the logic runs on any machine.
+The GPU-specific paths are behind `cuda` / `rocm`
+[feature flags](#building-for-gpu-nvidia--amd); with neither, the engine uses a
+page-aligned host fallback with the same layout contract, so the logic runs on
+any machine.
 
 ## Prerequisites
 
@@ -86,8 +87,11 @@ contract, so the logic runs on any machine.
   - Linux: `build-essential`
   - macOS: Xcode Command Line Tools (`xcode-select --install`)
   - Windows: the Visual Studio C++ Build Tools (MSVC)
-- **(Optional, for the GPU path)** NVIDIA CUDA Toolkit 12.x with `nvcc` and
-  `cudart` on the library path. Not required for building, testing, or the demo.
+- **(Optional, for the GPU path)** one of:
+  - NVIDIA CUDA Toolkit 12.x with `cudart` on the library path, or
+  - AMD ROCm 6.x with `amdhip64` on the library path.
+
+  Not required for building, testing, or the demo — the host fallback needs no GPU.
 
 ## Build & run locally
 
@@ -111,14 +115,14 @@ Example output:
 
 ```
 flip v0.1.0 — Phase 1 (Local Foundation)
-  cuda backend : disabled (host fallback)
+  gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
 model source : built-in Llama-3-70B-class sample
 geometry     : 80 layers, hidden 8192, 64 q-heads / 8 kv-heads, head_dim 128
 quantization : Int4 (0.5 bytes/param), ~70.6 B params
 
-free VRAM    : simulated 16 GiB (no CUDA device)
+free VRAM    : simulated 16 GiB (no GPU device)
 
 ── VRAM PLAN ─────────────────────────────────
   M_free           :    16384.0 MiB
@@ -173,8 +177,8 @@ LayersToLoad  =  ─────────────────────
                               M_layer_weight
 ```
 
-- **`M_free`** — free VRAM from `cudaMemGetInfo()` at runtime (simulated
-  off-GPU).
+- **`M_free`** — free VRAM from the GPU runtime at runtime
+  (`cudaMemGetInfo` / `hipMemGetInfo`; simulated off-GPU).
 - **`M_safety`** — cushion for activation spikes (default **1.5 GiB**).
 - **`M_kv_total`** — KV cache for the whole context, summed across **all** layers
   (their histories stay resident while weights stream):
@@ -200,29 +204,41 @@ src/
 ├── memory/           # page-size discovery + page-locked staging buffers
 ├── swap/             # linear layer-swap cycle (windows over the model)
 ├── pipeline/         # double-buffered A/B schedule + host executor
-└── cuda/             # feature-gated CUDA runtime FFI + safe wrappers
+└── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
 tests/
 └── phase1.rs         # integration tests
-build.rs              # links cudart when the `cuda` feature is enabled
+build.rs              # links cudart / amdhip64 for the selected GPU feature
 ```
 
-## Building with CUDA
+## Building for GPU (NVIDIA / AMD)
 
-The GPU path is gated behind the `cuda` Cargo feature. It requires the CUDA
-Toolkit with `cudart` reachable by the linker (set `CUDA_PATH` if it lives
-outside the default search path). Type-checking works without the toolkit:
+The GPU path is vendor-neutral behind [`src/gpu`](src/gpu), selected by a Cargo
+feature. Everything above the backend (storage, profiler, pipeline) is identical
+across vendors.
+
+| Feature | Vendor | Runtime | Env var |
+|---|---|---|---|
+| `cuda` | NVIDIA | `cudart` | `CUDA_PATH` |
+| `rocm` | AMD | `amdhip64` | `ROCM_PATH` |
+| _(none)_ | — | host fallback | — |
+
+Type-checking works without either toolkit installed; building/linking requires
+the corresponding runtime on the link path:
 
 ```bash
-cargo check --features cuda            # validates the FFI, no linking
-cargo build --features cuda            # requires cudart on the link path
-CUDA_PATH=/usr/local/cuda cargo build --features cuda
+cargo check --features cuda            # validates the CUDA FFI, no linking
+cargo check --features rocm            # validates the ROCm/HIP FFI, no linking
+
+CUDA_PATH=/usr/local/cuda cargo build --features cuda   # NVIDIA
+ROCM_PATH=/opt/rocm        cargo build --features rocm   # AMD
 ```
 
-With the feature on, `PinnedBuffer` allocates genuine page-locked memory via
-`cudaHostAlloc`, and `cudaMemGetInfo` reports the live device's free VRAM. With
-it off, buffers are page-aligned host allocations (same layout contract,
-promotable in place later via `cudaHostRegister`) so nothing about the pipeline
-shape changes between builds.
+The two GPU features are mutually exclusive. With one enabled, `PinnedBuffer`
+allocates genuine page-locked memory (`cudaHostAlloc` / `hipHostMalloc`) and
+`mem_get_info` reports the live device's free VRAM. With neither, buffers are
+page-aligned host allocations (same layout contract, promotable in place later
+via `cudaHostRegister` / `hipHostRegister`), so nothing about the pipeline shape
+changes between builds.
 
 See [`PRD.md`](PRD.md) for product requirements and [`specs.md`](specs.md) for
 the full technical specification.

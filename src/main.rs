@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     if live {
         println!("free VRAM    : live device query ({})", gpu::active_vendor().label());
     } else {
-        println!("free VRAM    : simulated {} GiB (no CUDA device)", free_bytes / GIB);
+        println!("free VRAM    : simulated {} GiB (no GPU device)", free_bytes / GIB);
     }
 
     // Prefer measured catalog sizes; fall back to the parameter estimate.
