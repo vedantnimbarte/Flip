@@ -22,6 +22,7 @@
 use crate::cuda;
 use crate::error::Result;
 use crate::model::ModelConfig;
+use crate::storage::LayerCatalog;
 
 /// Default safety cushion: 1.5 GiB, per `specs.md` §3.1 (`M_safety`).
 pub const DEFAULT_SAFETY_MARGIN_BYTES: u64 = 3 * 512 * 1024 * 1024; // 1.5 * 2^30
@@ -57,9 +58,12 @@ pub struct VramPlan {
     pub safety_bytes: u64,
     /// `M_kv_total` reserved for the KV cache across all layers.
     pub kv_total_bytes: u64,
+    /// Bytes held permanently by the Pinned Zone (embedding, LM head, norms).
+    /// Zero when profiling from a config estimate rather than a real catalog.
+    pub pinned_bytes: u64,
     /// `M_layer_weight` — size of one streamed block.
     pub per_layer_weight_bytes: u64,
-    /// `M_free − M_safety − M_kv_total`, saturated at 0.
+    /// `M_free − M_safety − M_kv_total − pinned`, saturated at 0.
     pub usable_bytes: u64,
     /// Final `LayersToLoad`, clamped to `[1, num_layers]`.
     pub layers_to_load: u32,
@@ -125,30 +129,76 @@ impl VramProfiler {
         (model_total_bytes / config.num_layers as f64).ceil() as u64
     }
 
-    /// Pure profiling step: compute the plan from an explicit `free_bytes`.
-    /// Kept side-effect-free so it can be unit-tested without a GPU.
+    /// Pure profiling step: compute the plan from an explicit `free_bytes`,
+    /// using the parameter-count *estimate* for per-layer weight and no pinned
+    /// overhead. Side-effect-free so it can be unit-tested without a GPU.
     pub fn plan_with_free(&self, config: &ModelConfig, free_bytes: u64) -> VramPlan {
-        let kv_total = self.kv_total_bytes(config);
-        let per_layer_weight = self.per_layer_weight_bytes(config).max(1);
+        self.compute_plan(
+            free_bytes,
+            self.kv_total_bytes(config),
+            self.per_layer_weight_bytes(config),
+            0,
+            config.num_layers,
+        )
+    }
 
+    /// Profiling step using **measured** sizes from a [`LayerCatalog`]: the
+    /// real largest-block weight for `M_layer_weight`, and the Pinned Zone's
+    /// actual byte cost subtracted from free VRAM. Falls back to the config
+    /// estimate for any figure the catalog can't supply (e.g. empty catalog).
+    pub fn plan_from_catalog(
+        &self,
+        config: &ModelConfig,
+        catalog: &LayerCatalog,
+        free_bytes: u64,
+    ) -> VramPlan {
+        let per_layer = match catalog.max_layer_bytes() {
+            0 => self.per_layer_weight_bytes(config),
+            measured => measured,
+        };
+        let num_layers = if catalog.num_layers() == 0 {
+            config.num_layers
+        } else {
+            catalog.num_layers()
+        };
+        self.compute_plan(
+            free_bytes,
+            self.kv_total_bytes(config),
+            per_layer,
+            catalog.pinned_bytes(),
+            num_layers,
+        )
+    }
+
+    /// Shared budget arithmetic behind both planning entry points.
+    fn compute_plan(
+        &self,
+        free_bytes: u64,
+        kv_total: u64,
+        per_layer_weight: u64,
+        pinned_bytes: u64,
+        num_layers: u32,
+    ) -> VramPlan {
+        let per_layer_weight = per_layer_weight.max(1);
         let usable = free_bytes
             .saturating_sub(self.safety_margin_bytes)
-            .saturating_sub(kv_total);
+            .saturating_sub(kv_total)
+            .saturating_sub(pinned_bytes);
 
         let raw = usable / per_layer_weight;
         // Streaming requires at least one layer slot resident; cap at the model
         // size. Matches `specs.md` §3.1 `max(1, min(calc, num_layers))`.
-        let layers_to_load = raw
-            .clamp(1, config.num_layers as u64) as u32;
+        let layers_to_load = raw.clamp(1, num_layers as u64) as u32;
 
         VramPlan {
             free_bytes,
             safety_bytes: self.safety_margin_bytes,
             kv_total_bytes: kv_total,
+            pinned_bytes,
             per_layer_weight_bytes: per_layer_weight,
             usable_bytes: usable,
             layers_to_load,
-            num_layers: config.num_layers,
+            num_layers,
         }
     }
 

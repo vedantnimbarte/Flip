@@ -9,7 +9,7 @@
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::profiler::VramProfiler;
-use flip::storage::MmapStore;
+use flip::storage::{LayerCatalog, MmapStore};
 use flip::swap::LayerSwapPlan;
 use flip::{cuda, Result};
 
@@ -49,31 +49,44 @@ fn main() -> Result<()> {
     );
     println!();
 
-    // If a model dir was given, map its shards to prove the storage engine works.
+    // If a model dir was given, map its shards and measure real weight sizes.
+    let mut catalog: Option<LayerCatalog> = None;
     if let Some(dir) = args.get(1) {
         if let Ok(store) = MmapStore::open_dir(dir) {
+            let cat = LayerCatalog::build(&store);
             println!(
                 "storage      : mapped {} shard(s), {} tensors, {:.2} GiB on disk",
                 store.num_shards(),
                 store.num_tensors(),
                 store.total_mapped_bytes() as f64 / GIB as f64,
             );
+            println!(
+                "catalog      : {} block(s), max block {:.1} MiB, pinned {:.1} MiB",
+                cat.num_layers(),
+                cat.max_layer_bytes() as f64 / (1024.0 * 1024.0),
+                cat.pinned_bytes() as f64 / (1024.0 * 1024.0),
+            );
             println!();
+            catalog = Some(cat);
         }
     }
 
     // Determine free VRAM: live device when CUDA is present, else simulate 16 GiB.
     let profiler = VramProfiler::new(8192);
-    let plan = match profiler.profile(&config) {
-        Ok(plan) => {
-            println!("free VRAM    : live cudaMemGetInfo");
-            plan
-        }
-        Err(_) => {
-            let simulated_free = 16 * GIB;
-            println!("free VRAM    : simulated {} GiB (no CUDA device)", simulated_free / GIB);
-            profiler.plan_with_free(&config, simulated_free)
-        }
+    let (free_bytes, live) = match cuda::mem_get_info() {
+        Ok(dev) => (dev.free, true),
+        Err(_) => (16 * GIB, false),
+    };
+    if live {
+        println!("free VRAM    : live cudaMemGetInfo");
+    } else {
+        println!("free VRAM    : simulated {} GiB (no CUDA device)", free_bytes / GIB);
+    }
+
+    // Prefer measured catalog sizes; fall back to the parameter estimate.
+    let plan = match &catalog {
+        Some(cat) if !cat.is_empty() => profiler.plan_from_catalog(&config, cat, free_bytes),
+        _ => profiler.plan_with_free(&config, free_bytes),
     };
 
     print_plan(&plan);
@@ -118,6 +131,7 @@ fn print_plan(plan: &flip::profiler::VramPlan) {
     println!("  M_free           : {:>10.1} MiB", mib(plan.free_bytes));
     println!("  M_safety         : {:>10.1} MiB", mib(plan.safety_bytes));
     println!("  M_kv_total       : {:>10.1} MiB", mib(plan.kv_total_bytes));
+    println!("  pinned_zone      : {:>10.1} MiB", mib(plan.pinned_bytes));
     println!("  M_layer_weight   : {:>10.1} MiB", mib(plan.per_layer_weight_bytes));
     println!("  usable           : {:>10.1} MiB", mib(plan.usable_bytes));
     println!("  ▶ layers_to_load : {:>10} / {}", plan.layers_to_load, plan.num_layers);

@@ -145,6 +145,44 @@ fn vram_math_matches_hand_computation() {
 }
 
 #[test]
+fn profiler_uses_catalog_sizes_and_pinned_overhead() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 4 layers of 100 bytes each, plus 500 bytes of pinned tensors.
+    write_multi_tensor(
+        tmp.path(),
+        &[
+            ("model.embed_tokens.weight", 250),
+            ("lm_head.weight", 250),
+            ("model.layers.0.w", 100),
+            ("model.layers.1.w", 100),
+            ("model.layers.2.w", 100),
+            ("model.layers.3.w", 100),
+        ],
+    );
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let catalog = LayerCatalog::build(&store);
+
+    let config = ModelConfig::from_json_bytes(
+        br#"{"hidden_size":512,"num_attention_heads":8,"num_hidden_layers":4,"vocab_size":1000}"#,
+        QuantScheme::Int4,
+    )
+    .unwrap();
+    // Zero out KV and safety to isolate the pinned-overhead effect.
+    let profiler = VramProfiler::new(1).with_safety_margin_bytes(0);
+    let kv = profiler.kv_total_bytes(&config);
+
+    // Give room for pinned(500) + exactly 2 layers (200) on top of KV.
+    let free = kv + 500 + 200;
+    let plan = profiler.plan_from_catalog(&config, &catalog, free);
+
+    assert_eq!(plan.pinned_bytes, 500);
+    assert_eq!(plan.per_layer_weight_bytes, 100); // measured max block
+    assert_eq!(plan.usable_bytes, 200);
+    assert_eq!(plan.layers_to_load, 2);
+    assert_eq!(plan.num_layers, 4);
+}
+
+#[test]
 fn vram_plan_clamps_between_one_and_num_layers() {
     let config = ModelConfig::from_json_bytes(
         br#"{"hidden_size":512,"num_attention_heads":8,"num_hidden_layers":4,"vocab_size":1000}"#,
