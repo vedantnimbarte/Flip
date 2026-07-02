@@ -78,6 +78,13 @@ Three interchangeable kernels sit behind the trait:
 - **GPU kernel** — a CUDA/HIP `run_block` implementation for production
   inference (not yet built; the hardware-gated piece).
 
+Around the stack, [`src/generate.rs`](src/generate.rs) closes the loop:
+`token → embedding → transformer stack → final RMSNorm → LM head → logits →
+sample → next token`. With the `CpuKernel` this is a complete, end-to-end (if
+slow, single-sequence) **CPU inference path** — prompt tokens are prefilled into
+the KV history, then new tokens are generated greedily until an EOS or the token
+limit.
+
 ## Components
 
 | Component | Module |
@@ -97,6 +104,7 @@ Three interchangeable kernels sit behind the trait:
 | Residual activation pool (buffer reuse) | [`src/activation`](src/activation) |
 | Forward-pass orchestration (block-level `ComputeKernel` trait) | [`src/forward`](src/forward) |
 | CPU forward path — real decode block (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
+| CPU token-generation loop (embed → stack → LM head → sample) | [`src/generate.rs`](src/generate.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
@@ -257,7 +265,8 @@ src/
 ├── pipeline/         # double-buffered A/B schedule + host executor
 ├── cache/            # PagedAttention KV cache + tiered CPU-RAM layer cache
 ├── activation/       # residual activation pool (buffer reuse)
-├── forward/          # forward-pass orchestration (ComputeKernel trait + stub)
+├── forward/          # forward-pass orchestration + real CPU decode block
+├── generate.rs       # CPU token-generation loop (embed / LM head / sampling)
 └── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
 tests/
 └── phase1.rs         # integration tests
