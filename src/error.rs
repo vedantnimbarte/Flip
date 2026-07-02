@@ -1,0 +1,59 @@
+//! Unified error type for the `flip` engine.
+
+use std::path::PathBuf;
+
+/// Result alias used throughout the crate.
+pub type Result<T> = std::result::Result<T, FlipError>;
+
+/// All fallible operations in Phase 1 surface through this enum so the
+/// orchestration layer can match on failure classes (I/O vs. parse vs. GPU)
+/// without stringly-typed comparisons.
+#[derive(Debug, thiserror::Error)]
+pub enum FlipError {
+    #[error("i/o error on {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to memory-map {path}: {source}")]
+    Mmap {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("safetensors header is malformed: {0}")]
+    SafetensorsHeader(String),
+
+    #[error("tensor {name:?} out of bounds: range {start}..{end} exceeds data section of {len} bytes")]
+    TensorOutOfBounds {
+        name: String,
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+
+    #[error("unknown tensor {0:?}")]
+    UnknownTensor(String),
+
+    #[error("failed to parse JSON in {context}: {source}")]
+    Json {
+        context: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("invalid model config: {0}")]
+    InvalidConfig(String),
+
+    #[error("host memory allocation failed for {bytes} bytes (align {align})")]
+    HostAlloc { bytes: usize, align: usize },
+
+    #[error("CUDA runtime error ({api}): code {code}")]
+    Cuda { api: &'static str, code: i32 },
+
+    #[error("CUDA feature not compiled in — rebuild with `--features cuda` to use {0}")]
+    CudaUnavailable(&'static str),
+}
