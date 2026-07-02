@@ -51,9 +51,9 @@ pub enum FlipError {
     #[error("host memory allocation failed for {bytes} bytes (align {align})")]
     HostAlloc { bytes: usize, align: usize },
 
-    #[error("CUDA runtime error ({api}): code {code}")]
-    Cuda { api: &'static str, code: i32 },
+    #[error("GPU runtime error ({api}): code {code}")]
+    Gpu { api: &'static str, code: i32 },
 
-    #[error("CUDA feature not compiled in — rebuild with `--features cuda` to use {0}")]
-    CudaUnavailable(&'static str),
+    #[error("no GPU backend compiled in — rebuild with `--features cuda` or `--features rocm` to use {0}")]
+    GpuUnavailable(&'static str),
 }

@@ -19,8 +19,8 @@
 //! All arithmetic is done in `u64`/`f64` with saturating subtraction so an
 //! over-subscribed device yields a zero/one-layer budget instead of underflow.
 
-use crate::cuda;
 use crate::error::Result;
+use crate::gpu;
 use crate::model::ModelConfig;
 use crate::storage::LayerCatalog;
 
@@ -203,10 +203,10 @@ impl VramProfiler {
     }
 
     /// Profile against the live device, querying `M_free` via `cudaMemGetInfo`.
-    /// Errors with [`crate::error::FlipError::CudaUnavailable`] on a non-CUDA
+    /// Errors with [`crate::error::FlipError::GpuUnavailable`] on a non-GPU
     /// build — use [`plan_with_free`](Self::plan_with_free) for off-GPU planning.
     pub fn profile(&self, config: &ModelConfig) -> Result<VramPlan> {
-        let dev = cuda::mem_get_info()?;
+        let dev = gpu::mem_get_info()?;
         Ok(self.plan_with_free(config, dev.free))
     }
 }

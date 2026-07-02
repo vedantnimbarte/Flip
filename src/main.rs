@@ -12,13 +12,13 @@ use flip::profiler::VramProfiler;
 use flip::storage::{LayerCatalog, MmapStore};
 use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource};
 use flip::swap::LayerSwapPlan;
-use flip::{cuda, Result};
+use flip::{gpu, Result};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
 fn main() -> Result<()> {
     println!("flip v{} — Phase 1 (Local Foundation)", env!("CARGO_PKG_VERSION"));
-    println!("  cuda backend : {}", if cuda::is_available() { "enabled" } else { "disabled (host fallback)" });
+    println!("  gpu backend  : {}", gpu::active_vendor().label());
     println!("  host page    : {} bytes", page_size());
     println!();
 
@@ -76,12 +76,12 @@ fn main() -> Result<()> {
 
     // Determine free VRAM: live device when CUDA is present, else simulate 16 GiB.
     let profiler = VramProfiler::new(8192);
-    let (free_bytes, live) = match cuda::mem_get_info() {
+    let (free_bytes, live) = match gpu::mem_get_info() {
         Ok(dev) => (dev.free, true),
         Err(_) => (16 * GIB, false),
     };
     if live {
-        println!("free VRAM    : live cudaMemGetInfo");
+        println!("free VRAM    : live device query ({})", gpu::active_vendor().label());
     } else {
         println!("free VRAM    : simulated {} GiB (no CUDA device)", free_bytes / GIB);
     }

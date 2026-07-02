@@ -5,26 +5,27 @@
 //! with `cudaMemcpyAsync` while the compute stream runs — pageable memory would
 //! force a synchronous staging copy and stall the pipeline.
 //!
-//! Two backends, one API:
-//! * `--features cuda` → [`cudaHostAlloc`] returns true page-locked memory.
+//! Two backends, one API — selected by GPU feature (see [`crate::gpu`]):
+//! * `--features cuda`/`rocm` → the vendor runtime's page-locking allocator
+//!   (`cudaHostAlloc` / `hipHostMalloc`) returns true page-locked memory.
 //! * default build → a page-*aligned* [`std::alloc`] buffer. It is not kernel-
 //!   pinned, but it is laid out identically (page-aligned base, page-multiple
 //!   length) so it satisfies the same pointer/alignment contract and can be
-//!   promoted in place later via `cudaHostRegister`. This keeps every buffer in
-//!   the engine allocation-compatible with async CUDA streams from Phase 1 on.
+//!   promoted in place later via `cudaHostRegister`/`hipHostRegister`. This keeps
+//!   every buffer allocation-compatible with async DMA streams from Phase 1 on.
 
 use crate::error::{FlipError, Result};
 use crate::memory::page::round_up_to_page;
 use std::alloc::{dealloc, Layout};
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 use std::alloc::alloc_zeroed;
 use std::ptr::NonNull;
 
 /// Which allocator produced a buffer's backing store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinKind {
-    /// Real page-locked host memory from `cudaHostAlloc`.
-    CudaPinned,
+    /// Real page-locked host memory from the GPU runtime (CUDA or ROCm).
+    DevicePinned,
     /// Page-aligned `std::alloc` memory (off-GPU fallback / pre-pinning stage).
     PageAligned,
 }
@@ -52,9 +53,9 @@ unsafe impl Sync for PinnedBuffer {}
 impl PinnedBuffer {
     /// Allocate a zero-initialized pinned buffer of at least `len` bytes.
     ///
-    /// The allocation is rounded up to a whole number of pages. Under the
-    /// `cuda` feature this yields genuinely page-locked memory; otherwise a
-    /// page-aligned host allocation with the same layout guarantees.
+    /// The allocation is rounded up to a whole number of pages. Under a GPU
+    /// feature (`cuda`/`rocm`) this yields genuinely page-locked memory;
+    /// otherwise a page-aligned host allocation with the same layout guarantees.
     pub fn with_len(len: usize) -> Result<Self> {
         if len == 0 {
             return Err(FlipError::HostAlloc {
@@ -75,36 +76,20 @@ impl PinnedBuffer {
         Ok(buf)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn alloc_backend(len: usize, capacity: usize) -> Result<Self> {
-        use crate::cuda::ffi;
-        let mut raw: *mut std::os::raw::c_void = std::ptr::null_mut();
-        // SAFETY: valid out-pointer; `capacity` is a positive page multiple.
-        let code = unsafe {
-            ffi::cudaHostAlloc(&mut raw, capacity, ffi::CUDA_HOST_ALLOC_PORTABLE)
-        };
-        if code != ffi::CUDA_SUCCESS {
-            return Err(FlipError::Cuda {
-                api: "cudaHostAlloc",
-                code,
-            });
-        }
-        let ptr = NonNull::new(raw as *mut u8).ok_or(FlipError::HostAlloc {
-            bytes: capacity,
-            align: crate::memory::page::page_size(),
-        })?;
-        // cudaHostAlloc does not zero; do it so `len..capacity` padding is defined.
-        // SAFETY: `ptr` owns `capacity` writable bytes.
-        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, capacity) };
+        // Delegate to the active GPU runtime's page-locking allocator, which
+        // returns zero-initialized pinned memory.
+        let ptr = crate::gpu::alloc_pinned_host(capacity)?;
         Ok(Self {
             ptr,
             len,
             capacity,
-            kind: PinKind::CudaPinned,
+            kind: PinKind::DevicePinned,
         })
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     fn alloc_backend(len: usize, capacity: usize) -> Result<Self> {
         let align = crate::memory::page::page_size();
         let layout = Layout::from_size_align(capacity, align).map_err(|_| FlipError::HostAlloc {
@@ -148,7 +133,7 @@ impl PinnedBuffer {
 
     /// True if the memory is genuinely page-locked (DMA-ready without staging).
     pub fn is_pinned(&self) -> bool {
-        self.kind == PinKind::CudaPinned
+        self.kind == PinKind::DevicePinned
     }
 
     /// Raw host pointer — the `void*` handed to `cudaMemcpyAsync` as the source.
@@ -177,12 +162,9 @@ impl PinnedBuffer {
 impl Drop for PinnedBuffer {
     fn drop(&mut self) {
         match self.kind {
-            PinKind::CudaPinned => {
-                #[cfg(feature = "cuda")]
-                // SAFETY: `ptr` came from `cudaHostAlloc` and is freed once.
-                unsafe {
-                    let _ = crate::cuda::ffi::cudaFreeHost(self.ptr.as_ptr() as *mut _);
-                }
+            PinKind::DevicePinned => {
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
+                crate::gpu::free_pinned_host(self.ptr);
             }
             PinKind::PageAligned => {
                 let align = crate::memory::page::page_size();

@@ -16,10 +16,14 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Enables real CUDA runtime FFI (cudaMemGetInfo / cudaHostAlloc page-locked pinning).
-# Requires the CUDA toolkit + `cudart` on the link path. Without it, the crate builds
-# and runs with a page-aligned host-memory fallback so Phase 1 is testable off-GPU.
+# NVIDIA backend: real CUDA runtime FFI (cudaMemGetInfo / cudaHostAlloc page-locked
+# pinning). Requires the CUDA toolkit + `cudart` on the link path.
 cuda = []
+# AMD backend: ROCm/HIP runtime FFI (hipMemGetInfo / hipHostMalloc). Requires ROCm
+# + `amdhip64` on the link path. Mutually exclusive with `cuda`.
+# Without either feature, the crate builds and runs with a page-aligned host-memory
+# fallback so the engine is fully testable off-GPU on any machine.
+rocm = []
 
 [dependencies]
 memmap2 = "0.9"
