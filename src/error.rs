@@ -48,6 +48,9 @@ pub enum FlipError {
     #[error("invalid model config: {0}")]
     InvalidConfig(String),
 
+    #[error("invalid quantized tensor layout: {0}")]
+    QuantLayout(String),
+
     #[error("host memory allocation failed for {bytes} bytes (align {align})")]
     HostAlloc { bytes: usize, align: usize },
 
