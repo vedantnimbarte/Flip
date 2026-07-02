@@ -508,6 +508,133 @@ fn tiered_cache_evicts_under_pressure() {
     assert!(stats.resident_bytes <= 200);
 }
 
+/// Write an F32 safetensors file from named tensors (1-D shape `[len]`).
+fn write_f32_model(dir: &std::path::Path, tensors: &[(String, Vec<f32>)]) {
+    let mut entries = Vec::new();
+    let mut data: Vec<u8> = Vec::new();
+    let mut offset = 0usize;
+    for (name, values) in tensors {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        entries.push(format!(
+            r#""{name}":{{"dtype":"F32","shape":[{}],"data_offsets":[{offset},{}]}}"#,
+            values.len(),
+            offset + bytes.len()
+        ));
+        data.extend_from_slice(&bytes);
+        offset += bytes.len();
+    }
+    let header = format!("{{{}}}", entries.join(","));
+    let path = dir.join("model-00001-of-00001.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(header.as_bytes()).unwrap();
+    f.write_all(&data).unwrap();
+    f.flush().unwrap();
+}
+
+#[test]
+fn bytes_to_f32_decodes_float_dtypes() {
+    use flip::storage::{bytes_to_f32, Dtype};
+
+    let f32_bytes: Vec<u8> = [1.0f32, -2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(bytes_to_f32(&f32_bytes, Dtype::F32).unwrap(), vec![1.0, -2.0]);
+
+    // F16: 1.0 = 0x3C00, 2.0 = 0x4000, -1.0 = 0xBC00
+    let f16_bytes: Vec<u8> = [0x3C00u16, 0x4000, 0xBC00]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(bytes_to_f32(&f16_bytes, Dtype::F16).unwrap(), vec![1.0, 2.0, -1.0]);
+
+    // BF16: 1.0 = 0x3F80
+    let bf16_bytes: Vec<u8> = 0x3F80u16.to_le_bytes().to_vec();
+    assert_eq!(bytes_to_f32(&bf16_bytes, Dtype::BF16).unwrap(), vec![1.0]);
+}
+
+#[test]
+fn loader_builds_generator_from_real_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (h, nh, nkv, hd, inter, vocab, layers) =
+        (8usize, 2usize, 1usize, 4usize, 8usize, 6usize, 1u32);
+    let q_dim = nh * hd;
+    let kv_dim = nkv * hd;
+    let fill = |n: usize| -> Vec<f32> { (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect() };
+
+    let mut tensors: Vec<(String, Vec<f32>)> = Vec::new();
+    tensors.push(("model.embed_tokens.weight".into(), fill(vocab * h)));
+    for i in 0..layers {
+        let p = format!("model.layers.{i}.");
+        tensors.push((format!("{p}self_attn.q_proj.weight"), fill(q_dim * h)));
+        tensors.push((format!("{p}self_attn.k_proj.weight"), fill(kv_dim * h)));
+        tensors.push((format!("{p}self_attn.v_proj.weight"), fill(kv_dim * h)));
+        tensors.push((format!("{p}self_attn.o_proj.weight"), fill(h * q_dim)));
+        tensors.push((format!("{p}mlp.gate_proj.weight"), fill(inter * h)));
+        tensors.push((format!("{p}mlp.up_proj.weight"), fill(inter * h)));
+        tensors.push((format!("{p}mlp.down_proj.weight"), fill(h * inter)));
+        tensors.push((format!("{p}input_layernorm.weight"), vec![1.0; h]));
+        tensors.push((format!("{p}post_attention_layernorm.weight"), vec![1.0; h]));
+    }
+    tensors.push(("model.norm.weight".into(), vec![1.0; h]));
+    tensors.push(("lm_head.weight".into(), fill(vocab * h)));
+    write_f32_model(tmp.path(), &tensors);
+
+    let config_json = format!(
+        r#"{{"hidden_size":{h},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"num_hidden_layers":{layers},"vocab_size":{vocab},"intermediate_size":{inter}}}"#
+    );
+    let config = ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Fp16).unwrap();
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+
+    let generator = flip::loader::load_generator(&store, &config, 16).unwrap();
+    assert_eq!(generator.vocab_size(), vocab);
+
+    let cfg = flip::generate::GenerationConfig {
+        max_new_tokens: 4,
+        eos_token: None,
+        sampler: flip::generate::Sampler::Greedy,
+    };
+    let out1 = generator.generate(&[1, 2], &cfg).unwrap();
+    assert_eq!(out1.len(), 4);
+    assert!(out1.iter().all(|&t| (t as usize) < vocab));
+
+    // Deterministic: same model + prompt → same continuation.
+    let out2 = generator.generate(&[1, 2], &cfg).unwrap();
+    assert_eq!(out1, out2);
+}
+
+#[test]
+fn loader_ties_lm_head_to_embedding_when_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (h, vocab) = (4usize, 5usize);
+    let fill = |n: usize| -> Vec<f32> { (0..n).map(|i| (i as f32) * 0.01).collect() };
+    let tensors: Vec<(String, Vec<f32>)> = vec![
+        ("model.embed_tokens.weight".into(), fill(vocab * h)),
+        ("model.layers.0.self_attn.q_proj.weight".into(), fill(h * h)),
+        ("model.layers.0.self_attn.k_proj.weight".into(), fill(h * h)),
+        ("model.layers.0.self_attn.v_proj.weight".into(), fill(h * h)),
+        ("model.layers.0.self_attn.o_proj.weight".into(), fill(h * h)),
+        ("model.layers.0.mlp.gate_proj.weight".into(), fill(h * h)),
+        ("model.layers.0.mlp.up_proj.weight".into(), fill(h * h)),
+        ("model.layers.0.mlp.down_proj.weight".into(), fill(h * h)),
+        ("model.layers.0.input_layernorm.weight".into(), vec![1.0; h]),
+        ("model.layers.0.post_attention_layernorm.weight".into(), vec![1.0; h]),
+        ("model.norm.weight".into(), vec![1.0; h]),
+        // No lm_head.weight → should tie to the embedding.
+    ];
+    write_f32_model(tmp.path(), &tensors);
+
+    // hidden=4, heads=4 → head_dim 1, kv-heads default 4, intermediate=4.
+    let config_json = format!(
+        r#"{{"hidden_size":{h},"num_attention_heads":4,"num_hidden_layers":1,"vocab_size":{vocab},"intermediate_size":{h}}}"#
+    );
+    let config = ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Fp16).unwrap();
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let generator = flip::loader::load_generator(&store, &config, 8).unwrap();
+    let out = generator
+        .generate(&[0], &flip::generate::GenerationConfig::default())
+        .unwrap();
+    assert!(!out.is_empty());
+}
+
 #[test]
 fn orchestrator_drives_stub_kernel_with_kv_growth() {
     use flip::cache::{KvCacheConfig, PagedKvCache};
