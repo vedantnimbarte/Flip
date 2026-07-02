@@ -10,7 +10,7 @@
 use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
 use flip::cli::{Cli, Command, GenerateArgs, ProfileArgs, ServeArgs};
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
+use flip::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
 use flip::generate::{GenerationConfig, Generator, Sampler};
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
@@ -59,12 +59,48 @@ impl Rng {
     }
 }
 
-/// `flip generate` — end-to-end CPU generation over a synthetic random model.
+/// `flip generate` — end-to-end CPU generation. Loads a real model when
+/// `--model-path` is given, otherwise synthesizes a random one.
 fn run_generate(args: GenerateArgs) -> Result<()> {
     println!("flip v{}", env!("CARGO_PKG_VERSION"));
     println!("  gpu backend  : {}", gpu::active_vendor().label());
     println!();
 
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: args.max_new_tokens,
+        eos_token: args.eos_token,
+        sampler: Sampler::Greedy,
+    };
+
+    if let Some(dir) = &args.model_path {
+        // Real model: parse config, map shards, materialize LayerTensors.
+        let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
+        let store = MmapStore::open_dir(dir)?;
+        if let Some(&max) = args.prompt.iter().max() {
+            if (max as usize) >= config.vocab_size as usize {
+                return Err(FlipError::InvalidConfig(format!(
+                    "prompt token {max} out of vocab range {}",
+                    config.vocab_size
+                )));
+            }
+        }
+        let max_context = (args.prompt.len() + args.max_new_tokens) as u32;
+        let generator = flip::loader::load_generator(&store, &config, max_context)?;
+
+        println!("generate     : model {}", dir.display());
+        println!(
+            "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
+            config.vocab_size,
+            config.hidden_size,
+            config.num_layers,
+            config.num_attention_heads,
+            config.num_kv_heads,
+            config.head_dim(),
+        );
+        return print_generation(&generator, &args.prompt, &gen_cfg);
+    }
+
+    // Synthetic random model (demonstration).
     if args.hidden_size == 0 || args.num_heads == 0 || args.num_kv_heads == 0 {
         return Err(FlipError::InvalidConfig("dimensions must be > 0".into()));
     }
@@ -153,22 +189,26 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         args.num_kv_heads,
         head_dim,
     );
-    println!("prompt       : {:?}", args.prompt);
-
-    let gen_cfg = GenerationConfig {
-        max_new_tokens: args.max_new_tokens,
-        eos_token: args.eos_token,
-        sampler: Sampler::Greedy,
-    };
-    let generated = generator.generate(&args.prompt, &gen_cfg)?;
-
-    let mut full = args.prompt.clone();
-    full.extend_from_slice(&generated);
-    println!("generated    : {generated:?}");
-    println!("sequence     : {full:?}");
+    print_generation(&generator, &args.prompt, &gen_cfg)?;
     println!();
     println!("note         : weights are untrained random values — token ids are");
     println!("               deterministic but not meaningful text.");
+    Ok(())
+}
+
+/// Run a generator over `prompt` and print the prompt, continuation, and the
+/// full token sequence.
+fn print_generation<K: ComputeKernel>(
+    generator: &Generator<K>,
+    prompt: &[u32],
+    cfg: &GenerationConfig,
+) -> Result<()> {
+    println!("prompt       : {prompt:?}");
+    let generated = generator.generate(prompt, cfg)?;
+    let mut full = prompt.to_vec();
+    full.extend_from_slice(&generated);
+    println!("generated    : {generated:?}");
+    println!("sequence     : {full:?}");
     Ok(())
 }
 

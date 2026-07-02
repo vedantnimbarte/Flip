@@ -145,6 +145,11 @@ pub struct GenerateArgs {
     #[arg(long, value_delimiter = ',', default_value = "1")]
     pub prompt: Vec<u32>,
 
+    /// Load a real model from this directory (config.json + safetensors).
+    /// When set, the synthetic-model geometry flags below are ignored.
+    #[arg(long, value_name = "DIR")]
+    pub model_path: Option<std::path::PathBuf>,
+
     /// Number of new tokens to generate.
     #[arg(long, default_value_t = 16)]
     pub max_new_tokens: usize,
