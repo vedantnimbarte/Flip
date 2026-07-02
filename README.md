@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="flip logo" width="200">
+</p>
+
 # flip
 
 **Dynamic layer-streaming inference engine** — run massive LLMs (70B, 405B+) on
