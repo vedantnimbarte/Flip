@@ -8,9 +8,34 @@
 use flip::memory::{page_size, PinKind, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::profiler::VramProfiler;
-use flip::storage::MmapStore;
+use flip::storage::{LayerCatalog, MmapStore};
 use flip::swap::LayerSwapPlan;
 use std::io::Write;
+
+/// Serialize a multi-tensor safetensors file (byte tensors) into `dir`.
+fn write_multi_tensor(dir: &std::path::Path, tensors: &[(&str, usize)]) -> std::path::PathBuf {
+    // Build the header with sequential data offsets, then a matching data blob.
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    for (name, len) in tensors {
+        entries.push(format!(
+            r#""{name}":{{"dtype":"U8","shape":[{len}],"data_offsets":[{offset},{}]}}"#,
+            offset + len
+        ));
+        offset += len;
+    }
+    let header = format!("{{{}}}", entries.join(","));
+    let header_bytes = header.as_bytes();
+    let data: Vec<u8> = vec![0u8; offset];
+
+    let path = dir.join("model-00001-of-00001.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(header_bytes).unwrap();
+    f.write_all(&data).unwrap();
+    f.flush().unwrap();
+    path
+}
 
 /// Serialize a minimal one-tensor safetensors file into `dir` and return its path.
 fn write_safetensors(dir: &std::path::Path, tensor: &str, data: &[u8]) -> std::path::PathBuf {
@@ -55,6 +80,34 @@ fn mmap_store_rejects_unknown_tensor() {
     write_safetensors(tmp.path(), "a", &[1, 2, 3, 4]);
     let store = MmapStore::open_dir(tmp.path()).unwrap();
     assert!(store.tensor_bytes("missing").is_err());
+}
+
+#[test]
+fn catalog_groups_layers_and_pinned_overhead() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_multi_tensor(
+        tmp.path(),
+        &[
+            ("model.embed_tokens.weight", 1000),
+            ("model.layers.0.self_attn.q_proj.weight", 400),
+            ("model.layers.0.mlp.down_proj.weight", 600), // layer 0 total = 1000
+            ("model.layers.1.self_attn.q_proj.weight", 800), // layer 1 total = 800
+            ("model.norm.weight", 50),
+            ("lm_head.weight", 1000),
+        ],
+    );
+
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let catalog = LayerCatalog::build(&store);
+
+    assert_eq!(catalog.num_layers(), 2);
+    assert_eq!(catalog.layer_bytes(0), Some(1000));
+    assert_eq!(catalog.layer_bytes(1), Some(800));
+    assert_eq!(catalog.max_layer_bytes(), 1000);
+    assert_eq!(catalog.mean_layer_bytes(), 900);
+    assert_eq!(catalog.total_layer_bytes(), 1800);
+    // Pinned = embed(1000) + norm(50) + lm_head(1000) = 2050.
+    assert_eq!(catalog.pinned_bytes(), 2050);
 }
 
 #[test]
