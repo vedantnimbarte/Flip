@@ -69,6 +69,7 @@ and copies hide under GPU compute.
 | Page-locked host staging buffers | [`src/memory`](src/memory) |
 | Linear layer-swap cycle | [`src/swap`](src/swap) |
 | Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) |
+| PagedAttention block-paged KV cache | [`src/cache`](src/cache) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
 The GPU-specific paths are behind `cuda` / `rocm`
@@ -204,6 +205,7 @@ src/
 ├── memory/           # page-size discovery + page-locked staging buffers
 ├── swap/             # linear layer-swap cycle (windows over the model)
 ├── pipeline/         # double-buffered A/B schedule + host executor
+├── cache/            # PagedAttention block-paged KV cache
 └── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
 tests/
 └── phase1.rs         # integration tests
