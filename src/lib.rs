@@ -5,9 +5,11 @@
 
 pub mod cuda;
 pub mod error;
+pub mod memory;
 pub mod model;
 pub mod storage;
 
 pub use error::{FlipError, Result};
+pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};
 pub use storage::{MmapShard, MmapStore};
