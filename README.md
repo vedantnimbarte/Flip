@@ -248,6 +248,14 @@ otherwise a raw byte tokenizer:
 cargo run -- generate --model-path /path/to/small-model --text "Hello"
 ```
 
+By default generation runs on the CPU. On a `cuda-kernels` build, `--device gpu`
+runs the same model through `GpuKernel` instead (the CLI errors with a clear
+message if the binary wasn't built with the feature):
+
+```bash
+cargo run --features cuda-kernels -- generate --model-path /path/to/small-model --device gpu
+```
+
 The standalone `tokenize` subcommand shows the encoder round-trip:
 
 ```bash
