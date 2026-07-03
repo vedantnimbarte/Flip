@@ -46,6 +46,8 @@ extern "C" {
         kind: c_int,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: c_int) -> cudaError_t;
+    fn cudaDeviceSynchronize() -> cudaError_t;
     fn cudaEventCreate(event: *mut cudaEvent_t) -> cudaError_t;
     fn cudaEventDestroy(event: cudaEvent_t) -> cudaError_t;
     fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError_t;
@@ -97,4 +99,65 @@ pub(super) fn host_free(ptr: NonNull<u8>) {
     unsafe {
         let _ = cudaFreeHost(ptr.as_ptr() as *mut c_void);
     }
+}
+
+/// Allocate `bytes` of device (VRAM) memory.
+pub(super) fn device_malloc(bytes: usize) -> Result<*mut c_void> {
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: valid out-pointer.
+    let code = unsafe { cudaMalloc(&mut raw, bytes.max(1)) };
+    if code != CUDA_SUCCESS {
+        return Err(FlipError::Gpu {
+            api: "cudaMalloc",
+            code,
+        });
+    }
+    Ok(raw)
+}
+
+/// Free device memory from [`device_malloc`].
+pub(super) fn device_free(ptr: *mut c_void) {
+    // SAFETY: `ptr` came from `cudaMalloc` and is freed exactly once.
+    unsafe {
+        let _ = cudaFree(ptr);
+    }
+}
+
+/// Synchronous host→device copy.
+pub(super) fn copy_h2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+    // SAFETY: caller guarantees `bytes` valid on both sides.
+    let code = unsafe { cudaMemcpy(dst, src, bytes, CUDA_MEMCPY_HOST_TO_DEVICE) };
+    if code != CUDA_SUCCESS {
+        return Err(FlipError::Gpu {
+            api: "cudaMemcpy(H2D)",
+            code,
+        });
+    }
+    Ok(())
+}
+
+/// Synchronous device→host copy.
+pub(super) fn copy_d2h(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+    // SAFETY: caller guarantees `bytes` valid on both sides.
+    let code = unsafe { cudaMemcpy(dst, src, bytes, CUDA_MEMCPY_DEVICE_TO_HOST) };
+    if code != CUDA_SUCCESS {
+        return Err(FlipError::Gpu {
+            api: "cudaMemcpy(D2H)",
+            code,
+        });
+    }
+    Ok(())
+}
+
+/// Block until all device work completes.
+pub(super) fn synchronize() -> Result<()> {
+    // SAFETY: no arguments.
+    let code = unsafe { cudaDeviceSynchronize() };
+    if code != CUDA_SUCCESS {
+        return Err(FlipError::Gpu {
+            api: "cudaDeviceSynchronize",
+            code,
+        });
+    }
+    Ok(())
 }

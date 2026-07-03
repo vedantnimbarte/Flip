@@ -23,6 +23,8 @@ use std::ptr::NonNull;
 mod ffi_cuda;
 #[cfg(feature = "rocm")]
 mod ffi_hip;
+#[cfg(feature = "cuda")]
+pub mod device;
 
 /// Which GPU runtime this binary was compiled against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
