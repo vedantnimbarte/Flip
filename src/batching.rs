@@ -32,7 +32,6 @@ struct Active<'a, K: ComputeKernel> {
     session: GenerationSession<'a, K>,
     remaining: usize,
     eos: Option<u32>,
-    output: Vec<u32>,
 }
 
 /// A completed request.
@@ -42,13 +41,21 @@ pub struct Finished {
     pub tokens: Vec<u32>,
 }
 
+/// What one scheduler tick produced: `(request id, token)` pairs emitted this
+/// step, and the ids of requests that finished (their last token is in
+/// `produced`). Streaming consumers forward `produced` and close on `finished`.
+#[derive(Debug, Clone, Default)]
+pub struct Tick {
+    pub produced: Vec<(u64, u32)>,
+    pub finished: Vec<u64>,
+}
+
 /// A continuous-batching scheduler over a borrowed generator.
 pub struct BatchScheduler<'a, K: ComputeKernel> {
     generator: &'a Generator<K>,
     max_batch: usize,
     pending: VecDeque<Pending>,
     active: Vec<Active<'a, K>>,
-    finished: Vec<Finished>,
 }
 
 impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
@@ -59,7 +66,6 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             max_batch: max_batch.max(1),
             pending: VecDeque::new(),
             active: Vec::new(),
-            finished: Vec::new(),
         }
     }
 
@@ -94,14 +100,13 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     }
 
     /// Fill free slots from the pending queue (prefilling each new session).
-    fn admit(&mut self) -> Result<()> {
+    /// Returns ids of requests that finished immediately (zero max tokens).
+    fn admit(&mut self) -> Result<Vec<u64>> {
+        let mut zero_finished = Vec::new();
         while self.active.len() < self.max_batch {
             let Some(p) = self.pending.pop_front() else { break };
             if p.max_new_tokens == 0 {
-                self.finished.push(Finished {
-                    id: p.id,
-                    tokens: Vec::new(),
-                });
+                zero_finished.push(p.id);
                 continue;
             }
             let session = self.generator.start_session(&p.prompt, Sampler::Greedy)?;
@@ -110,41 +115,51 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 session,
                 remaining: p.max_new_tokens,
                 eos: p.eos,
-                output: Vec::new(),
             });
         }
-        Ok(())
+        Ok(zero_finished)
     }
 
-    /// One scheduler tick: admit, advance every active session by one token,
-    /// retire any that finished.
-    pub fn step(&mut self) -> Result<()> {
-        self.admit()?;
+    /// One scheduler tick: admit queued requests, advance every active session by
+    /// one token, and retire any that finished. Returns the tokens produced and
+    /// the ids that completed this tick (for streaming).
+    pub fn step(&mut self) -> Result<Tick> {
+        let zero_finished = self.admit()?;
+        let mut tick = Tick::default();
+        tick.finished = zero_finished;
         let mut still_active = Vec::with_capacity(self.active.len());
         for mut a in self.active.drain(..) {
             let token = a.session.step()?;
-            a.output.push(token);
+            tick.produced.push((a.id, token));
             a.remaining -= 1;
-            let done = a.remaining == 0 || Some(token) == a.eos;
-            if done {
-                self.finished.push(Finished {
-                    id: a.id,
-                    tokens: std::mem::take(&mut a.output),
-                });
+            if a.remaining == 0 || Some(token) == a.eos {
+                tick.finished.push(a.id);
             } else {
                 still_active.push(a);
             }
         }
         self.active = still_active;
-        Ok(())
+        Ok(tick)
     }
 
     /// Run ticks until every request has completed, returning the results (in
-    /// completion order).
+    /// completion order). Convenience wrapper over [`step`](Self::step).
     pub fn run(&mut self) -> Result<Vec<Finished>> {
+        use std::collections::HashMap;
+        let mut outputs: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut results = Vec::new();
         while self.has_work() {
-            self.step()?;
+            let tick = self.step()?;
+            for (id, token) in tick.produced {
+                outputs.entry(id).or_default().push(token);
+            }
+            for id in tick.finished {
+                results.push(Finished {
+                    id,
+                    tokens: outputs.remove(&id).unwrap_or_default(),
+                });
+            }
         }
-        Ok(std::mem::take(&mut self.finished))
+        Ok(results)
     }
 }
