@@ -9,7 +9,9 @@
 
 use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
-use flip::cli::{Cli, Command, Device, GenerateArgs, ProfileArgs, ServeArgs, TokenizeArgs};
+use flip::cli::{
+    Cli, Command, Device, DistributedMode, GenerateArgs, ProfileArgs, ServeArgs, TokenizeArgs,
+};
 #[cfg(feature = "cuda-kernels")]
 use flip::forward::GpuKernel;
 use flip::forward::{BlockConfig, ComputeKernel, LayerTensors};
@@ -372,18 +374,49 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     println!("model source : config.json in {}", args.model_path.display());
     print_geometry(&config);
 
-    report_plan(
-        &config,
-        Some(&args.model_path),
-        args.context_length,
-        args.vram_budget_gb,
-        args.ram_cache_gb,
-    )?;
+    let store = MmapStore::open_dir(&args.model_path)?;
+    let parts = flip::loader::load_model_parts(&store, &config, args.context_length)?;
+    let listen = format!("{}:{}", args.host, args.port);
 
-    println!();
-    println!("note         : model prepared; the inference serving loop is not yet");
-    println!("               implemented (Phase 3 — OpenAI-compatible API server).");
-    Ok(())
+    match args.distributed_mode {
+        DistributedMode::Worker => {
+            // Serve this node's layer shard (the whole model here) to a master.
+            let worker = flip::distributed::Worker::new(parts.cfg, parts.layers)?;
+            let listener = flip::distributed::worker::bind(&listen)?;
+            println!();
+            println!("worker node  : listening on {listen} ({} layers)", config.num_layers);
+            worker.serve(listener)?; // blocks
+            Ok(())
+        }
+        DistributedMode::Standalone | DistributedMode::Master => {
+            let generator = parts.into_cpu_generator()?;
+            let tokenizer = if args.model_path.join("vocab.json").exists()
+                && args.model_path.join("merges.txt").exists()
+            {
+                BpeTokenizer::from_dir(&args.model_path)?
+            } else {
+                BpeTokenizer::bytes_only()
+            };
+            let created = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let engine = std::sync::Arc::new(flip::server::Engine::new(
+                generator, tokenizer, "flip", 128, created,
+            ));
+            let server = flip::server::HttpServer::bind(&listen)?;
+            println!();
+            println!("serving      : OpenAI-compatible API on http://{listen}");
+            println!("  endpoints  : POST /v1/chat/completions, POST /v1/completions, GET /v1/models");
+            if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
+                println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
+                println!("               currently runs the model locally (distributed routing available");
+                println!("               via flip::distributed::Coordinator).");
+            }
+            server.serve(flip::server::router(engine))?; // blocks
+            Ok(())
+        }
+    }
 }
 
 /// Shared planner/reporter: map the model (if a dir is given), profile it, size
