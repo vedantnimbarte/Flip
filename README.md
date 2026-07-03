@@ -220,11 +220,14 @@ cargo run -- serve \
     --port 8000 \
     --host 127.0.0.1
 
-# then, from another shell:
+# then, from another shell (add "stream": true for token-by-token SSE):
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"flip","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
+
+Concurrent requests are continuously batched by a background scheduler, and
+`"stream": true` streams the reply as Server-Sent Events.
 
 With `--distributed-mode worker` the process instead serves its layer shard to a
 master over TCP (see [Distributed & scaling](#distributed--scaling)).
@@ -396,8 +399,10 @@ The Phase 3 serving and scaling components (all CPU-testable, driven by the same
 inference engine):
 
 - **OpenAI-compatible server** ([`src/server`](src/server)) — a dependency-free
-  HTTP/1.1 server exposing `/v1/chat/completions`, `/v1/completions`, `/v1/models`.
-  Wraps a generator + tokenizer; started by `flip serve`.
+  HTTP/1.1 server exposing `/v1/chat/completions` (with `stream: true` SSE),
+  `/v1/completions`, `/v1/models`. Behind it, an `EngineService` runs a background
+  batching thread so concurrent requests are **continuously batched** and each can
+  be **streamed** to the client token by token. Started by `flip serve`.
 - **Speculative decoding** ([`src/speculative.rs`](src/speculative.rs)) — a cheap
   draft model proposes `gamma` tokens, the target verifies them; accepted tokens
   advance in bulk. With greedy sampling the output is provably **identical** to
