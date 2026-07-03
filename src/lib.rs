@@ -7,6 +7,7 @@ pub mod activation;
 pub mod batching;
 pub mod cache;
 pub mod cli;
+pub mod distributed;
 pub mod error;
 pub mod forward;
 pub mod generate;

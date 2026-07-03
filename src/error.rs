@@ -54,6 +54,9 @@ pub enum FlipError {
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
 
+    #[error("distributed/network error: {0}")]
+    Network(String),
+
     #[error("host memory allocation failed for {bytes} bytes (align {align})")]
     HostAlloc { bytes: usize, align: usize },
 
