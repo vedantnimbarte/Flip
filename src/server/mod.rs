@@ -3,5 +3,5 @@
 pub mod http;
 pub mod openai;
 
-pub use http::{HttpServer, Request, Response};
+pub use http::{Body, HttpServer, Request, Response};
 pub use openai::{Engine, router, ChatMessage, Completion};

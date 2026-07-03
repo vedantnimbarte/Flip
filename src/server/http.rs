@@ -28,12 +28,20 @@ impl Request {
     }
 }
 
+/// A response body: either a complete buffer or a streaming writer (for SSE).
+pub enum Body {
+    /// A complete, length-known body.
+    Full(Vec<u8>),
+    /// A streaming body: the closure writes directly to the socket and returns
+    /// when the stream is complete. Sent without `Content-Length`.
+    Stream(Box<dyn FnOnce(&mut dyn Write) -> std::io::Result<()> + Send>),
+}
+
 /// An HTTP response.
-#[derive(Debug, Clone)]
 pub struct Response {
     pub status: u16,
     pub content_type: String,
-    pub body: Vec<u8>,
+    pub body: Body,
 }
 
 impl Response {
@@ -42,7 +50,7 @@ impl Response {
         Self {
             status,
             content_type: "application/json".to_string(),
-            body: body.into(),
+            body: Body::Full(body.into()),
         }
     }
 
@@ -51,19 +59,32 @@ impl Response {
         Self {
             status,
             content_type: "text/plain; charset=utf-8".to_string(),
-            body: body.into(),
+            body: Body::Full(body.into()),
         }
     }
 
-    fn reason(&self) -> &'static str {
-        match self.status {
-            200 => "OK",
-            400 => "Bad Request",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            500 => "Internal Server Error",
-            _ => "OK",
+    /// A streaming response — `write` is invoked with the socket to emit the body
+    /// incrementally (e.g. Server-Sent Events).
+    pub fn stream<F>(status: u16, content_type: impl Into<String>, write: F) -> Self
+    where
+        F: FnOnce(&mut dyn Write) -> std::io::Result<()> + Send + 'static,
+    {
+        Self {
+            status,
+            content_type: content_type.into(),
+            body: Body::Stream(Box::new(write)),
         }
+    }
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "OK",
     }
 }
 
@@ -154,19 +175,33 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
         body,
     };
     let response = handler(&request);
-    write_response(reader.get_mut(), &response)
+    write_response(reader.get_mut(), response)
 }
 
-fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.status,
-        response.reason(),
-        response.content_type,
-        response.body.len(),
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(&response.body)?;
+fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
+    match response.body {
+        Body::Full(bytes) => {
+            let head = format!(
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.status,
+                reason(response.status),
+                response.content_type,
+                bytes.len(),
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(&bytes)?;
+        }
+        Body::Stream(write) => {
+            let head = format!(
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                response.status,
+                reason(response.status),
+                response.content_type,
+            );
+            stream.write_all(head.as_bytes())?;
+            write(stream)?;
+        }
+    }
     stream.flush()
 }
 
