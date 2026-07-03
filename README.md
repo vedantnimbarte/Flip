@@ -106,6 +106,7 @@ limit.
 | CPU forward path — real decode block (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
 | CPU token-generation loop (embed → stack → LM head → sample) | [`src/generate.rs`](src/generate.rs) |
 | Safetensors → CPU model loader (F32/F16/BF16) | [`src/loader.rs`](src/loader.rs) |
+| Byte-level BPE tokenizer (encode/decode + vocab/merges) | [`src/tokenizer.rs`](src/tokenizer.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
@@ -142,13 +143,14 @@ cargo build            # debug build
 cargo build --release  # optimized build
 ```
 
-The binary exposes three subcommands:
+The binary exposes these subcommands:
 
 ```bash
 cargo run -- --help          # top-level help
 cargo run -- profile         # profile a sample 70B-class model (no GPU needed)
 cargo run -- serve --help    # full serve flag list (specs §4)
 cargo run -- generate --help # end-to-end CPU generation on a synthetic model
+cargo run -- tokenize --help # byte-level BPE encode/decode round-trip
 ```
 
 **`profile`** — with no `--model-path` it profiles a representative
@@ -234,8 +236,24 @@ embedding, and LM head:
 cargo run -- generate --model-path /path/to/small-model --prompt 1,2,3
 ```
 
-(Still no tokenizer, so prompt/output are token ids; quantized `qweight`
-checkpoints route through the dequant kernel — the loader covers float dtypes.)
+Provide a **text** prompt (tokenized with a byte-level BPE tokenizer) instead of
+raw ids. It uses the model directory's `vocab.json` + `merges.txt` if present,
+otherwise a raw byte tokenizer:
+
+```bash
+cargo run -- generate --model-path /path/to/small-model --text "Hello"
+```
+
+The standalone `tokenize` subcommand shows the encoder round-trip:
+
+```bash
+cargo run -- tokenize --text "Hello, world!"
+# ids        : [72, 101, 108, 108, 111, 44, 32, 119, 111, 114, 108, 100, 33]
+# round-trip : "Hello, world!" (ok)
+```
+
+(Quantized `qweight` checkpoints route through the dequant kernel — the loader
+covers float dtypes.)
 
 ## Running the tests
 
@@ -294,6 +312,7 @@ src/
 ├── forward/          # forward-pass orchestration + real CPU decode block
 ├── generate.rs       # CPU token-generation loop (embed / LM head / sampling)
 ├── loader.rs         # safetensors → CPU model (F32/F16/BF16)
+├── tokenizer.rs      # byte-level BPE tokenizer (encode / decode)
 └── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
 tests/
 └── phase1.rs         # integration tests
