@@ -53,6 +53,26 @@ fn start_server() -> SocketAddr {
     addr
 }
 
+/// A server backed by a speculative engine: an identical draft is fully
+/// accepted, so acceptance stats are deterministic and non-empty.
+fn start_speculative_server() -> SocketAddr {
+    let engine = EngineService::start_speculative(
+        build_generator(),
+        build_generator(), // identical draft → 100% acceptance
+        4,                 // gamma
+        BpeTokenizer::bytes_only(),
+        256,
+        "flip-test",
+        16,
+        0,
+        4, // max batch
+    );
+    let server = HttpServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || server.serve(router(engine)).unwrap());
+    addr
+}
+
 fn post(addr: SocketAddr, path: &str, body: &str) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
     let raw = format!(
@@ -87,6 +107,45 @@ fn streaming_chat_emits_sse_chunks() {
     // Role chunk + 4 token chunks + final chunk + [DONE] → several SSE frames.
     let data_frames = resp.matches("data: ").count();
     assert!(data_frames >= 5, "expected several SSE frames, got {data_frames}\n{resp}");
+    assert!(resp.trim_end().ends_with("data: [DONE]"), "{resp}");
+}
+
+#[test]
+fn speculative_usage_reported_non_streaming() {
+    let addr = start_speculative_server();
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":6}"#;
+    let resp = post(addr, "/v1/chat/completions", body);
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(resp.contains(r#""completion_tokens":6"#), "{resp}");
+    // usage.speculative carries the acceptance breakdown.
+    assert!(resp.contains(r#""speculative""#), "{resp}");
+    assert!(resp.contains(r#""draft_proposed""#), "{resp}");
+    assert!(resp.contains(r#""draft_accepted""#), "{resp}");
+    assert!(resp.contains(r#""acceptance_rate""#), "{resp}");
+}
+
+#[test]
+fn plain_usage_omits_speculative() {
+    let addr = start_server();
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4}"#;
+    let resp = post(addr, "/v1/chat/completions", body);
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    // No draft model → no speculative block at all.
+    assert!(!resp.contains("speculative"), "plain path must omit speculative usage:\n{resp}");
+}
+
+#[test]
+fn speculative_stream_emits_usage_chunk() {
+    let addr = start_speculative_server();
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4,"stream":true}"#;
+    let resp = post(addr, "/v1/chat/completions", body);
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    // A final usage-only chunk precedes [DONE] when speculating.
+    assert!(resp.contains(r#""usage""#), "expected a usage chunk:\n{resp}");
+    assert!(resp.contains(r#""acceptance_rate""#), "{resp}");
     assert!(resp.trim_end().ends_with("data: [DONE]"), "{resp}");
 }
 

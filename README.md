@@ -415,7 +415,10 @@ inference engine):
   `BatchScheduler::with_speculative` swaps each slot for a `SpeculativeSession`,
   so **the server engine decodes speculatively** when `flip serve` is given
   `--draft-model-path` — a tick then advances a request by a whole accept/reject
-  round, streaming the accepted tokens through the same path.
+  round, streaming the accepted tokens through the same path. Per-request
+  acceptance is surfaced in the OpenAI `usage` response under a `speculative`
+  block (`draft_proposed`, `draft_accepted`, `acceptance_rate`); streaming
+  responses carry it in a final usage-only chunk.
 - **Distributed master-worker** ([`src/distributed`](src/distributed)) — layers
   are partitioned into shards across worker nodes; a coordinator streams the
   hidden state through them over a length-prefixed binary TCP protocol (bit-exact
