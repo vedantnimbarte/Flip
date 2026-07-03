@@ -9,9 +9,10 @@
 
 use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
-use flip::cli::{Cli, Command, GenerateArgs, ProfileArgs, ServeArgs};
-use flip::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
+use flip::cli::{Cli, Command, GenerateArgs, ProfileArgs, ServeArgs, TokenizeArgs};
+use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
 use flip::generate::{GenerationConfig, Generator, Sampler};
+use flip::tokenizer::BpeTokenizer;
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, TieredWeightSource};
@@ -29,7 +30,27 @@ fn main() -> Result<()> {
         Command::Profile(args) => run_profile(args),
         Command::Serve(args) => run_serve(args),
         Command::Generate(args) => run_generate(args),
+        Command::Tokenize(args) => run_tokenize(args),
     }
+}
+
+/// `flip tokenize` — encode text and report the round-trip.
+fn run_tokenize(args: TokenizeArgs) -> Result<()> {
+    let tokenizer = match &args.tokenizer {
+        Some(dir) => BpeTokenizer::from_dir(dir)?,
+        None => BpeTokenizer::bytes_only(),
+    };
+    let ids = tokenizer.encode(&args.text)?;
+    let decoded = tokenizer.decode(&ids)?;
+    println!("text       : {:?}", args.text);
+    println!("vocab      : {} tokens", tokenizer.vocab_size());
+    println!("encoded    : {} token(s)", ids.len());
+    println!("ids        : {ids:?}");
+    println!(
+        "round-trip : {decoded:?} ({})",
+        if decoded == args.text { "ok" } else { "LOSSY" }
+    );
+    Ok(())
 }
 
 /// Deterministic SplitMix64 PRNG for synthetic weights (no external deps).
@@ -60,7 +81,8 @@ impl Rng {
 }
 
 /// `flip generate` — end-to-end CPU generation. Loads a real model when
-/// `--model-path` is given, otherwise synthesizes a random one.
+/// `--model-path` is given, otherwise synthesizes a random one. With `--text`
+/// the prompt is tokenized (and the output detokenized) via a BPE tokenizer.
 fn run_generate(args: GenerateArgs) -> Result<()> {
     println!("flip v{}", env!("CARGO_PKG_VERSION"));
     println!("  gpu backend  : {}", gpu::active_vendor().label());
@@ -72,21 +94,28 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         sampler: Sampler::Greedy,
     };
 
-    if let Some(dir) = &args.model_path {
-        // Real model: parse config, map shards, materialize LayerTensors.
+    // A tokenizer is needed only for a text prompt.
+    let tokenizer = if args.text.is_some() {
+        Some(resolve_tokenizer(&args)?)
+    } else {
+        None
+    };
+
+    // Prompt token ids: tokenized text, or raw --prompt ids.
+    let prompt_ids: Vec<u32> = match (&args.text, &tokenizer) {
+        (Some(text), Some(tok)) => tok.encode(text)?,
+        _ => args.prompt.clone(),
+    };
+    if prompt_ids.is_empty() {
+        return Err(FlipError::InvalidConfig("prompt is empty".into()));
+    }
+    let max_context = (prompt_ids.len() + args.max_new_tokens) as u32;
+
+    // Build the generator: a real mapped model, or a synthetic random one.
+    let (generator, vocab_size) = if let Some(dir) = &args.model_path {
         let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
         let store = MmapStore::open_dir(dir)?;
-        if let Some(&max) = args.prompt.iter().max() {
-            if (max as usize) >= config.vocab_size as usize {
-                return Err(FlipError::InvalidConfig(format!(
-                    "prompt token {max} out of vocab range {}",
-                    config.vocab_size
-                )));
-            }
-        }
-        let max_context = (args.prompt.len() + args.max_new_tokens) as u32;
         let generator = flip::loader::load_generator(&store, &config, max_context)?;
-
         println!("generate     : model {}", dir.display());
         println!(
             "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
@@ -97,10 +126,71 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
             config.num_kv_heads,
             config.head_dim(),
         );
-        return print_generation(&generator, &args.prompt, &gen_cfg);
+        (generator, config.vocab_size as usize)
+    } else {
+        let generator = build_synthetic(&args, max_context)?;
+        println!("generate     : demo with randomly-initialized weights (seed {})", args.seed);
+        println!(
+            "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
+            args.vocab_size,
+            args.hidden_size,
+            args.num_layers,
+            args.num_heads,
+            args.num_kv_heads,
+            args.hidden_size / args.num_heads,
+        );
+        (generator, args.vocab_size)
+    };
+
+    // Prompt ids must fit the model's vocabulary.
+    if let Some(&max) = prompt_ids.iter().max() {
+        if max as usize >= vocab_size {
+            return Err(FlipError::InvalidConfig(format!(
+                "prompt token {max} out of vocab range {vocab_size} (tokenizer/model mismatch?)"
+            )));
+        }
     }
 
-    // Synthetic random model (demonstration).
+    if let Some(text) = &args.text {
+        println!("prompt text  : {text:?}");
+    }
+    println!("prompt ids   : {prompt_ids:?}");
+
+    let generated = generator.generate(&prompt_ids, &gen_cfg)?;
+    println!("generated ids: {generated:?}");
+
+    // Detokenize when a tokenizer is in play.
+    if let Some(tok) = &tokenizer {
+        println!("generated txt: {:?}", tok.decode(&generated)?);
+        let mut full = prompt_ids.clone();
+        full.extend_from_slice(&generated);
+        println!("full text    : {:?}", tok.decode(&full)?);
+    }
+
+    if args.model_path.is_none() {
+        println!();
+        println!("note         : weights are untrained random values — output is not");
+        println!("               meaningful text.");
+    }
+    Ok(())
+}
+
+/// Pick a tokenizer for `generate`: explicit `--tokenizer`, else the model
+/// directory if it ships one, else a raw byte tokenizer.
+fn resolve_tokenizer(args: &GenerateArgs) -> Result<BpeTokenizer> {
+    if let Some(dir) = &args.tokenizer {
+        return BpeTokenizer::from_dir(dir);
+    }
+    if let Some(dir) = &args.model_path {
+        if dir.join("vocab.json").exists() && dir.join("merges.txt").exists() {
+            return BpeTokenizer::from_dir(dir);
+        }
+    }
+    Ok(BpeTokenizer::bytes_only())
+}
+
+/// Build a synthetic random-weight generator from the geometry flags.
+fn build_synthetic(args: &GenerateArgs, max_context: u32) -> Result<Generator<CpuKernel>> {
     if args.hidden_size == 0 || args.num_heads == 0 || args.num_kv_heads == 0 {
         return Err(FlipError::InvalidConfig("dimensions must be > 0".into()));
     }
@@ -116,14 +206,6 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
             args.num_heads, args.num_kv_heads
         )));
     }
-    if let Some(&max) = args.prompt.iter().max() {
-        if (max as usize) >= args.vocab_size {
-            return Err(FlipError::InvalidConfig(format!(
-                "prompt token {max} out of vocab range {}",
-                args.vocab_size
-            )));
-        }
-    }
 
     let head_dim = args.hidden_size / args.num_heads;
     let cfg = BlockConfig {
@@ -136,7 +218,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         rms_eps: 1e-5,
     };
 
-    // Synthesize small random weights (RMSNorm keeps activations bounded).
+    // Small random weights (RMSNorm keeps activations bounded).
     let scale = 0.02;
     let mut rng = Rng::new(args.seed);
     let layers: Vec<LayerTensors> = (0..args.num_layers)
@@ -164,11 +246,9 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         head_dim: head_dim as u32,
         block_size: 16,
     };
-    // One block per 16 tokens over the whole sequence, plus a margin.
-    let total_tokens = args.prompt.len() + args.max_new_tokens;
-    let kv_blocks = (total_tokens as u64).div_ceil(16) as u32 + 2;
+    let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
-    let generator = Generator::new(
+    Generator::new(
         kernel,
         embedding,
         final_norm,
@@ -177,39 +257,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         1e-5,
         kv_config,
         kv_blocks,
-    )?;
-
-    println!("generate     : demo with randomly-initialized weights (seed {})", args.seed);
-    println!(
-        "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
-        args.vocab_size,
-        args.hidden_size,
-        args.num_layers,
-        args.num_heads,
-        args.num_kv_heads,
-        head_dim,
-    );
-    print_generation(&generator, &args.prompt, &gen_cfg)?;
-    println!();
-    println!("note         : weights are untrained random values — token ids are");
-    println!("               deterministic but not meaningful text.");
-    Ok(())
-}
-
-/// Run a generator over `prompt` and print the prompt, continuation, and the
-/// full token sequence.
-fn print_generation<K: ComputeKernel>(
-    generator: &Generator<K>,
-    prompt: &[u32],
-    cfg: &GenerationConfig,
-) -> Result<()> {
-    println!("prompt       : {prompt:?}");
-    let generated = generator.generate(prompt, cfg)?;
-    let mut full = prompt.to_vec();
-    full.extend_from_slice(&generated);
-    println!("generated    : {generated:?}");
-    println!("sequence     : {full:?}");
-    Ok(())
+    )
 }
 
 /// Print the shared startup banner (backend + host page size).

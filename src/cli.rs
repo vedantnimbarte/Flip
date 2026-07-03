@@ -25,6 +25,21 @@ pub enum Command {
     Profile(ProfileArgs),
     /// Run the end-to-end CPU generation loop on a synthetic model (demo).
     Generate(GenerateArgs),
+    /// Tokenize text with a byte-level BPE tokenizer (round-trip check).
+    Tokenize(TokenizeArgs),
+}
+
+/// Arguments for `flip tokenize`.
+#[derive(Debug, Args)]
+pub struct TokenizeArgs {
+    /// Text to encode.
+    #[arg(long)]
+    pub text: String,
+
+    /// Directory with `vocab.json` + `merges.txt`. Defaults to a raw byte
+    /// tokenizer (256 tokens, no merges) when omitted.
+    #[arg(long, value_name = "DIR")]
+    pub tokenizer: Option<std::path::PathBuf>,
 }
 
 /// Distributed operating mode (`--distributed-mode`).
@@ -149,6 +164,15 @@ pub struct GenerateArgs {
     /// When set, the synthetic-model geometry flags below are ignored.
     #[arg(long, value_name = "DIR")]
     pub model_path: Option<std::path::PathBuf>,
+
+    /// Prompt as text, tokenized with the BPE tokenizer. Overrides `--prompt`.
+    #[arg(long)]
+    pub text: Option<String>,
+
+    /// Tokenizer directory (`vocab.json` + `merges.txt`). Defaults to the model
+    /// directory if it has them, else a raw byte tokenizer.
+    #[arg(long, value_name = "DIR")]
+    pub tokenizer: Option<std::path::PathBuf>,
 
     /// Number of new tokens to generate.
     #[arg(long, default_value_t = 16)]
@@ -285,6 +309,22 @@ mod tests {
         assert_eq!(a.vocab_size, 32);
         assert_eq!(a.num_heads, 4);
         assert!(a.eos_token.is_none());
+    }
+
+    #[test]
+    fn tokenize_and_generate_text_parse() {
+        let cli = Cli::try_parse_from(["flip", "tokenize", "--text", "hi there"]).unwrap();
+        let Command::Tokenize(a) = cli.command else {
+            panic!("expected tokenize");
+        };
+        assert_eq!(a.text, "hi there");
+        assert!(a.tokenizer.is_none());
+
+        let cli = Cli::try_parse_from(["flip", "generate", "--text", "hello"]).unwrap();
+        let Command::Generate(a) = cli.command else {
+            panic!("expected generate");
+        };
+        assert_eq!(a.text.as_deref(), Some("hello"));
     }
 
     #[test]
