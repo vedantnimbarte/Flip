@@ -601,6 +601,85 @@ fn loader_builds_generator_from_real_checkpoint() {
     assert_eq!(out1, out2);
 }
 
+/// Write a safetensors file from `(name, dtype, raw_bytes, element_count)` entries.
+fn write_typed_model(dir: &std::path::Path, entries: &[(String, &str, Vec<u8>, usize)]) {
+    let mut header = Vec::new();
+    let mut data: Vec<u8> = Vec::new();
+    let mut offset = 0usize;
+    for (name, dtype, bytes, len) in entries {
+        header.push(format!(
+            r#""{name}":{{"dtype":"{dtype}","shape":[{len}],"data_offsets":[{offset},{}]}}"#,
+            offset + bytes.len()
+        ));
+        data.extend_from_slice(bytes);
+        offset += bytes.len();
+    }
+    let header = format!("{{{}}}", header.join(","));
+    let path = dir.join("model-00001-of-00001.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(header.as_bytes()).unwrap();
+    f.write_all(&data).unwrap();
+    f.flush().unwrap();
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+fn i32_bytes(v: &[i32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+#[test]
+fn loader_materializes_gptq_quantized_projection() {
+    use flip::quant::{pack_gptq_4bit, PackedQuantConfig};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (h, nh, nkv, hd, inter, vocab) = (8usize, 2usize, 1usize, 4usize, 8usize, 6usize);
+    let q_dim = nh * hd; // 8
+    let kv_dim = nkv * hd; // 4
+    let fill = |n: usize| -> Vec<f32> { (0..n).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect() };
+
+    // Quantize q_proj: Linear(in=hidden, out=q_dim), one group.
+    let dense_in_by_out: Vec<f32> = (0..h * q_dim).map(|k| ((k % 9) as f32 - 4.0) * 0.03).collect();
+    let pcfg = PackedQuantConfig { in_features: h, out_features: q_dim, group_size: h };
+    let (qweight, qzeros, scales) = pack_gptq_4bit(&dense_in_by_out, &pcfg).unwrap();
+
+    let mut entries: Vec<(String, &str, Vec<u8>, usize)> = vec![
+        ("model.embed_tokens.weight".into(), "F32", f32_bytes(&fill(vocab * h)), vocab * h),
+        // q_proj as a GPTQ-quantized triplet.
+        ("model.layers.0.self_attn.q_proj.qweight".into(), "I32", i32_bytes(&qweight), qweight.len()),
+        ("model.layers.0.self_attn.q_proj.qzeros".into(), "I32", i32_bytes(&qzeros), qzeros.len()),
+        ("model.layers.0.self_attn.q_proj.scales".into(), "F32", f32_bytes(&scales), scales.len()),
+        // Remaining projections as plain floats.
+        ("model.layers.0.self_attn.k_proj.weight".into(), "F32", f32_bytes(&fill(kv_dim * h)), kv_dim * h),
+        ("model.layers.0.self_attn.v_proj.weight".into(), "F32", f32_bytes(&fill(kv_dim * h)), kv_dim * h),
+        ("model.layers.0.self_attn.o_proj.weight".into(), "F32", f32_bytes(&fill(h * q_dim)), h * q_dim),
+        ("model.layers.0.mlp.gate_proj.weight".into(), "F32", f32_bytes(&fill(inter * h)), inter * h),
+        ("model.layers.0.mlp.up_proj.weight".into(), "F32", f32_bytes(&fill(inter * h)), inter * h),
+        ("model.layers.0.mlp.down_proj.weight".into(), "F32", f32_bytes(&fill(h * inter)), h * inter),
+        ("model.layers.0.input_layernorm.weight".into(), "F32", f32_bytes(&vec![1.0; h]), h),
+        ("model.layers.0.post_attention_layernorm.weight".into(), "F32", f32_bytes(&vec![1.0; h]), h),
+        ("model.norm.weight".into(), "F32", f32_bytes(&vec![1.0; h]), h),
+        ("lm_head.weight".into(), "F32", f32_bytes(&fill(vocab * h)), vocab * h),
+    ];
+    write_typed_model(tmp.path(), &mut entries);
+
+    let config_json = format!(
+        r#"{{"hidden_size":{h},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"num_hidden_layers":1,"vocab_size":{vocab},"intermediate_size":{inter}}}"#
+    );
+    let config = ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Int4).unwrap();
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+
+    // Loads and runs — the quantized q_proj is dequantized into LayerTensors.
+    let generator = flip::loader::load_generator(&store, &config, 8).unwrap();
+    let out = generator
+        .generate(&[1, 2], &flip::generate::GenerationConfig { max_new_tokens: 3, eos_token: None, sampler: flip::generate::Sampler::Greedy })
+        .unwrap();
+    assert_eq!(out.len(), 3);
+    assert!(out.iter().all(|&t| (t as usize) < vocab));
+}
+
 #[test]
 fn loader_ties_lm_head_to_embedding_when_absent() {
     let tmp = tempfile::tempdir().unwrap();

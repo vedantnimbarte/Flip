@@ -18,14 +18,12 @@ use crate::error::{FlipError, Result};
 use crate::forward::{BlockConfig, CpuKernel, LayerTensors};
 use crate::generate::Generator;
 use crate::model::ModelConfig;
-use crate::storage::{bytes_to_f32, MmapStore};
+use crate::quant::{dequantize_gptq_4bit, PackedQuantConfig};
+use crate::storage::{bytes_to_f32, bytes_to_i32, MmapStore};
 
 /// Read a named tensor as `f32`, verifying it has exactly `expected_len` elements.
 fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec<f32>> {
-    let (shard, info) = store
-        .locate(name)
-        .ok_or_else(|| FlipError::UnknownTensor(name.to_string()))?;
-    let values = bytes_to_f32(shard.tensor_bytes(name)?, info.dtype)?;
+    let values = load_floats(store, name)?;
     if values.len() != expected_len {
         return Err(FlipError::InvalidConfig(format!(
             "tensor {name:?}: expected {expected_len} elements, got {}",
@@ -33,6 +31,70 @@ fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec
         )));
     }
     Ok(values)
+}
+
+/// Read a float tensor of unknown length.
+fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
+    let (shard, info) = store
+        .locate(name)
+        .ok_or_else(|| FlipError::UnknownTensor(name.to_string()))?;
+    bytes_to_f32(shard.tensor_bytes(name)?, info.dtype)
+}
+
+/// Read an integer tensor of unknown length (packed `qweight`/`qzeros`).
+fn load_ints(store: &MmapStore, name: &str) -> Result<Vec<i32>> {
+    let (shard, info) = store
+        .locate(name)
+        .ok_or_else(|| FlipError::UnknownTensor(name.to_string()))?;
+    bytes_to_i32(shard.tensor_bytes(name)?, info.dtype)
+}
+
+/// Load a linear layer's weight as dense row-major `[out, in]`, transparently
+/// handling both float (`{base}.weight`) and GPTQ-style quantized
+/// (`{base}.qweight` + `.qzeros` + `.scales`) checkpoints.
+fn load_linear(
+    store: &MmapStore,
+    base: &str,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Vec<f32>> {
+    // Float weight: already row-major [out, in].
+    let weight_name = format!("{base}.weight");
+    if store.locate(&weight_name).is_some() {
+        return load_tensor(store, &weight_name, out_features * in_features);
+    }
+
+    // GPTQ-style quantized triplet.
+    let qweight_name = format!("{base}.qweight");
+    if store.locate(&qweight_name).is_some() {
+        let qweight = load_ints(store, &qweight_name)?;
+        let qzeros = load_ints(store, &format!("{base}.qzeros"))?;
+        let scales = load_floats(store, &format!("{base}.scales"))?;
+
+        // Infer the group size from the scales shape ([in/group_size, out]).
+        if scales.is_empty() || scales.len() % out_features != 0 {
+            return Err(FlipError::QuantLayout(format!(
+                "{base}.scales length {} is not a multiple of out_features {out_features}",
+                scales.len()
+            )));
+        }
+        let num_groups = scales.len() / out_features;
+        if num_groups == 0 || in_features % num_groups != 0 {
+            return Err(FlipError::QuantLayout(format!(
+                "{base}: {num_groups} groups do not divide in_features {in_features}"
+            )));
+        }
+        let cfg = PackedQuantConfig {
+            in_features,
+            out_features,
+            group_size: in_features / num_groups,
+        };
+        return dequantize_gptq_4bit(&qweight, &qzeros, &scales, &cfg);
+    }
+
+    Err(FlipError::UnknownTensor(format!(
+        "{base}.weight or {base}.qweight"
+    )))
 }
 
 /// Build a CPU [`Generator`] from a mapped checkpoint and its config.
@@ -68,14 +130,16 @@ pub fn load_generator(
     let mut layers = Vec::with_capacity(config.num_layers as usize);
     for i in 0..config.num_layers {
         let name = |suffix: &str| format!("model.layers.{i}.{suffix}");
+        // Projections may be float or GPTQ-quantized; norms are always float.
+        // load_linear takes (in_features, out_features) of the underlying Linear.
         let tensors = LayerTensors {
-            q_proj: load_tensor(store, &name("self_attn.q_proj.weight"), q_dim * hidden)?,
-            k_proj: load_tensor(store, &name("self_attn.k_proj.weight"), kv_dim * hidden)?,
-            v_proj: load_tensor(store, &name("self_attn.v_proj.weight"), kv_dim * hidden)?,
-            o_proj: load_tensor(store, &name("self_attn.o_proj.weight"), hidden * q_dim)?,
-            gate_proj: load_tensor(store, &name("mlp.gate_proj.weight"), intermediate * hidden)?,
-            up_proj: load_tensor(store, &name("mlp.up_proj.weight"), intermediate * hidden)?,
-            down_proj: load_tensor(store, &name("mlp.down_proj.weight"), hidden * intermediate)?,
+            q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim)?,
+            k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim)?,
+            v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim)?,
+            o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden)?,
+            gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate)?,
+            up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate)?,
+            down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden)?,
             input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
             post_attention_layernorm: load_tensor(
                 store,
