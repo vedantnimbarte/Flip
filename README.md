@@ -93,7 +93,7 @@ limit.
 | Sharded checkpoint support + tensor index | [`src/storage/mmap_store.rs`](src/storage/mmap_store.rs) |
 | Layer catalog (real per-layer + pinned byte sizes) | [`src/storage/catalog.rs`](src/storage/catalog.rs) |
 | `config.json` geometry + quantization parsing | [`src/model`](src/model) |
-| 4-bit group-affine dequantization kernel (AWQ/GPTQ-style) | [`src/quant`](src/quant) |
+| 4-bit dequantization kernels — group-affine + GPTQ-packed int32 | [`src/quant`](src/quant) |
 | Tensor role classification (pinned vs. streamed) | [`src/model/naming.rs`](src/model/naming.rs) |
 | Dynamic VRAM profiling math | [`src/profiler`](src/profiler) |
 | Page-locked host staging buffers | [`src/memory`](src/memory) |
@@ -105,7 +105,7 @@ limit.
 | Forward-pass orchestration (block-level `ComputeKernel` trait) | [`src/forward`](src/forward) |
 | CPU forward path — real decode block (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
 | CPU token-generation loop (embed → stack → LM head → sample) | [`src/generate.rs`](src/generate.rs) |
-| Safetensors → CPU model loader (F32/F16/BF16) | [`src/loader.rs`](src/loader.rs) |
+| Safetensors → CPU model loader (F32/F16/BF16 + GPTQ 4-bit) | [`src/loader.rs`](src/loader.rs) |
 | Byte-level BPE tokenizer (encode/decode + vocab/merges) | [`src/tokenizer.rs`](src/tokenizer.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
@@ -252,8 +252,12 @@ cargo run -- tokenize --text "Hello, world!"
 # round-trip : "Hello, world!" (ok)
 ```
 
-(Quantized `qweight` checkpoints route through the dequant kernel — the loader
-covers float dtypes.)
+The loader handles both float (`.weight` in F32/F16/BF16) and **GPTQ-style 4-bit
+quantized** (`.qweight`/`.qzeros`/`.scales`) projections, dequantizing the latter
+into dense weights on load. (The int32 packing, grouping, and transpose are
+round-trip-tested; matching a specific exporter byte-for-byte — AWQ's nibble
+permutation, GPTQ's zero-point bias — would need real fixtures, noted in
+[`src/quant/packed.rs`](src/quant/packed.rs).)
 
 ## Running the tests
 
