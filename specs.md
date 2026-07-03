@@ -142,6 +142,7 @@ flip serve \
     --port 8000 \
     --host 127.0.0.1 \
     --draft-model-path "/home/user/models/Llama-3-3B" \
+    --draft-gamma 4 \
     --multi-gpu-ids 0,1 \
     --distributed-mode master \
     --worker-nodes 192.168.1.50:9001,192.168.1.51:9001
@@ -152,5 +153,6 @@ flip serve \
 *   `--vram-budget-gb`: Upper hardware bounds cap assigned manually to limit memory footprint.
 *   `--context-length`: Sets the targeted structural size configuration for the conversation window buffer.
 *   `--draft-model-path`: Optional path targeting a tiny model profile to enable Speculative Decoding execution.
+*   `--draft-gamma`: Draft tokens proposed per speculative round (default 4; only used with `--draft-model-path`).
 *   `--multi-gpu-ids`: Comma-separated index string to split layers across multiple local graphics adapters.
 *   `--distributed-mode`: Toggles server operational configuration state (`standalone`, `master`, or `worker`).

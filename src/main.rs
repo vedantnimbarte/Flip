@@ -360,7 +360,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     println!("  quant      : {:?}", args.quant.to_scheme());
     println!("  mode       : {:?}", args.distributed_mode);
     if let Some(draft) = &args.draft_model_path {
-        println!("  draft model: {}", draft.display());
+        println!("  draft model: {} (gamma {})", draft.display(), args.draft_gamma);
     }
     if !args.multi_gpu_ids.is_empty() {
         println!("  gpu ids    : {:?}", args.multi_gpu_ids);
@@ -425,13 +425,12 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // Batched, streaming engine: a background scheduler interleaves
             // concurrent requests a token at a time. With a draft model it
             // decodes speculatively (draft proposes, target verifies).
-            const SPEC_GAMMA: usize = 4;
             let speculative = draft.is_some();
             let engine = match draft {
                 Some(d) => flip::server::EngineService::start_speculative(
                     generator,
                     d,
-                    SPEC_GAMMA,
+                    args.draft_gamma,
                     tokenizer,
                     config.vocab_size as usize,
                     "flip",

@@ -119,6 +119,11 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     pub draft_model_path: Option<PathBuf>,
 
+    /// Draft tokens proposed per speculative round (only used with
+    /// `--draft-model-path`).
+    #[arg(long, default_value_t = 4)]
+    pub draft_gamma: usize,
+
     /// Comma-separated local GPU indices to split layers across.
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     pub multi_gpu_ids: Vec<u32>,
@@ -246,6 +251,8 @@ mod tests {
             "127.0.0.1",
             "--draft-model-path",
             "/models/Llama-3-3B",
+            "--draft-gamma",
+            "6",
             "--multi-gpu-ids",
             "0,1",
             "--distributed-mode",
@@ -264,6 +271,7 @@ mod tests {
         assert_eq!(a.port, 8000);
         assert_eq!(a.host, "127.0.0.1");
         assert_eq!(a.draft_model_path.unwrap().to_str().unwrap(), "/models/Llama-3-3B");
+        assert_eq!(a.draft_gamma, 6);
         assert_eq!(a.multi_gpu_ids, vec![0, 1]);
         assert_eq!(a.distributed_mode, DistributedMode::Master);
         assert_eq!(
@@ -283,6 +291,7 @@ mod tests {
         assert_eq!(a.host, "127.0.0.1");
         assert_eq!(a.quant, QuantArg::Int4);
         assert_eq!(a.distributed_mode, DistributedMode::Standalone);
+        assert_eq!(a.draft_gamma, 4);
         assert!(a.multi_gpu_ids.is_empty());
         assert!(a.worker_nodes.is_empty());
     }
