@@ -12,8 +12,6 @@ use flip::cache::{KvCacheConfig, PagedKvCache};
 use flip::cli::{
     Cli, Command, Device, DistributedMode, GenerateArgs, ProfileArgs, ServeArgs, TokenizeArgs,
 };
-#[cfg(feature = "cuda-kernels")]
-use flip::forward::GpuKernel;
 use flip::forward::{BlockConfig, ComputeKernel, LayerTensors};
 use flip::generate::{GenerationConfig, Generator, Sampler};
 use flip::loader::ModelParts;
@@ -187,20 +185,7 @@ fn generate_on_device(
         }
         #[cfg(feature = "cuda-kernels")]
         Device::Gpu => {
-            // KV buffers must hold the whole sequence the pool was sized for.
-            let max_kv_tokens =
-                parts.kv_blocks as usize * parts.kv_config.block_size as usize;
-            let kernel = GpuKernel::new(parts.cfg, parts.layers, max_kv_tokens)?;
-            let generator = Generator::new(
-                kernel,
-                parts.embedding,
-                parts.final_norm,
-                parts.lm_head,
-                parts.vocab_size,
-                parts.rms_eps,
-                parts.kv_config,
-                parts.kv_blocks,
-            )?;
+            let generator = parts.into_gpu_generator()?;
             run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
         }
         #[cfg(not(feature = "cuda-kernels"))]
@@ -375,12 +360,12 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     print_geometry(&config);
 
     let store = MmapStore::open_dir(&args.model_path)?;
-    let parts = flip::loader::load_model_parts(&store, &config, args.context_length)?;
     let listen = format!("{}:{}", args.host, args.port);
 
     match args.distributed_mode {
         DistributedMode::Worker => {
             // Serve this node's layer shard (the whole model here) to a master.
+            let parts = flip::loader::load_model_parts(&store, &config, args.context_length)?;
             let worker = flip::distributed::Worker::new(parts.cfg, parts.layers)?;
             let listener = flip::distributed::worker::bind(&listen)?;
             println!();
@@ -389,10 +374,39 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             Ok(())
         }
         DistributedMode::Standalone | DistributedMode::Master => {
+            // The kernel modes are mutually exclusive.
+            let selected = [!args.multi_gpu_ids.is_empty(), args.stream, args.device == Device::Gpu];
+            if selected.iter().filter(|&&s| s).count() > 1 {
+                return Err(FlipError::InvalidConfig(
+                    "choose only one of --multi-gpu-ids, --stream, --device gpu".into(),
+                ));
+            }
+
+            // Streaming path: keep only a window of layers resident and stream the
+            // rest from disk, so a model can exceed the resident budget.
+            if args.stream {
+                if args.draft_model_path.is_some() {
+                    return Err(FlipError::InvalidConfig(
+                        "--stream does not support speculative decoding (--draft-model-path) yet".into(),
+                    ));
+                }
+                let window = resident_window(&config, &args);
+                println!();
+                println!(
+                    "streaming    : {window} / {} layers resident, rest streamed from disk",
+                    config.num_layers,
+                );
+                let generator =
+                    flip::loader::build_streaming_generator(store, &config, args.context_length, window)?;
+                return start_batched_server(generator, None, &args, &config, &listen);
+            }
+
+            // Non-streaming paths materialize all layers resident.
+            let parts = flip::loader::load_model_parts(&store, &config, args.context_length)?;
+
             // Optional draft model for speculative decoding. It must share the
             // target's vocabulary (same tokenizer) for the accept/reject rule to
-            // be exact. Loaded as parts so it can take the same kernel as the
-            // target below.
+            // be exact. Loaded as parts so it can take the same kernel as the target.
             let draft_parts = match &args.draft_model_path {
                 Some(dir) => {
                     let dcfg = ModelConfig::from_path(dir, args.quant.to_scheme())?;
@@ -408,15 +422,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 None => None,
             };
 
-            // Pick the compute kernel. With --multi-gpu-ids the target's layers
-            // are split into a pipeline across the local GPUs (specs §3.3); the
-            // small, pinned draft model stays on the first GPU. Both paths feed
-            // the same batched/speculative server.
-            if args.multi_gpu_ids.is_empty() {
-                let generator = parts.into_cpu_generator()?;
-                let draft = draft_parts.map(|p| p.into_cpu_generator()).transpose()?;
-                start_batched_server(generator, draft, &args, &config, &listen)
-            } else {
+            if !args.multi_gpu_ids.is_empty() {
+                // Split the target across local GPUs (specs §3.3); the small,
+                // pinned draft stays on the first GPU.
                 let ids = args.multi_gpu_ids.clone();
                 let split = flip::distributed::partition_layers(config.num_layers as usize, ids.len());
                 println!();
@@ -432,9 +440,56 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     .map(|p| p.into_pipeline_parallel_generator(&ids[..1]))
                     .transpose()?;
                 start_batched_server(generator, draft, &args, &config, &listen)
+            } else if args.device == Device::Gpu {
+                serve_on_gpu(parts, draft_parts, &args, &config, &listen)
+            } else {
+                let generator = parts.into_cpu_generator()?;
+                let draft = draft_parts.map(|p| p.into_cpu_generator()).transpose()?;
+                start_batched_server(generator, draft, &args, &config, &listen)
             }
         }
     }
+}
+
+/// Resolve the streaming resident-layer window: the explicit override, else the
+/// VRAM plan's `layers_to_load` for the model + context.
+fn resident_window(config: &ModelConfig, args: &ServeArgs) -> usize {
+    if let Some(n) = args.resident_layers {
+        return n.max(1);
+    }
+    let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
+    let plan = VramProfiler::new(args.context_length).plan_with_free(config, free_bytes);
+    (plan.layers_to_load as usize).max(1)
+}
+
+/// Serve with the GPU kernel (all layers resident in VRAM). Feature-gated on
+/// `cuda-kernels`; the draft model, if any, is also placed on the GPU.
+#[cfg(feature = "cuda-kernels")]
+fn serve_on_gpu(
+    parts: ModelParts,
+    draft_parts: Option<ModelParts>,
+    args: &ServeArgs,
+    config: &ModelConfig,
+    listen: &str,
+) -> Result<()> {
+    println!();
+    println!("device       : gpu ({})", gpu::active_vendor().label());
+    let generator = parts.into_gpu_generator()?;
+    let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
+    start_batched_server(generator, draft, args, config, listen)
+}
+
+#[cfg(not(feature = "cuda-kernels"))]
+fn serve_on_gpu(
+    _parts: ModelParts,
+    _draft_parts: Option<ModelParts>,
+    _args: &ServeArgs,
+    _config: &ModelConfig,
+    _listen: &str,
+) -> Result<()> {
+    Err(FlipError::InvalidConfig(
+        "--device gpu requires building with `--features cuda-kernels`".into(),
+    ))
 }
 
 /// Build the batched (optionally speculative) streaming engine over any compute

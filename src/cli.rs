@@ -128,6 +128,22 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     pub multi_gpu_ids: Vec<u32>,
 
+    /// Compute device for the serving engine. `gpu` requires a `cuda-kernels`
+    /// build. Ignored when `--multi-gpu-ids` or `--stream` is set.
+    #[arg(long, value_enum, default_value_t = Device::Cpu)]
+    pub device: Device,
+
+    /// Stream transformer layers from disk instead of holding them all resident,
+    /// keeping only a bounded window in memory — lets a model exceed the resident
+    /// budget. Runs on the CPU kernel.
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+
+    /// Resident layer-window size for `--stream`. Defaults to the VRAM plan's
+    /// `layers_to_load` for the model + context.
+    #[arg(long, value_name = "N")]
+    pub resident_layers: Option<usize>,
+
     /// Cluster role.
     #[arg(long, value_enum, default_value_t = DistributedMode::Standalone)]
     pub distributed_mode: DistributedMode,
