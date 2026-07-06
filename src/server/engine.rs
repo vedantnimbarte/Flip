@@ -11,7 +11,7 @@
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
-use crate::generate::Generator;
+use crate::generate::{Generator, Sampler};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ struct Job {
     prompt: Vec<u32>,
     max_new: usize,
     eos: Option<u32>,
+    sampler: Sampler,
     sink: Sender<TokenEvent>,
 }
 
@@ -127,7 +128,13 @@ impl EngineService {
     }
 
     /// Submit a request; returns a channel that yields its tokens then `Done`.
-    fn submit(&self, prompt: Vec<u32>, max_new: usize, eos: Option<u32>) -> Receiver<TokenEvent> {
+    fn submit(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        eos: Option<u32>,
+        sampler: Sampler,
+    ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let _ = self.job_tx.lock().unwrap().send(Job {
@@ -135,6 +142,7 @@ impl EngineService {
             prompt,
             max_new,
             eos,
+            sampler,
             sink,
         });
         out
@@ -216,7 +224,7 @@ fn enqueue<K: ComputeKernel>(
     sinks: &mut HashMap<u64, Sender<TokenEvent>>,
     job: Job,
 ) {
-    match sched.submit(job.id, job.prompt, job.max_new, job.eos) {
+    match sched.submit_sampled(job.id, job.prompt, job.max_new, job.eos, job.sampler) {
         Ok(()) => {
             sinks.insert(job.id, job.sink);
         }
@@ -243,6 +251,32 @@ struct ChatRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     stream: bool,
+    /// Sampling temperature (0 or absent → deterministic greedy).
+    #[serde(default)]
+    temperature: Option<f32>,
+    /// Nucleus sampling cutoff.
+    #[serde(default)]
+    top_p: Option<f32>,
+    /// Top-k truncation (non-standard OpenAI extension; 0/absent → all tokens).
+    #[serde(default)]
+    top_k: Option<u32>,
+    /// Optional RNG seed for reproducible sampling.
+    #[serde(default)]
+    seed: Option<u64>,
+}
+
+/// Build a [`Sampler`] from the request's sampling fields. Falls back to greedy
+/// when no positive temperature is given; seeds from `seed` or the request `id`.
+fn sampler_from_request(req: &ChatRequest, id: u64) -> Sampler {
+    match req.temperature {
+        Some(t) if t > 0.0 => Sampler::TopPK {
+            temperature: t,
+            top_p: req.top_p.unwrap_or(1.0),
+            top_k: req.top_k.unwrap_or(0),
+            seed: req.seed.unwrap_or(id),
+        },
+        _ => Sampler::Greedy,
+    }
 }
 
 #[derive(Serialize)]
@@ -386,14 +420,15 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Err(e) => return Response::json(400, error_json(&e)),
     };
     let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
     let prompt_tokens = ids.len();
 
     if parsed.stream {
-        stream_chat(Arc::clone(engine), ids, max_tokens, model)
+        stream_chat(Arc::clone(engine), ids, max_tokens, model, sampler)
     } else {
         // Collect the whole completion, then return it.
-        let rx = engine.submit(ids, max_tokens, None);
+        let rx = engine.submit(ids, max_tokens, None, sampler);
         let mut tokens = Vec::new();
         let mut spec = None;
         for ev in rx {
@@ -428,7 +463,13 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
 }
 
 /// Stream a chat completion as Server-Sent Events.
-fn stream_chat(engine: Arc<EngineService>, ids: Vec<u32>, max_tokens: usize, model: String) -> Response {
+fn stream_chat(
+    engine: Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    model: String,
+    sampler: Sampler,
+) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed));
         let created = engine.created;
@@ -452,7 +493,7 @@ fn stream_chat(engine: Arc<EngineService>, ids: Vec<u32>, max_tokens: usize, mod
         let prompt_tokens = ids.len();
         let mut completion_tokens = 0usize;
         let mut spec = None;
-        let rx = engine.submit(ids, max_tokens, None);
+        let rx = engine.submit(ids, max_tokens, None, sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
