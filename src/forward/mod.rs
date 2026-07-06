@@ -11,6 +11,7 @@ pub mod gpu;
 pub mod kernel;
 pub mod multigpu;
 pub mod orchestrator;
+pub mod streaming;
 
 pub use cpu::{decode_block, BlockConfig, CpuKernel, KvLayerCache, LayerTensors};
 #[cfg(feature = "cuda-kernels")]
@@ -18,3 +19,4 @@ pub use gpu::GpuKernel;
 pub use kernel::{ComputeKernel, StubKernel};
 pub use multigpu::PipelineParallelKernel;
 pub use orchestrator::ForwardOrchestrator;
+pub use streaming::{LayerSource, StreamStats, StreamingKernel};
