@@ -15,7 +15,9 @@
 
 use crate::cache::KvCacheConfig;
 use crate::error::{FlipError, Result};
-use crate::forward::{BlockConfig, CpuKernel, LayerTensors, PipelineParallelKernel};
+use crate::forward::{
+    BlockConfig, CpuKernel, LayerSource, LayerTensors, PipelineParallelKernel, StreamingKernel,
+};
 use crate::generate::Generator;
 use crate::model::ModelConfig;
 use crate::quant::{dequantize_gptq_4bit, PackedQuantConfig};
@@ -127,6 +129,23 @@ impl ModelParts {
         )
     }
 
+    /// Upload every layer to VRAM and build a generator over the GPU kernel.
+    #[cfg(feature = "cuda-kernels")]
+    pub fn into_gpu_generator(self) -> Result<Generator<crate::forward::GpuKernel>> {
+        let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
+        let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
+        Generator::new(
+            kernel,
+            self.embedding,
+            self.final_norm,
+            self.lm_head,
+            self.vocab_size,
+            self.rms_eps,
+            self.kv_config,
+            self.kv_blocks,
+        )
+    }
+
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
     /// parallelism, `specs.md` §3.3) and build a generator over the resulting
     /// [`PipelineParallelKernel`]. Off-GPU it runs on the CPU kernel with the
@@ -162,6 +181,122 @@ pub fn load_generator(
     load_model_parts(store, config, max_context)?.into_cpu_generator()
 }
 
+/// The per-block geometry a [`ModelConfig`] describes.
+fn block_config(config: &ModelConfig) -> BlockConfig {
+    BlockConfig {
+        hidden_size: config.hidden_size as usize,
+        num_heads: config.num_attention_heads as usize,
+        num_kv_heads: config.num_kv_heads as usize,
+        head_dim: config.head_dim() as usize,
+        intermediate_size: config.intermediate_size as usize,
+        rope_theta: config.rope_theta,
+        rms_eps: config.rms_eps,
+    }
+}
+
+/// Materialize one transformer layer's weights (`model.layers.{layer}.*`),
+/// handling float and GPTQ-quantized projections. This is the unit the streaming
+/// kernel pulls on demand and the resident loader pulls for every layer.
+pub(crate) fn load_layer_tensors(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    layer: u32,
+) -> Result<LayerTensors> {
+    let hidden = cfg.hidden_size;
+    let q_dim = cfg.q_dim();
+    let kv_dim = cfg.kv_dim();
+    let intermediate = cfg.intermediate_size;
+    let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
+    // load_linear takes (in_features, out_features) of the underlying Linear.
+    let tensors = LayerTensors {
+        q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim)?,
+        k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim)?,
+        v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim)?,
+        o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden)?,
+        gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate)?,
+        up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate)?,
+        down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden)?,
+        input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
+        post_attention_layernorm: load_tensor(
+            store,
+            &name("post_attention_layernorm.weight"),
+            hidden,
+        )?,
+    };
+    tensors.validate(cfg)?;
+    Ok(tensors)
+}
+
+/// A [`LayerSource`] that streams layer weights out of a memory-mapped
+/// checkpoint on demand — the production backend for [`StreamingKernel`].
+pub struct MmapLayerSource {
+    store: MmapStore,
+    cfg: BlockConfig,
+    num_layers: u32,
+}
+
+impl LayerSource for MmapLayerSource {
+    fn num_layers(&self) -> u32 {
+        self.num_layers
+    }
+    fn load_layer(&self, layer: u32) -> Result<LayerTensors> {
+        load_layer_tensors(&self.store, &self.cfg, layer)
+    }
+}
+
+/// Load only the **pinned** (always-resident) parts — token embedding, final
+/// norm, LM head — plus the KV sizing, and wrap `store`'s transformer layers in
+/// a [`StreamingKernel`] that keeps at most `resident_layers` in memory at once.
+///
+/// Peak layer-weight memory is `resident_layers × per-layer` instead of the
+/// whole model, so this serves models larger than the resident budget. Output is
+/// identical to a fully-resident run (the window is a memory knob only).
+pub fn build_streaming_generator(
+    store: MmapStore,
+    config: &ModelConfig,
+    max_context: u32,
+    resident_layers: usize,
+) -> Result<Generator<StreamingKernel<MmapLayerSource>>> {
+    let cfg = block_config(config);
+    let hidden = cfg.hidden_size;
+    let vocab = config.vocab_size as usize;
+
+    // Pinned zone: embedding + norm + head stay resident (loaded once).
+    let embedding = load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?;
+    let final_norm = load_tensor(&store, "model.norm.weight", hidden)?;
+    let lm_head = if store.locate("lm_head.weight").is_some() {
+        load_tensor(&store, "lm_head.weight", vocab * hidden)?
+    } else {
+        embedding.clone()
+    };
+
+    let kv_config = KvCacheConfig {
+        num_layers: config.num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
+
+    // Streaming zone: layers materialize on demand from the mapped store.
+    let source = MmapLayerSource {
+        store,
+        cfg,
+        num_layers: config.num_layers,
+    };
+    let kernel = StreamingKernel::new(cfg, source, resident_layers);
+    Generator::new(
+        kernel,
+        embedding,
+        final_norm,
+        lm_head,
+        vocab,
+        config.rms_eps,
+        kv_config,
+        kv_blocks,
+    )
+}
+
 /// Materialize a checkpoint into [`ModelParts`] (host `f32` weights + shapes).
 ///
 /// `max_context` sizes the KV block pool (tokens the sequence may reach). Uses
@@ -174,46 +309,15 @@ pub fn load_model_parts(
     max_context: u32,
 ) -> Result<ModelParts> {
     let hidden = config.hidden_size as usize;
-    let num_heads = config.num_attention_heads as usize;
     let num_kv_heads = config.num_kv_heads as usize;
     let head_dim = config.head_dim() as usize;
-    let intermediate = config.intermediate_size as usize;
     let vocab = config.vocab_size as usize;
 
-    let cfg = BlockConfig {
-        hidden_size: hidden,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        intermediate_size: intermediate,
-        rope_theta: config.rope_theta,
-        rms_eps: config.rms_eps,
-    };
-    let q_dim = cfg.q_dim();
-    let kv_dim = cfg.kv_dim();
+    let cfg = block_config(config);
 
     let mut layers = Vec::with_capacity(config.num_layers as usize);
     for i in 0..config.num_layers {
-        let name = |suffix: &str| format!("model.layers.{i}.{suffix}");
-        // Projections may be float or GPTQ-quantized; norms are always float.
-        // load_linear takes (in_features, out_features) of the underlying Linear.
-        let tensors = LayerTensors {
-            q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim)?,
-            k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim)?,
-            v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim)?,
-            o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden)?,
-            gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate)?,
-            up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate)?,
-            down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden)?,
-            input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
-            post_attention_layernorm: load_tensor(
-                store,
-                &name("post_attention_layernorm.weight"),
-                hidden,
-            )?,
-        };
-        tensors.validate(&cfg)?;
-        layers.push(tensors);
+        layers.push(load_layer_tensors(store, &cfg, i)?);
     }
 
     let embedding = load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?;
