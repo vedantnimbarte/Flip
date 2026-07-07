@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::forward::cpu::{decode_block, BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -104,6 +104,18 @@ struct Shared<S: LayerSource> {
     cache: Mutex<LayerLru>,
     /// Signaled when a layer finishes loading, so waiters can recheck.
     ready: Condvar,
+    /// EWMA of a layer load's duration (ns), for auto prefetch depth.
+    load_ns: AtomicU64,
+    /// EWMA of a block's compute duration (ns), for auto prefetch depth.
+    compute_ns: AtomicU64,
+}
+
+/// Fold `sample` into an exponential moving average in `slot` (¼ weight on the
+/// new value). Relaxed and racy on purpose — it only feeds a heuristic.
+fn ewma(slot: &AtomicU64, sample: u64) {
+    let old = slot.load(Ordering::Relaxed);
+    let new = if old == 0 { sample } else { (old * 3 + sample) / 4 };
+    slot.store(new, Ordering::Relaxed);
 }
 
 impl<S: LayerSource> Shared<S> {
@@ -126,7 +138,9 @@ impl<S: LayerSource> Shared<S> {
             // We own the load. Release the lock so compute/other loads proceed.
             cache.loading.insert(layer);
             drop(cache);
+            let t = std::time::Instant::now();
             let loaded = self.source.load_layer(layer);
+            ewma(&self.load_ns, t.elapsed().as_nanos() as u64);
             let mut cache = self.cache.lock().unwrap();
             cache.loading.remove(&layer);
             self.ready.notify_all();
@@ -167,7 +181,10 @@ pub struct StreamingKernel<S: LayerSource + 'static> {
     num_layers: u32,
     /// How many layers ahead to keep loading (1 = just the next). Clamped to
     /// `window - 1` so prefetched layers aren't evicted before they're used.
+    /// Ignored when `auto` is set.
     prefetch_depth: u32,
+    /// Auto-tune the depth from measured load-vs-compute time each block.
+    auto: bool,
     /// Resident window size (LRU capacity), for clamping the depth.
     window: u32,
     /// Requests to prefetch a layer; `None` once the kernel is being dropped.
@@ -186,6 +203,8 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
             source,
             cache: Mutex::new(LayerLru::new(resident_layers)),
             ready: Condvar::new(),
+            load_ns: AtomicU64::new(0),
+            compute_ns: AtomicU64::new(0),
         });
         let (tx, rx) = channel::<u32>();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -208,6 +227,7 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
             num_layers,
             // Default: one layer ahead (clamped to the window).
             prefetch_depth: 1.min(window.saturating_sub(1)),
+            auto: false,
             window,
             prefetch_tx: Some(tx),
             worker: Some(worker),
@@ -222,7 +242,43 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
     /// prefetch.
     pub fn with_prefetch_depth(mut self, depth: u32) -> Self {
         self.prefetch_depth = depth.min(self.window.saturating_sub(1));
+        self.auto = false;
         self
+    }
+
+    /// Auto-tune the prefetch depth: each block, size it to
+    /// `ceil(load_time / compute_time)` from measured moving averages (clamped to
+    /// `window - 1`), so it self-adjusts to whatever the load-vs-compute ratio is
+    /// without a manual `--prefetch-depth`. Overrides a fixed depth.
+    pub fn with_auto_prefetch(mut self) -> Self {
+        self.auto = true;
+        self
+    }
+
+    /// The prefetch depth this block would use (fixed, or the current auto value).
+    pub fn current_prefetch_depth(&self) -> u32 {
+        if self.auto {
+            self.auto_depth()
+        } else {
+            self.prefetch_depth
+        }
+    }
+
+    /// Depth from the measured load/compute ratio, clamped to `[1, window-1]`
+    /// (or 0 when the window is too small to prefetch). Falls back to 1 until the
+    /// first measurements land.
+    fn auto_depth(&self) -> u32 {
+        let max = self.window.saturating_sub(1);
+        if max == 0 {
+            return 0;
+        }
+        let load = self.shared.load_ns.load(Ordering::Relaxed);
+        let compute = self.shared.compute_ns.load(Ordering::Relaxed).max(1);
+        if load == 0 {
+            return 1; // no load measured yet — one ahead
+        }
+        let need = load.div_ceil(compute) as u32;
+        need.clamp(1, max)
     }
 
     /// Cache stats (hits/misses/evictions/prefetched) accumulated so far.
@@ -272,16 +328,22 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         position: usize,
     ) -> Result<()> {
         let tensors = self.shared.fetch(layer)?;
-        // Kick off the next `prefetch_depth` layers' loads now, so they overlap
-        // this and following blocks' compute (layers run strictly in order,
-        // wrapping per token). Already-resident/in-flight layers de-dupe cheaply.
+        // Kick off the next `depth` layers' loads now, so they overlap this and
+        // following blocks' compute (layers run strictly in order, wrapping per
+        // token). Already-resident/in-flight layers de-dupe cheaply. `depth` is
+        // fixed or, under auto, sized to the current load/compute ratio.
+        let depth = if self.auto { self.auto_depth() } else { self.prefetch_depth };
         if let Some(tx) = &self.prefetch_tx {
-            for ahead in 1..=self.prefetch_depth {
+            for ahead in 1..=depth {
                 let _ = tx.send((layer + ahead) % self.num_layers);
             }
         }
         // Compute without holding the cache lock — the worker loads in parallel.
+        let t = std::time::Instant::now();
         let out = decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?;
+        if self.auto {
+            ewma(&self.shared.compute_ns, t.elapsed().as_nanos() as u64);
+        }
         hidden.copy_from_slice(&out);
         Ok(())
     }
@@ -400,6 +462,37 @@ mod tests {
         k.run_block(0, &mut h, &mut kv, 0).unwrap(); // requests prefetch of 1,2,3
         std::thread::sleep(std::time::Duration::from_millis(40));
         assert_eq!(k.stats().prefetched, 3, "depth-3 should prefetch three layers: {:?}", k.stats());
+    }
+
+    #[test]
+    fn auto_prefetch_tunes_to_load_compute_ratio() {
+        let c = cfg();
+        // Slow load (~1ms) vs tiny compute → huge ratio → depth pins to window-1.
+        let k = StreamingKernel::new(c, SlowSource(layers(&c, 6)), 4).with_auto_prefetch();
+        let mut h = vec![0.5f32; 8];
+        let mut kv = KvLayerCache::new(c.kv_dim());
+        for pos in 0..2 {
+            for layer in 0..6 {
+                k.run_block(layer, &mut h, &mut kv, pos).unwrap();
+            }
+        }
+        assert_eq!(
+            k.current_prefetch_depth(),
+            3,
+            "load >> compute should pin auto depth to window-1: load_ns/compute_ns unbalanced"
+        );
+    }
+
+    #[test]
+    fn fixed_depth_ignores_measurements() {
+        let c = cfg();
+        let k = StreamingKernel::new(c, SlowSource(layers(&c, 6)), 6).with_prefetch_depth(2);
+        let mut h = vec![0.5f32; 8];
+        let mut kv = KvLayerCache::new(c.kv_dim());
+        for layer in 0..6 {
+            k.run_block(layer, &mut h, &mut kv, 0).unwrap();
+        }
+        assert_eq!(k.current_prefetch_depth(), 2, "fixed depth must not be auto-tuned");
     }
 
     #[test]

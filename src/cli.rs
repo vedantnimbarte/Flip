@@ -206,6 +206,11 @@ pub struct ServeArgs {
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub prefetch_depth: usize,
 
+    /// Auto-tune the streaming prefetch depth from measured load-vs-compute time
+    /// instead of a fixed `--prefetch-depth`. Adapts to the disk/model at runtime.
+    #[arg(long, default_value_t = false)]
+    pub auto_prefetch: bool,
+
     /// Cluster role.
     #[arg(long, value_enum, default_value_t = DistributedMode::Standalone)]
     pub distributed_mode: DistributedMode,
