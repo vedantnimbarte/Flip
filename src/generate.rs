@@ -72,6 +72,9 @@ pub enum Sampler {
         /// Keep only tokens whose probability is at least `min_p` times the most
         /// likely token's probability. Applied after top-k/top-p.
         min_p: f32,
+        /// Divide the logit of any already-seen token by this factor (multiply
+        /// when negative), discouraging repetition. `1.0` disables it.
+        repetition_penalty: f32,
         seed: u64,
     },
 }
@@ -87,6 +90,16 @@ impl Sampler {
         }
     }
 
+    /// The repetition-penalty factor (`1.0` — no penalty — for [`Greedy`]).
+    ///
+    /// [`Greedy`]: Sampler::Greedy
+    pub fn repetition_penalty(&self) -> f32 {
+        match self {
+            Sampler::Greedy => 1.0,
+            Sampler::TopPK { repetition_penalty, .. } => *repetition_penalty,
+        }
+    }
+
     /// Pick the next token id from `logits`, advancing `rng` for stochastic
     /// samplers (unused by [`Greedy`](Sampler::Greedy)).
     pub fn sample(&self, logits: &[f32], rng: &mut SplitMix64) -> u32 {
@@ -98,6 +111,22 @@ impl Sampler {
                 }
                 sample_topk_topp(logits, temperature, top_p, top_k as usize, min_p, rng)
             }
+        }
+    }
+}
+
+/// Discourage repetition by penalizing the logits of tokens already in the
+/// context (HF convention: divide positive logits by `penalty`, multiply
+/// negative ones). A `penalty` of `1.0` is a no-op. Applied in place before
+/// sampling.
+fn apply_repetition_penalty(logits: &mut [f32], seen: &std::collections::HashSet<u32>, penalty: f32) {
+    if penalty == 1.0 {
+        return;
+    }
+    for &t in seen {
+        let i = t as usize;
+        if i < logits.len() {
+            logits[i] = if logits[i] > 0.0 { logits[i] / penalty } else { logits[i] * penalty };
         }
     }
 }
@@ -302,13 +331,18 @@ impl<K: ComputeKernel> Generator<K> {
             orch.decode_token(&mut hidden)?;
         }
 
-        // Decode loop.
+        // Decode loop. `seen` tracks the full context (prompt + generated) for
+        // the repetition penalty.
         let mut rng = SplitMix64::new(cfg.sampler.seed());
+        let penalty = cfg.sampler.repetition_penalty();
+        let mut seen: std::collections::HashSet<u32> = prompt.iter().copied().collect();
         let mut generated = Vec::with_capacity(cfg.max_new_tokens);
         for _ in 0..cfg.max_new_tokens {
-            let logits = self.logits(&hidden);
+            let mut logits = self.logits(&hidden);
+            apply_repetition_penalty(&mut logits, &seen, penalty);
             let next = cfg.sampler.sample(&logits, &mut rng);
             generated.push(next);
+            seen.insert(next);
             if cfg.eos_token == Some(next) {
                 break;
             }
@@ -329,6 +363,8 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     last_hidden: Vec<f32>,
     sampler: Sampler,
     rng: SplitMix64,
+    /// Context tokens (prompt + generated) for the repetition penalty.
+    seen: std::collections::HashSet<u32>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -351,6 +387,7 @@ impl<K: ComputeKernel> Generator<K> {
             last_hidden: hidden,
             rng: SplitMix64::new(sampler.seed()),
             sampler,
+            seen: prompt.iter().copied().collect(),
         })
     }
 }
@@ -358,8 +395,10 @@ impl<K: ComputeKernel> Generator<K> {
 impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
-        let logits = self.generator.logits(&self.last_hidden);
+        let mut logits = self.generator.logits(&self.last_hidden);
+        apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
         let next = self.sampler.sample(&logits, &mut self.rng);
+        self.seen.insert(next);
         self.last_hidden = self.generator.embed(next)?;
         self.orchestrator.decode_token(&mut self.last_hidden)?;
         Ok(next)
@@ -423,24 +462,24 @@ mod tests {
         let mut rng = SplitMix64::new(42);
 
         // temperature 0 collapses to greedy.
-        let zero = Sampler::TopPK { temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, seed: 1 };
+        let zero = Sampler::TopPK { temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 1 };
         assert_eq!(zero.sample(&logits, &mut rng), 1);
 
         // top_k = 1 keeps only the argmax, so any draw returns it.
-        let k1 = Sampler::TopPK { temperature: 2.0, top_p: 1.0, top_k: 1, min_p: 0.0, seed: 7 };
+        let k1 = Sampler::TopPK { temperature: 2.0, top_p: 1.0, top_k: 1, min_p: 0.0, repetition_penalty: 1.0, seed: 7 };
         for _ in 0..20 {
             assert_eq!(k1.sample(&logits, &mut rng), 1);
         }
 
         // A dominant logit + tight nucleus keeps only that token.
         let peaked = [0.0f32, 0.0, 20.0, 0.0];
-        let nucleus = Sampler::TopPK { temperature: 1.0, top_p: 0.5, top_k: 0, min_p: 0.0, seed: 3 };
+        let nucleus = Sampler::TopPK { temperature: 1.0, top_p: 0.5, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 3 };
         for _ in 0..20 {
             assert_eq!(nucleus.sample(&peaked, &mut rng), 2);
         }
 
         // A fixed seed makes temperature sampling reproducible.
-        let s = Sampler::TopPK { temperature: 1.5, top_p: 1.0, top_k: 0, min_p: 0.0, seed: 99 };
+        let s = Sampler::TopPK { temperature: 1.5, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 99 };
         let mut a = SplitMix64::new(s.seed());
         let mut b = SplitMix64::new(s.seed());
         let seq_a: Vec<u32> = (0..8).map(|_| s.sample(&logits, &mut a)).collect();
@@ -450,16 +489,48 @@ mod tests {
         // min_p prunes tokens far below the top probability. With one dominant
         // logit and a high min_p, only the top token survives.
         let peaked = [0.0f32, 5.0, 0.0, 0.0];
-        let mp = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.5, seed: 4 };
+        let mp = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.5, repetition_penalty: 1.0, seed: 4 };
         for _ in 0..20 {
             assert_eq!(mp.sample(&peaked, &mut rng), 1);
         }
         // min_p = 0 disables the filter (flat logits → draws vary across tokens).
-        let off = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.0, seed: 4 };
+        let off = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 4 };
         let flat = [1.0f32, 1.0, 1.0, 1.0];
         let draws: std::collections::HashSet<u32> =
             (0..50).map(|_| off.sample(&flat, &mut rng)).collect();
         assert!(draws.len() > 1, "min_p=0 should not collapse a flat distribution");
+    }
+
+    #[test]
+    fn repetition_penalty_reweights_seen_tokens() {
+        use std::collections::HashSet;
+        let seen: HashSet<u32> = [0u32, 2].into_iter().collect();
+
+        // Positive logits of seen tokens are divided; negative ones multiplied
+        // (pushed further down). Unseen tokens (1, 3) are untouched.
+        let mut logits = vec![2.0f32, 2.0, -2.0, -2.0];
+        apply_repetition_penalty(&mut logits, &seen, 2.0);
+        assert_eq!(logits, vec![1.0, 2.0, -4.0, -2.0]);
+
+        // A penalty of 1.0 is a no-op.
+        let mut same = vec![3.0f32, -1.0, 0.5];
+        apply_repetition_penalty(&mut same, &seen, 1.0);
+        assert_eq!(same, vec![3.0, -1.0, 0.5]);
+
+        // End-to-end: penalizing the counting model's next token diverts it.
+        // Unpenalized, [0] → 1; a strong penalty on token 1 (once seen) reshapes
+        // later steps, so the two sequences differ.
+        let gen = counting_generator();
+        let cfg = |rp: f32| GenerationConfig {
+            max_new_tokens: 6,
+            eos_token: None,
+            sampler: Sampler::TopPK {
+                temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: rp, seed: 1,
+            },
+        };
+        let base = gen.generate(&[0], &cfg(1.0)).unwrap();
+        let penalized = gen.generate(&[0], &cfg(10.0)).unwrap();
+        assert_ne!(base, penalized, "repetition_penalty should change the sequence");
     }
 
     #[test]
