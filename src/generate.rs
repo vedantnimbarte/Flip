@@ -61,13 +61,17 @@ impl SplitMix64 {
 pub enum Sampler {
     /// Deterministic argmax.
     Greedy,
-    /// Temperature scaling with optional top-k and nucleus (top-p) truncation.
-    /// `top_k == 0` keeps all tokens; `top_p >= 1.0` disables nucleus filtering;
-    /// `temperature <= 0` collapses to [`Greedy`](Sampler::Greedy).
+    /// Temperature scaling with optional top-k, nucleus (top-p), and min-p
+    /// truncation. `top_k == 0` keeps all tokens; `top_p >= 1.0` disables nucleus
+    /// filtering; `min_p <= 0` disables min-p; `temperature <= 0` collapses to
+    /// [`Greedy`](Sampler::Greedy).
     TopPK {
         temperature: f32,
         top_p: f32,
         top_k: u32,
+        /// Keep only tokens whose probability is at least `min_p` times the most
+        /// likely token's probability. Applied after top-k/top-p.
+        min_p: f32,
         seed: u64,
     },
 }
@@ -88,11 +92,11 @@ impl Sampler {
     pub fn sample(&self, logits: &[f32], rng: &mut SplitMix64) -> u32 {
         match *self {
             Sampler::Greedy => argmax(logits),
-            Sampler::TopPK { temperature, top_p, top_k, .. } => {
+            Sampler::TopPK { temperature, top_p, top_k, min_p, .. } => {
                 if temperature <= 0.0 {
                     return argmax(logits);
                 }
-                sample_topk_topp(logits, temperature, top_p, top_k as usize, rng)
+                sample_topk_topp(logits, temperature, top_p, top_k as usize, min_p, rng)
             }
         }
     }
@@ -105,6 +109,7 @@ fn sample_topk_topp(
     temperature: f32,
     top_p: f32,
     top_k: usize,
+    min_p: f32,
     rng: &mut SplitMix64,
 ) -> u32 {
     if logits.is_empty() {
@@ -142,6 +147,19 @@ fn sample_topk_topp(
                 break;
             }
         }
+        probs.truncate(cut);
+        idx.truncate(cut);
+        let s: f32 = probs.iter().sum();
+        for p in &mut probs {
+            *p /= s;
+        }
+    }
+
+    // Min-p: drop tokens less likely than `min_p` × the top token's probability
+    // (probs[0] is the max since idx was sorted by logit). Then renormalize.
+    if min_p > 0.0 {
+        let threshold = min_p * probs[0];
+        let cut = probs.iter().take_while(|&&p| p >= threshold).count().max(1);
         probs.truncate(cut);
         idx.truncate(cut);
         let s: f32 = probs.iter().sum();
@@ -405,29 +423,43 @@ mod tests {
         let mut rng = SplitMix64::new(42);
 
         // temperature 0 collapses to greedy.
-        let zero = Sampler::TopPK { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 1 };
+        let zero = Sampler::TopPK { temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, seed: 1 };
         assert_eq!(zero.sample(&logits, &mut rng), 1);
 
         // top_k = 1 keeps only the argmax, so any draw returns it.
-        let k1 = Sampler::TopPK { temperature: 2.0, top_p: 1.0, top_k: 1, seed: 7 };
+        let k1 = Sampler::TopPK { temperature: 2.0, top_p: 1.0, top_k: 1, min_p: 0.0, seed: 7 };
         for _ in 0..20 {
             assert_eq!(k1.sample(&logits, &mut rng), 1);
         }
 
         // A dominant logit + tight nucleus keeps only that token.
         let peaked = [0.0f32, 0.0, 20.0, 0.0];
-        let nucleus = Sampler::TopPK { temperature: 1.0, top_p: 0.5, top_k: 0, seed: 3 };
+        let nucleus = Sampler::TopPK { temperature: 1.0, top_p: 0.5, top_k: 0, min_p: 0.0, seed: 3 };
         for _ in 0..20 {
             assert_eq!(nucleus.sample(&peaked, &mut rng), 2);
         }
 
         // A fixed seed makes temperature sampling reproducible.
-        let s = Sampler::TopPK { temperature: 1.5, top_p: 1.0, top_k: 0, seed: 99 };
+        let s = Sampler::TopPK { temperature: 1.5, top_p: 1.0, top_k: 0, min_p: 0.0, seed: 99 };
         let mut a = SplitMix64::new(s.seed());
         let mut b = SplitMix64::new(s.seed());
         let seq_a: Vec<u32> = (0..8).map(|_| s.sample(&logits, &mut a)).collect();
         let seq_b: Vec<u32> = (0..8).map(|_| s.sample(&logits, &mut b)).collect();
         assert_eq!(seq_a, seq_b);
+
+        // min_p prunes tokens far below the top probability. With one dominant
+        // logit and a high min_p, only the top token survives.
+        let peaked = [0.0f32, 5.0, 0.0, 0.0];
+        let mp = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.5, seed: 4 };
+        for _ in 0..20 {
+            assert_eq!(mp.sample(&peaked, &mut rng), 1);
+        }
+        // min_p = 0 disables the filter (flat logits → draws vary across tokens).
+        let off = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.0, seed: 4 };
+        let flat = [1.0f32, 1.0, 1.0, 1.0];
+        let draws: std::collections::HashSet<u32> =
+            (0..50).map(|_| off.sample(&flat, &mut rng)).collect();
+        assert!(draws.len() > 1, "min_p=0 should not collapse a flat distribution");
     }
 
     #[test]

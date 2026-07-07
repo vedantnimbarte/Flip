@@ -313,6 +313,9 @@ struct ChatRequest {
     /// Top-k truncation (non-standard OpenAI extension; 0/absent → all tokens).
     #[serde(default)]
     top_k: Option<u32>,
+    /// Min-p truncation (non-standard extension; 0/absent → disabled).
+    #[serde(default)]
+    min_p: Option<f32>,
     /// Optional RNG seed for reproducible sampling.
     #[serde(default)]
     seed: Option<u64>,
@@ -346,6 +349,7 @@ fn sampler_from_request(req: &ChatRequest, id: u64) -> Sampler {
             temperature: t,
             top_p: req.top_p.unwrap_or(1.0),
             top_k: req.top_k.unwrap_or(0),
+            min_p: req.min_p.unwrap_or(0.0),
             seed: req.seed.unwrap_or(id),
         },
         _ => Sampler::Greedy,
@@ -764,6 +768,8 @@ struct MessagesRequest {
     #[serde(default)]
     top_k: Option<u32>,
     #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
     stop_sequences: Option<Vec<String>>,
 }
 
@@ -874,6 +880,7 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
             temperature: t,
             top_p: parsed.top_p.unwrap_or(1.0),
             top_k: parsed.top_k.unwrap_or(0),
+            min_p: parsed.min_p.unwrap_or(0.0),
             seed: id,
         },
         _ => Sampler::Greedy,
