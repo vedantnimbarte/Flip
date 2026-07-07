@@ -38,6 +38,13 @@ pub trait ComputeKernel {
         kv: &mut KvLayerCache,
         position: usize,
     ) -> Result<()>;
+
+    /// Layer-streaming cache stats, if this kernel streams weights. Resident
+    /// kernels (everything held in memory) return `None`; the streaming kernel
+    /// overrides it so the server can surface hit rate / prefetch effectiveness.
+    fn stream_stats(&self) -> Option<crate::forward::streaming::StreamStats> {
+        None
+    }
 }
 
 /// Borrowing a kernel is itself a kernel — lets a [`ForwardOrchestrator`] hold a

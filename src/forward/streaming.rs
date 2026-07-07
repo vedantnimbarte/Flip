@@ -260,6 +260,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         self.shared.cfg.kv_dim()
     }
 
+    fn stream_stats(&self) -> Option<StreamStats> {
+        Some(self.stats())
+    }
+
     fn run_block(
         &self,
         layer: u32,
