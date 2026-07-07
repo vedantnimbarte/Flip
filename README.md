@@ -58,7 +58,7 @@ Rust users can also `cargo install --git https://github.com/vedantnimbarte/Flip`
 
 ## How it works
 
-`flip` partitions VRAM into three regions (see `specs.md` §2):
+`flip` partitions VRAM into three regions:
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -190,6 +190,7 @@ cargo run -- profile         # profile a sample 70B-class model (no GPU needed)
 cargo run -- serve --help    # full serve flag list (specs §4)
 cargo run -- generate --help # end-to-end CPU generation on a synthetic model
 cargo run -- tokenize --help # byte-level BPE encode/decode round-trip
+cargo run -- doctor          # check machine (GPU/VRAM) + run an inference self-test
 ```
 
 **`profile`** — with no `--model-path` it profiles a representative
@@ -325,8 +326,7 @@ the A/B swap never corrupts the window under compute).
 
 ## The VRAM budget math
 
-The profiler decides how many transformer blocks fit resident at once
-(`specs.md` §3.1):
+The profiler decides how many transformer blocks fit resident at once:
 
 ```
                  ⌊ M_free − M_safety − M_kv_total − M_pinned ⌋
@@ -508,6 +508,3 @@ let tokens = coord.generate(&prompt, 32)?;   // == local greedy; survives a dead
 > hand-rolled TCP protocol — are documented at their call sites; the scheduling,
 > protocol, routing, fault-tolerance, and correctness are all implemented and
 > verified here.
-
-See [`PRD.md`](PRD.md) for product requirements and [`specs.md`](specs.md) for
-the full technical specification.
