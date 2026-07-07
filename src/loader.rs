@@ -307,11 +307,16 @@ pub fn build_streaming_generator(
     max_context: u32,
     resident_layers: usize,
     prefetch_depth: usize,
+    auto_prefetch: bool,
 ) -> Result<Generator<StreamingKernel<MmapLayerSource>>> {
     let p = load_streaming_pieces(store, config, max_context)?;
     let cfg = p.source.cfg;
-    let kernel = StreamingKernel::new(cfg, p.source, resident_layers)
-        .with_prefetch_depth(prefetch_depth as u32);
+    let base = StreamingKernel::new(cfg, p.source, resident_layers);
+    let kernel = if auto_prefetch {
+        base.with_auto_prefetch()
+    } else {
+        base.with_prefetch_depth(prefetch_depth as u32)
+    };
     Generator::new(
         kernel,
         p.embedding,

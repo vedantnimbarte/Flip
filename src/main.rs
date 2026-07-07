@@ -579,7 +579,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     config.num_layers,
                 );
                 let depth = args.prefetch_depth.min(window.saturating_sub(1));
-                if depth > 0 {
+                if args.auto_prefetch {
+                    println!("  prefetch   : auto (depth tuned from load vs compute, ≤ {})", window.saturating_sub(1));
+                } else if depth > 0 {
                     println!("  prefetch   : {depth} layer(s) ahead (overlaps load with compute)");
                 } else {
                     println!("  prefetch   : off (window too small or --prefetch-depth 0)");
@@ -593,6 +595,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     args.context_length,
                     window,
                     args.prefetch_depth,
+                    args.auto_prefetch,
                 )?;
                 return start_batched_server(generator, None, &args, &config, &listen);
             }
