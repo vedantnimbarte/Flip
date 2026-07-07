@@ -335,6 +335,9 @@ struct ChatRequest {
     /// Min-p truncation (non-standard extension; 0/absent → disabled).
     #[serde(default)]
     min_p: Option<f32>,
+    /// Repetition penalty (non-standard extension; 1.0/absent → disabled).
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
     /// Optional RNG seed for reproducible sampling.
     #[serde(default)]
     seed: Option<u64>,
@@ -369,6 +372,7 @@ fn sampler_from_request(req: &ChatRequest, id: u64) -> Sampler {
             top_p: req.top_p.unwrap_or(1.0),
             top_k: req.top_k.unwrap_or(0),
             min_p: req.min_p.unwrap_or(0.0),
+            repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
             seed: req.seed.unwrap_or(id),
         },
         _ => Sampler::Greedy,
@@ -821,6 +825,8 @@ struct MessagesRequest {
     #[serde(default)]
     min_p: Option<f32>,
     #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
     stop_sequences: Option<Vec<String>>,
 }
 
@@ -932,6 +938,7 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
             top_p: parsed.top_p.unwrap_or(1.0),
             top_k: parsed.top_k.unwrap_or(0),
             min_p: parsed.min_p.unwrap_or(0.0),
+            repetition_penalty: parsed.repetition_penalty.unwrap_or(1.0),
             seed: id,
         },
         _ => Sampler::Greedy,
