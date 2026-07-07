@@ -24,10 +24,52 @@
 //! rejections in a row simply emits one token per round, matching plain decoding.
 
 use crate::error::Result;
-use crate::forward::ComputeKernel;
+use crate::forward::{ComputeKernel, KvSnapshot};
 use crate::generate::{GenerationSession, Generator, Sampler};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
+
+/// A bounded cache of KV snapshots keyed by the prompt tokens that produced
+/// them, so a request whose prompt extends a cached one can resume from the
+/// snapshot instead of re-prefilling the shared prefix (a big win for chat
+/// traffic sharing a system prompt). Off unless enabled; only used on the plain
+/// (non-speculative) path, which is the only one that can resume.
+struct PrefixCache {
+    max_entries: usize,
+    /// `(prompt tokens, snapshot after prefilling them)`, oldest first.
+    entries: Vec<(Vec<u32>, KvSnapshot)>,
+}
+
+impl PrefixCache {
+    fn new(max_entries: usize) -> Self {
+        Self { max_entries, entries: Vec::new() }
+    }
+
+    /// The snapshot of the longest cached prompt that is a strict prefix of
+    /// `prompt` (so there is a non-empty suffix left to prefill).
+    // ponytail: linear scan, fine for a small cache; index by first token if the
+    // cache ever grows large.
+    fn longest_prefix(&self, prompt: &[u32]) -> Option<KvSnapshot> {
+        self.entries
+            .iter()
+            .filter(|(toks, _)| toks.len() < prompt.len() && prompt.starts_with(toks))
+            .max_by_key(|(toks, _)| toks.len())
+            .map(|(_, snap)| snap.clone())
+    }
+
+    /// Cache `prompt`'s post-prefill `snapshot`, evicting the oldest entry when
+    /// full. Replaces any existing entry for the same prompt.
+    fn insert(&mut self, prompt: Vec<u32>, snapshot: KvSnapshot) {
+        if self.max_entries == 0 {
+            return;
+        }
+        self.entries.retain(|(toks, _)| toks != &prompt);
+        self.entries.push((prompt, snapshot));
+        if self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
+    }
+}
 
 /// A queued request awaiting admission.
 struct Pending {
@@ -108,6 +150,10 @@ pub struct BatchScheduler<'a, K: ComputeKernel> {
     /// Cumulative draft tokens proposed / accepted across retired slots.
     proposed: usize,
     accepted: usize,
+    /// Optional cross-request prefix cache (plain path only).
+    prefix_cache: Option<PrefixCache>,
+    /// Count of admissions that resumed from a cached prefix (cache hits).
+    resume_hits: usize,
 }
 
 impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
@@ -122,7 +168,22 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             active: Vec::new(),
             proposed: 0,
             accepted: 0,
+            prefix_cache: None,
+            resume_hits: 0,
         }
+    }
+
+    /// Enable a cross-request prefix cache holding up to `max_entries` KV
+    /// snapshots. A request whose prompt extends a cached one resumes from the
+    /// snapshot, skipping the shared prefix's prefill. No effect on a
+    /// speculative scheduler (its sessions can't resume). `0` disables it.
+    pub fn with_prefix_cache(mut self, max_entries: usize) -> Self {
+        self.prefix_cache = if max_entries > 0 && self.draft.is_none() {
+            Some(PrefixCache::new(max_entries))
+        } else {
+            None
+        };
+        self
     }
 
     /// Create a scheduler that decodes every request speculatively, using
@@ -144,6 +205,8 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             active: Vec::new(),
             proposed: 0,
             accepted: 0,
+            prefix_cache: None,
+            resume_hits: 0,
         }
     }
 
@@ -151,6 +214,12 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// speculative slots. Zero unless the scheduler was built with a draft.
     pub fn speculative_stats(&self) -> (usize, usize) {
         (self.proposed, self.accepted)
+    }
+
+    /// How many admitted requests resumed from a cached prefix (prefix-cache
+    /// hits). Zero unless [`with_prefix_cache`](Self::with_prefix_cache) is on.
+    pub fn resume_hits(&self) -> usize {
+        self.resume_hits
     }
 
     /// Queue a request (greedy decoding). Errors on an empty prompt. `eos` lists
@@ -226,7 +295,27 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     self.gamma,
                     &p.prompt,
                 )),
-                None => Decoder::Plain(self.generator.start_session(&p.prompt, p.sampler)?),
+                None => {
+                    // Resume from the longest cached prefix if one exists;
+                    // otherwise prefill from scratch. Either way, cache the
+                    // full-prompt snapshot so later requests can extend it.
+                    let resume = self
+                        .prefix_cache
+                        .as_ref()
+                        .and_then(|c| c.longest_prefix(&p.prompt));
+                    let session = match resume {
+                        Some(snap) => {
+                            let suffix = &p.prompt[snap.position()..];
+                            self.resume_hits += 1;
+                            self.generator.resume_session(snap, suffix, p.sampler)?
+                        }
+                        None => self.generator.start_session(&p.prompt, p.sampler)?,
+                    };
+                    if let Some(cache) = self.prefix_cache.as_mut() {
+                        cache.insert(p.prompt.clone(), session.snapshot());
+                    }
+                    Decoder::Plain(session)
+                }
             };
             self.active.push(Active {
                 id: p.id,
