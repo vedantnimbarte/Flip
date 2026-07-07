@@ -400,14 +400,19 @@ inference engine):
   and `--chat-template {plain,chatml,llama3}` renders chat messages in the model's
   trained format (control tokens become single ids via the special-token
   vocabulary). Hardening: `--api-key` requires a bearer token on `/v1/*`, and the
-  request body is size-capped. The engine picks its compute kernel from flags:
+  request body is size-capped. `GET /metrics` exposes Prometheus counters
+  (requests, prompt/completion tokens, and — when streaming — layer cache
+  hits/misses/evictions/prefetches and live prefetch depth). The engine picks its
+  compute kernel from flags:
   - `--stream [--resident-layers N]` — **layer streaming**
     ([`src/forward/streaming.rs`](src/forward/streaming.rs)): only a bounded window
     of layers is held in memory (pinned embedding/LM-head stay resident); the rest
     are materialized on demand from the mmap'd checkpoint through an LRU and evicted
     least-recently-used, so a model can **exceed the resident budget**. The window
-    defaults to the VRAM plan's `layers_to_load`. Output is bit-for-bit identical to
-    a fully-resident run (tested end-to-end).
+    defaults to the VRAM plan's `layers_to_load`. A background worker prefetches the
+    next `--prefetch-depth N` layers ahead of compute (`--auto-prefetch` tunes the
+    depth from measured load-vs-compute time); `0` disables it. Output is
+    bit-for-bit identical to a fully-resident run (tested end-to-end).
   - `--device gpu` — run the batched engine on the CUDA `GpuKernel`
     (all layers resident in VRAM; requires a `cuda-kernels` build).
   - `--stream --device gpu` — stream a window of layer weights **through VRAM**
@@ -415,6 +420,14 @@ inference engine):
     resident: run a model larger than VRAM on the GPU. **Experimental —
     compile-checked but not yet validated on real GPU hardware.**
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
+
+  Two orthogonal memory knobs apply to any kernel:
+  - `--kv-quant {none,int8,int4}` — quantize the KV cache to int8 (~½ the KV
+    memory) or int4 (~¼, more error), trading precision for a longer context in
+    the same budget. Defaults to exact `f32`.
+  - `--prefix-cache-size N` — cache up to `N` prompt-prefix KV snapshots so
+    requests sharing a prefix (e.g. a common system prompt) skip re-prefilling it.
+    Each entry holds its prefix's KV in RAM; `0` disables it.
 
   **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a
