@@ -39,7 +39,7 @@ fn start_server() -> SocketAddr {
         64,
     )
     .unwrap();
-    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm", 8, 0, 8);
+    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm", 8, 0, 8, 0);
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     std::thread::spawn(move || server.serve(router(engine)).unwrap());

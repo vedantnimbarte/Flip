@@ -223,6 +223,13 @@ pub struct ServeArgs {
     /// that. Sets `finish_reason: stop` / `stop_reason: end_turn` when hit.
     #[arg(long, value_name = "ID")]
     pub eos_token: Option<u32>,
+
+    /// Cache up to this many prompt-prefix KV snapshots so requests sharing a
+    /// prefix (e.g. a common system prompt) skip re-prefilling it. `0` disables
+    /// it. Each entry holds the prefix's KV in RAM, so size it to your memory.
+    /// No effect with a draft model (speculative sessions can't resume).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub prefix_cache_size: usize,
 }
 
 /// Arguments for `dlm profile`.

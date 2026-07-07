@@ -75,6 +75,7 @@ impl EngineService {
         default_max_tokens: usize,
         created: u64,
         max_batch: usize,
+        prefix_cache_size: usize,
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
@@ -86,6 +87,7 @@ impl EngineService {
             default_max_tokens,
             created,
             max_batch,
+            prefix_cache_size,
         )
     }
 
@@ -104,6 +106,7 @@ impl EngineService {
         default_max_tokens: usize,
         created: u64,
         max_batch: usize,
+        prefix_cache_size: usize,
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
@@ -115,6 +118,7 @@ impl EngineService {
             default_max_tokens,
             created,
             max_batch,
+            prefix_cache_size,
         )
     }
 
@@ -129,9 +133,12 @@ impl EngineService {
         default_max_tokens: usize,
         created: u64,
         max_batch: usize,
+        prefix_cache_size: usize,
     ) -> Arc<Self> {
         let (job_tx, job_rx) = channel::<Job>();
-        std::thread::spawn(move || engine_loop(generator, draft, gamma, job_rx, max_batch));
+        std::thread::spawn(move || {
+            engine_loop(generator, draft, gamma, job_rx, max_batch, prefix_cache_size)
+        });
         Arc::new(Self {
             job_tx: Mutex::new(job_tx),
             next_id: AtomicU64::new(1),
@@ -230,10 +237,12 @@ fn engine_loop<K: ComputeKernel>(
     gamma: usize,
     job_rx: Receiver<Job>,
     max_batch: usize,
+    prefix_cache_size: usize,
 ) {
     let mut sched = match &draft {
+        // Speculative sessions can't resume, so the prefix cache is plain-path only.
         Some(d) => BatchScheduler::with_speculative(&generator, d, max_batch, gamma),
-        None => BatchScheduler::new(&generator, max_batch),
+        None => BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size),
     };
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
 

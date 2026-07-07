@@ -768,6 +768,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             128,
             created,
             8, // max concurrent batch
+            args.prefix_cache_size,
         ),
         None => dlm::server::EngineService::start(
             generator,
@@ -777,6 +778,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             128,
             created,
             8, // max concurrent batch
+            args.prefix_cache_size,
         ),
     }
     .with_chat_template(template)
@@ -793,6 +795,9 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         println!("  stop       : max_tokens only (no eos_token_id in config; pass --eos-token)");
     } else {
         println!("  stop       : eos {eos_tokens:?} + max_tokens, context {} tokens", args.context_length);
+    }
+    if args.prefix_cache_size > 0 && !speculative {
+        println!("  prefix     : KV cache up to {} prompt prefixes", args.prefix_cache_size);
     }
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
