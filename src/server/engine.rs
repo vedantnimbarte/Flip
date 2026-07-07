@@ -32,7 +32,7 @@ struct Job {
     id: u64,
     prompt: Vec<u32>,
     max_new: usize,
-    eos: Option<u32>,
+    eos: Vec<u32>,
     sampler: Sampler,
     sink: Sender<TokenEvent>,
 }
@@ -47,8 +47,9 @@ pub struct EngineService {
     created: u64,
     default_max_tokens: usize,
     chat_template: ChatTemplate,
-    /// Stop generation when this token id is produced (the model's EOS).
-    eos_token: Option<u32>,
+    /// Stop generation when any of these token ids is produced (the model's
+    /// EOS set). Empty means run to `max_tokens`.
+    eos_tokens: Vec<u32>,
 }
 
 impl EngineService {
@@ -128,7 +129,7 @@ impl EngineService {
             created,
             default_max_tokens,
             chat_template: ChatTemplate::default(),
-            eos_token: None,
+            eos_tokens: Vec::new(),
         })
     }
 
@@ -141,11 +142,12 @@ impl EngineService {
         self
     }
 
-    /// Set the EOS token id: generation stops (and the token is dropped from the
-    /// output) when the model produces it. Defaults to `None` (run to length).
-    pub fn with_eos_token(mut self: Arc<Self>, eos_token: Option<u32>) -> Arc<Self> {
+    /// Set the EOS token id(s): generation stops (and the token is dropped from
+    /// the output) when the model produces any of them. Defaults to empty (run
+    /// to length).
+    pub fn with_eos_tokens(mut self: Arc<Self>, eos_tokens: Vec<u32>) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
-            inner.eos_token = eos_token;
+            inner.eos_tokens = eos_tokens;
         }
         self
     }
@@ -155,7 +157,7 @@ impl EngineService {
         &self,
         prompt: Vec<u32>,
         max_new: usize,
-        eos: Option<u32>,
+        eos: Vec<u32>,
         sampler: Sampler,
     ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
@@ -575,8 +577,7 @@ fn collect_completion(
     stops: &[String],
 ) -> Generated {
     let prompt_tokens = ids.len();
-    let eos = engine.eos_token;
-    let rx = engine.submit(ids, max_tokens, eos, sampler);
+    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
     let mut tokens = Vec::new();
     let mut spec = None;
     let mut hit_eos = false;
@@ -585,7 +586,7 @@ fn collect_completion(
             TokenEvent::Next(t) => {
                 // The scheduler emits EOS inclusively as the final token; drop it
                 // from the visible output and mark a natural stop.
-                if Some(t) == eos {
+                if engine.eos_tokens.contains(&t) {
                     hit_eos = true;
                     break;
                 }
@@ -913,7 +914,6 @@ fn stream_messages(
         }))?;
         send(w, "ping", serde_json::json!({"type": "ping"}))?;
 
-        let eos = engine.eos_token;
         let mut completion_tokens = 0usize;
         // Stop-aware emission mirrors stream_chat: accumulate ids, re-decode, and
         // emit only the newly-visible suffix up to any stop sequence.
@@ -921,12 +921,12 @@ fn stream_messages(
         let mut sent_chars = 0usize;
         let mut stop_reason = "max_tokens";
         let mut stop_sequence: Option<String> = None;
-        let rx = engine.submit(ids, max_tokens, eos, sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
                     // EOS is emitted inclusively; end the turn without showing it.
-                    if Some(t) == eos {
+                    if engine.eos_tokens.contains(&t) {
                         stop_reason = "end_turn";
                         break;
                     }
@@ -1005,13 +1005,12 @@ fn stream_chat(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
-        let eos = engine.eos_token;
-        let rx = engine.submit(ids, max_tokens, eos, sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
                     // EOS is emitted inclusively; stop without showing it.
-                    if Some(t) == eos {
+                    if engine.eos_tokens.contains(&t) {
                         finish = "stop";
                         break;
                     }

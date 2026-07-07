@@ -219,8 +219,8 @@ pub struct ServeArgs {
     pub chat_template: String,
 
     /// Stop generation when the model produces this token id (the model's EOS).
-    /// Omit to always run to `max_tokens`. Sets `finish_reason: stop` /
-    /// `stop_reason: end_turn` when hit.
+    /// Overrides the `eos_token_id` auto-detected from `config.json`; omit to use
+    /// that. Sets `finish_reason: stop` / `stop_reason: end_turn` when hit.
     #[arg(long, value_name = "ID")]
     pub eos_token: Option<u32>,
 }
