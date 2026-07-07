@@ -54,6 +54,7 @@ fn start_server_cfg(eos: Vec<u32>, max_context: usize) -> SocketAddr {
         16,
         0,
         4, // max batch
+        0, // prefix cache off
     )
     .with_eos_tokens(eos)
     .with_context_window(max_context);
@@ -76,6 +77,7 @@ fn start_speculative_server() -> SocketAddr {
         16,
         0,
         4, // max batch
+        0, // prefix cache off
     );
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();

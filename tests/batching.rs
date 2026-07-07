@@ -113,6 +113,38 @@ fn batch_size_one_is_sequential_but_correct() {
 }
 
 #[test]
+fn prefix_cache_preserves_output() {
+    let generator = build_generator();
+    // Requests that share progressively longer prefixes (plus an unrelated one),
+    // so the cache's resume path is exercised across admissions.
+    let requests: Vec<(u64, Vec<u32>, usize)> = vec![
+        (1, vec![1, 2, 3], 5),
+        (2, vec![1, 2, 3, 4], 5),
+        (3, vec![1, 2, 3, 4, 5], 5),
+        (4, vec![7, 8], 5),
+    ];
+    let mut sched = BatchScheduler::new(&generator, 4).with_prefix_cache(16);
+    for (id, prompt, n) in &requests {
+        sched.submit(*id, prompt.clone(), *n, vec![]).unwrap();
+    }
+    let mut results = sched.run().unwrap();
+    results.sort_by_key(|f| f.id);
+
+    // Resuming from a cached prefix must yield exactly the isolated output.
+    for (f, (id, prompt, n)) in results.iter().zip(&requests) {
+        assert_eq!(
+            f.tokens,
+            greedy(&generator, prompt, *n),
+            "request {id} diverged with the prefix cache"
+        );
+        assert_eq!(f.tokens.len(), *n);
+    }
+    // The two prefix-extending requests (2 and 3) must actually have resumed —
+    // otherwise the cache would be a silent no-op that still passes the above.
+    assert_eq!(sched.resume_hits(), 2, "expected two prefix-cache hits");
+}
+
+#[test]
 fn eos_stops_a_request_early() {
     let generator = build_generator();
     // Find the first token greedily produced for a prompt, use it as EOS.

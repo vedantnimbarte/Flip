@@ -35,7 +35,7 @@ fn start_server(api_key: Option<&str>) -> SocketAddr {
         128,
     )
     .unwrap();
-    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm", 8, 0, 4);
+    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm", 8, 0, 4, 0);
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     let router = secured_router(engine, api_key.map(String::from));
