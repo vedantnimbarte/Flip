@@ -37,6 +37,14 @@ struct Job {
     sink: Sender<TokenEvent>,
 }
 
+/// Cumulative server counters, exposed as Prometheus text at `GET /metrics`.
+#[derive(Default)]
+struct Metrics {
+    requests: AtomicU64,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
+}
+
 /// A handle to the background batching engine.
 pub struct EngineService {
     job_tx: Mutex<Sender<Job>>,
@@ -53,6 +61,7 @@ pub struct EngineService {
     /// Maximum context (prompt + generated) the model/KV cache supports.
     /// Requests are clamped to fit; `usize::MAX` disables the guard.
     max_context: usize,
+    metrics: Metrics,
 }
 
 impl EngineService {
@@ -134,7 +143,17 @@ impl EngineService {
             chat_template: ChatTemplate::default(),
             eos_tokens: Vec::new(),
             max_context: usize::MAX,
+            metrics: Metrics::default(),
         })
+    }
+
+    /// Record a completed generation into the `/metrics` counters.
+    fn record(&self, prompt_tokens: usize, completion_tokens: usize) {
+        self.metrics.requests.fetch_add(1, Ordering::Relaxed);
+        self.metrics.prompt_tokens.fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+        self.metrics
+            .completion_tokens
+            .fetch_add(completion_tokens as u64, Ordering::Relaxed);
     }
 
     /// Set the chat template (called right after [`start`](Self::start), while
@@ -235,7 +254,13 @@ fn engine_loop<K: ComputeKernel>(
             Ok(tick) => {
                 for (id, token) in tick.produced {
                     if let Some(s) = sinks.get(&id) {
-                        let _ = s.send(TokenEvent::Next(token));
+                        // A failed send means the client dropped the receiver
+                        // (disconnected or finished early); stop wasting compute
+                        // on it by retiring the slot.
+                        if s.send(TokenEvent::Next(token)).is_err() {
+                            sinks.remove(&id);
+                            sched.abort(id);
+                        }
                     }
                 }
                 for id in tick.finished {
@@ -307,6 +332,12 @@ struct ChatRequest {
     /// Top-k truncation (non-standard OpenAI extension; 0/absent → all tokens).
     #[serde(default)]
     top_k: Option<u32>,
+    /// Min-p truncation (non-standard extension; 0/absent → disabled).
+    #[serde(default)]
+    min_p: Option<f32>,
+    /// Repetition penalty (non-standard extension; 1.0/absent → disabled).
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
     /// Optional RNG seed for reproducible sampling.
     #[serde(default)]
     seed: Option<u64>,
@@ -340,6 +371,8 @@ fn sampler_from_request(req: &ChatRequest, id: u64) -> Sampler {
             temperature: t,
             top_p: req.top_p.unwrap_or(1.0),
             top_k: req.top_k.unwrap_or(0),
+            min_p: req.min_p.unwrap_or(0.0),
+            repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
             seed: req.seed.unwrap_or(id),
         },
         _ => Sampler::Greedy,
@@ -526,11 +559,32 @@ pub fn secured_router(engine: Arc<EngineService>, api_key: Option<String>) -> Ha
     }
 }
 
+/// Prometheus text-format dump of the cumulative counters.
+fn metrics_text(engine: &EngineService) -> String {
+    let m = &engine.metrics;
+    format!(
+        "# HELP dlm_requests_total Completed generation requests.\n\
+         # TYPE dlm_requests_total counter\n\
+         dlm_requests_total {}\n\
+         # HELP dlm_prompt_tokens_total Prompt tokens processed.\n\
+         # TYPE dlm_prompt_tokens_total counter\n\
+         dlm_prompt_tokens_total {}\n\
+         # HELP dlm_completion_tokens_total Tokens generated.\n\
+         # TYPE dlm_completion_tokens_total counter\n\
+         dlm_completion_tokens_total {}\n",
+        m.requests.load(Ordering::Relaxed),
+        m.prompt_tokens.load(Ordering::Relaxed),
+        m.completion_tokens.load(Ordering::Relaxed),
+    )
+}
+
 /// Build the HTTP router for the batched/streaming engine.
 pub fn router(engine: Arc<EngineService>) -> Handler {
     Arc::new(move |req: &Request| -> Response {
-        match (req.method.as_str(), req.path.as_str()) {
+        let started = std::time::Instant::now();
+        let resp = match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/") | ("GET", "/health") => Response::text(200, "dlm: ok"),
+            ("GET", "/metrics") => Response::text(200, metrics_text(&engine)),
             ("GET", "/v1/models") => {
                 let body = ModelsResponse {
                     object: "list",
@@ -548,7 +602,17 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
             ("POST", "/v1/messages/count_tokens") => handle_count_tokens(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
             _ => Response::json(405, error_json("method not allowed")),
-        }
+        };
+        // Access log. For streamed responses this times request setup only; the
+        // body is written afterwards.
+        eprintln!(
+            "{} {} → {} ({}ms)",
+            req.method,
+            req.path,
+            resp.status,
+            started.elapsed().as_millis()
+        );
+        resp
     })
 }
 
@@ -645,6 +709,7 @@ fn collect_completion(
             None => Finish::Length,
         }
     };
+    engine.record(prompt_tokens, completion_tokens);
     Generated {
         text,
         finish,
@@ -758,6 +823,10 @@ struct MessagesRequest {
     #[serde(default)]
     top_k: Option<u32>,
     #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
     stop_sequences: Option<Vec<String>>,
 }
 
@@ -868,6 +937,8 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
             temperature: t,
             top_p: parsed.top_p.unwrap_or(1.0),
             top_k: parsed.top_k.unwrap_or(0),
+            min_p: parsed.min_p.unwrap_or(0.0),
+            repetition_penalty: parsed.repetition_penalty.unwrap_or(1.0),
             seed: id,
         },
         _ => Sampler::Greedy,
@@ -989,6 +1060,7 @@ fn stream_messages(
                 TokenEvent::Done(_) => break,
             }
         }
+        engine.record(prompt_tokens, completion_tokens);
 
         send(w, "content_block_stop", serde_json::json!({
             "type": "content_block_stop",
@@ -1079,6 +1151,7 @@ fn stream_chat(
                 }
             }
         }
+        engine.record(prompt_tokens, completion_tokens);
 
         send_chunk(w, Delta { role: None, content: None }, Some(finish))?;
 
