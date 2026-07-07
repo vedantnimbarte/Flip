@@ -207,6 +207,25 @@ fn eos_token_ends_the_turn() {
 }
 
 #[test]
+fn count_tokens_reports_input_tokens() {
+    let addr = start_server();
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}]}"#;
+    let resp = post(addr, "/v1/messages/count_tokens", body);
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let expected = BpeTokenizer::bytes_only().encode("user: Hi\nassistant:").unwrap().len();
+    assert!(resp.contains(&format!(r#""input_tokens":{expected}"#)), "{resp}");
+}
+
+#[test]
+fn messages_errors_use_anthropic_shape() {
+    let addr = start_server();
+    let resp = post(addr, "/v1/messages", r#"{"messages":[]}"#);
+    assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+    assert!(resp.contains(r#""type":"error""#), "{resp}");
+    assert!(resp.contains(r#""invalid_request_error""#), "{resp}");
+}
+
+#[test]
 fn concurrent_requests_are_served() {
     let addr = start_server();
     let handles: Vec<_> = (0..3)

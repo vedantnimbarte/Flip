@@ -529,6 +529,7 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
             }
             ("POST", "/v1/chat/completions") => handle_chat(&engine, req),
             ("POST", "/v1/messages") => handle_messages(&engine, req),
+            ("POST", "/v1/messages/count_tokens") => handle_count_tokens(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
             _ => Response::json(405, error_json("method not allowed")),
         }
@@ -754,31 +755,74 @@ struct MessagesResponse {
     usage: AnthropicUsage,
 }
 
-fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
-    let parsed: MessagesRequest = match serde_json::from_slice(&req.body) {
-        Ok(r) => r,
-        Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
-    };
-    if parsed.messages.is_empty() {
-        return Response::json(400, error_json("messages must not be empty"));
-    }
+/// Anthropic error envelope: `{"type":"error","error":{"type","message"}}`.
+fn anthropic_error_json(message: &str) -> Vec<u8> {
+    format!(
+        r#"{{"type":"error","error":{{"type":"invalid_request_error","message":{message:?}}}}}"#
+    )
+    .into_bytes()
+}
 
-    // Fold `system` + messages into the shared chat template. The Anthropic
-    // `system` field becomes a leading system-role message.
-    let mut messages: Vec<ChatMessage> = Vec::with_capacity(parsed.messages.len() + 1);
-    if let Some(sys) = &parsed.system {
+/// Fold Anthropic `system` + `messages` into the rendered prompt string. The
+/// `system` field becomes a leading system-role message.
+fn anthropic_prompt(
+    engine: &EngineService,
+    system: &Option<AnthropicContent>,
+    msgs: &[AnthropicMessage],
+) -> String {
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(msgs.len() + 1);
+    if let Some(sys) = system {
         let text = sys.to_text();
         if !text.is_empty() {
             messages.push(ChatMessage { role: "system".into(), content: text });
         }
     }
-    for m in &parsed.messages {
+    for m in msgs {
         messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
     }
-    let prompt = engine.chat_template.apply(&messages);
+    engine.chat_template.apply(&messages)
+}
+
+#[derive(Deserialize)]
+struct CountTokensRequest {
+    messages: Vec<AnthropicMessage>,
+    #[serde(default)]
+    system: Option<AnthropicContent>,
+}
+
+/// `POST /v1/messages/count_tokens`: report how many input tokens the request
+/// would consume, without generating.
+fn handle_count_tokens(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: CountTokensRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, anthropic_error_json(&format!("invalid request: {e}"))),
+    };
+    if parsed.messages.is_empty() {
+        return Response::json(400, anthropic_error_json("messages must not be empty"));
+    }
+    let prompt = anthropic_prompt(engine, &parsed.system, &parsed.messages);
+    match engine.encode_prompt(&prompt) {
+        Ok(ids) => {
+            let body = serde_json::json!({ "input_tokens": ids.len() });
+            Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
+        }
+        Err(e) => Response::json(400, anthropic_error_json(&e)),
+    }
+}
+
+fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: MessagesRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, anthropic_error_json(&format!("invalid request: {e}"))),
+    };
+    if parsed.messages.is_empty() {
+        return Response::json(400, anthropic_error_json("messages must not be empty"));
+    }
+
+    let prompt = anthropic_prompt(engine, &parsed.system, &parsed.messages);
     let ids = match engine.encode_prompt(&prompt) {
         Ok(ids) => ids,
-        Err(e) => return Response::json(400, error_json(&e)),
+        Err(e) => return Response::json(400, anthropic_error_json(&e)),
     };
 
     let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
@@ -867,6 +911,7 @@ fn stream_messages(
             "index": 0,
             "content_block": {"type": "text", "text": ""},
         }))?;
+        send(w, "ping", serde_json::json!({"type": "ping"}))?;
 
         let eos = engine.eos_token;
         let mut completion_tokens = 0usize;

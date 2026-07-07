@@ -777,8 +777,9 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     let mode = if speculative { "batched + speculative" } else { "batched" };
-    println!("serving      : OpenAI-compatible API on http://{listen} ({mode})");
-    println!("  endpoints  : POST /v1/chat/completions (stream supported), GET /v1/models");
+    println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
+    println!("  openai     : POST /v1/chat/completions (stream), GET /v1/models");
+    println!("  anthropic  : POST /v1/messages (stream), POST /v1/messages/count_tokens");
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
     }
