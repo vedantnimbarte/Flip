@@ -16,7 +16,7 @@ use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +45,28 @@ struct Metrics {
     completion_tokens: AtomicU64,
 }
 
+/// Latest layer-streaming cache stats, published by the engine loop from the
+/// kernel and read by `/metrics`. `active` is set only when the served kernel
+/// streams weights, so resident-model runs omit the streaming gauges.
+#[derive(Default)]
+struct StreamMetrics {
+    active: AtomicBool,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    prefetched: AtomicU64,
+}
+
+impl StreamMetrics {
+    fn publish(&self, s: crate::forward::StreamStats) {
+        self.active.store(true, Ordering::Relaxed);
+        self.hits.store(s.hits, Ordering::Relaxed);
+        self.misses.store(s.misses, Ordering::Relaxed);
+        self.evictions.store(s.evictions, Ordering::Relaxed);
+        self.prefetched.store(s.prefetched, Ordering::Relaxed);
+    }
+}
+
 /// A handle to the background batching engine.
 pub struct EngineService {
     job_tx: Mutex<Sender<Job>>,
@@ -62,6 +84,8 @@ pub struct EngineService {
     /// Requests are clamped to fit; `usize::MAX` disables the guard.
     max_context: usize,
     metrics: Metrics,
+    /// Layer-streaming stats, shared with the engine loop that publishes them.
+    stream: Arc<StreamMetrics>,
 }
 
 impl EngineService {
@@ -136,8 +160,10 @@ impl EngineService {
         prefix_cache_size: usize,
     ) -> Arc<Self> {
         let (job_tx, job_rx) = channel::<Job>();
+        let stream = Arc::new(StreamMetrics::default());
+        let stream_loop = Arc::clone(&stream);
         std::thread::spawn(move || {
-            engine_loop(generator, draft, gamma, job_rx, max_batch, prefix_cache_size)
+            engine_loop(generator, draft, gamma, job_rx, max_batch, prefix_cache_size, stream_loop)
         });
         Arc::new(Self {
             job_tx: Mutex::new(job_tx),
@@ -151,6 +177,7 @@ impl EngineService {
             eos_tokens: Vec::new(),
             max_context: usize::MAX,
             metrics: Metrics::default(),
+            stream,
         })
     }
 
@@ -231,6 +258,7 @@ impl EngineService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn engine_loop<K: ComputeKernel>(
     generator: Generator<K>,
     draft: Option<Generator<K>>,
@@ -238,6 +266,7 @@ fn engine_loop<K: ComputeKernel>(
     job_rx: Receiver<Job>,
     max_batch: usize,
     prefix_cache_size: usize,
+    stream: Arc<StreamMetrics>,
 ) {
     let mut sched = match &draft {
         // Speculative sessions can't resume, so the prefix cache is plain-path only.
@@ -288,6 +317,11 @@ fn engine_loop<K: ComputeKernel>(
                     let _ = s.send(TokenEvent::Done(None));
                 }
             }
+        }
+        // Publish the streaming kernel's latest cache stats (no-op / None for
+        // resident kernels). Cheap: one stats read per token step.
+        if let Some(s) = generator.stream_stats() {
+            stream.publish(s);
         }
     }
 }
@@ -573,7 +607,7 @@ pub fn secured_router(engine: Arc<EngineService>, api_key: Option<String>) -> Ha
 /// Prometheus text-format dump of the cumulative counters.
 fn metrics_text(engine: &EngineService) -> String {
     let m = &engine.metrics;
-    format!(
+    let mut out = format!(
         "# HELP dlm_requests_total Completed generation requests.\n\
          # TYPE dlm_requests_total counter\n\
          dlm_requests_total {}\n\
@@ -586,7 +620,32 @@ fn metrics_text(engine: &EngineService) -> String {
         m.requests.load(Ordering::Relaxed),
         m.prompt_tokens.load(Ordering::Relaxed),
         m.completion_tokens.load(Ordering::Relaxed),
-    )
+    );
+    // Layer-streaming cache stats — present only when streaming weights, so a
+    // scraper can see the hit rate / prefetch effectiveness and tune the window
+    // and --prefetch-depth.
+    let s = &engine.stream;
+    if s.active.load(Ordering::Relaxed) {
+        out.push_str(&format!(
+            "# HELP dlm_stream_layer_hits_total Layer fetches served from the resident window.\n\
+             # TYPE dlm_stream_layer_hits_total counter\n\
+             dlm_stream_layer_hits_total {}\n\
+             # HELP dlm_stream_layer_misses_total Layer fetches that blocked on a load.\n\
+             # TYPE dlm_stream_layer_misses_total counter\n\
+             dlm_stream_layer_misses_total {}\n\
+             # HELP dlm_stream_layer_evictions_total Layers evicted from the window.\n\
+             # TYPE dlm_stream_layer_evictions_total counter\n\
+             dlm_stream_layer_evictions_total {}\n\
+             # HELP dlm_stream_layer_prefetched_total Layers loaded ahead by the prefetch worker.\n\
+             # TYPE dlm_stream_layer_prefetched_total counter\n\
+             dlm_stream_layer_prefetched_total {}\n",
+            s.hits.load(Ordering::Relaxed),
+            s.misses.load(Ordering::Relaxed),
+            s.evictions.load(Ordering::Relaxed),
+            s.prefetched.load(Ordering::Relaxed),
+        ));
+    }
+    out
 }
 
 /// Build the HTTP router for the batched/streaming engine.

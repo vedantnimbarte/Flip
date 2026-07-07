@@ -2,7 +2,7 @@
 //! chat completions, plus concurrent requests.
 
 use dlm::cache::KvCacheConfig;
-use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::forward::{BlockConfig, CpuKernel, LayerSource, LayerTensors, StreamingKernel};
 use dlm::generate::Generator;
 use dlm::server::{engine::router, EngineService, HttpServer};
 use dlm::tokenizer::BpeTokenizer;
@@ -276,6 +276,70 @@ fn messages_errors_use_anthropic_shape() {
     assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
     assert!(resp.contains(r#""type":"error""#), "{resp}");
     assert!(resp.contains(r#""invalid_request_error""#), "{resp}");
+}
+
+/// A byte-tokenizer-compatible streaming server: layers pulled on demand from a
+/// window smaller than the model, so `/metrics` reports streaming stats.
+fn start_streaming_server() -> SocketAddr {
+    let (vocab, hidden, layers_n) = (256usize, 16usize, 4u32);
+    let cfg = BlockConfig {
+        hidden_size: hidden,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 4,
+        intermediate_size: 32,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+    };
+    struct Src {
+        cfg: BlockConfig,
+        n: u32,
+    }
+    impl LayerSource for Src {
+        fn num_layers(&self) -> u32 {
+            self.n
+        }
+        fn load_layer(&self, _layer: u32) -> dlm::Result<LayerTensors> {
+            Ok(LayerTensors::zeros(&self.cfg))
+        }
+    }
+    let kernel = StreamingKernel::new(cfg, Src { cfg, n: layers_n }, 2); // window 2 of 4
+    let fill = |n: usize| -> Vec<f32> { (0..n).map(|i| (i % 7) as f32 * 0.01).collect() };
+    let generator = Generator::new(
+        kernel,
+        fill(vocab * hidden),
+        vec![1.0; hidden],
+        fill(vocab * hidden),
+        vocab,
+        1e-5,
+        KvCacheConfig { num_layers: layers_n, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+        128,
+    )
+    .unwrap();
+    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm-stream", 16, 0, 4, 0);
+    let server = HttpServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || server.serve(router(engine)).unwrap());
+    addr
+}
+
+#[test]
+fn metrics_reports_streaming_stats() {
+    let addr = start_streaming_server();
+    // Resident kernels omit the streaming block; before any request it's absent.
+    let m0 = get(addr, "/metrics");
+    assert!(!m0.contains("dlm_stream_layer_"), "streaming gauges before traffic:\n{m0}");
+
+    // Drive a completion so the engine loop publishes the kernel's stream stats.
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4}"#;
+    let resp = post(addr, "/v1/chat/completions", body);
+    assert!(resp.contains(r#""completion_tokens":4"#), "{resp}");
+
+    let m1 = get(addr, "/metrics");
+    assert!(m1.contains("dlm_stream_layer_hits_total"), "{m1}");
+    assert!(m1.contains("dlm_stream_layer_prefetched_total"), "{m1}");
+    // Window of 2 over 4 layers → evictions must have happened.
+    assert!(m1.contains("dlm_stream_layer_evictions_total"), "{m1}");
 }
 
 #[test]

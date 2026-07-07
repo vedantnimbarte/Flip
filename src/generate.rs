@@ -286,6 +286,11 @@ impl<K: ComputeKernel> Generator<K> {
         })
     }
 
+    /// Layer-streaming cache stats, if the kernel streams weights (else `None`).
+    pub fn stream_stats(&self) -> Option<crate::forward::StreamStats> {
+        self.kernel.stream_stats()
+    }
+
     /// Vocabulary size.
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
