@@ -519,6 +519,64 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
     })
 }
 
+/// A collected non-streaming completion.
+struct Generated {
+    text: String,
+    /// True if a stop sequence was hit (vs. running to `max_tokens`).
+    stopped: bool,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    spec: Option<AcceptanceStats>,
+}
+
+/// Run one request to completion, ending early at the first stop sequence and
+/// truncating the decoded text before it. Shared by the OpenAI and Anthropic
+/// non-streaming handlers.
+fn collect_completion(
+    engine: &Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    sampler: Sampler,
+    stops: &[String],
+) -> Generated {
+    let prompt_tokens = ids.len();
+    let rx = engine.submit(ids, max_tokens, None, sampler);
+    let mut tokens = Vec::new();
+    let mut spec = None;
+    for ev in rx {
+        match ev {
+            TokenEvent::Next(t) => {
+                tokens.push(t);
+                if !stops.is_empty() {
+                    let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
+                    if earliest_stop(&so_far, stops).is_some() {
+                        break; // dropping the receiver ends generation
+                    }
+                }
+            }
+            TokenEvent::Done(stats) => {
+                spec = stats;
+                break;
+            }
+        }
+    }
+    let mut text = engine.tokenizer.decode(&tokens).unwrap_or_default();
+    let stopped = match earliest_stop(&text, stops) {
+        Some(cut) => {
+            text.truncate(cut);
+            true
+        }
+        None => false,
+    };
+    Generated {
+        text,
+        stopped,
+        prompt_tokens,
+        completion_tokens: tokens.len(),
+        spec,
+    }
+}
+
 fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let parsed: ChatRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
@@ -536,41 +594,11 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
-    let prompt_tokens = ids.len();
 
     if parsed.stream {
         stream_chat(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
     } else {
-        // Collect the completion, ending early at the first stop sequence.
-        let rx = engine.submit(ids, max_tokens, None, sampler);
-        let mut tokens = Vec::new();
-        let mut spec = None;
-        for ev in rx {
-            match ev {
-                TokenEvent::Next(t) => {
-                    tokens.push(t);
-                    if !stops.is_empty() {
-                        let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
-                        if earliest_stop(&so_far, &stops).is_some() {
-                            break; // dropping the receiver ends generation
-                        }
-                    }
-                }
-                TokenEvent::Done(stats) => {
-                    spec = stats;
-                    break;
-                }
-            }
-        }
-        // Truncate the decoded text before the stop sequence, if one hit.
-        let mut text = engine.tokenizer.decode(&tokens).unwrap_or_default();
-        let finish_reason = match earliest_stop(&text, &stops) {
-            Some(cut) => {
-                text.truncate(cut);
-                "stop"
-            }
-            None => "length",
-        };
+        let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
         let body = ChatResponse {
             id: format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed)),
             object: "chat.completion",
@@ -578,14 +606,14 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             model,
             choices: vec![Choice {
                 index: 0,
-                message: RespMessage { role: "assistant", content: text },
-                finish_reason,
+                message: RespMessage { role: "assistant", content: g.text },
+                finish_reason: if g.stopped { "stop" } else { "length" },
             }],
             usage: Usage {
-                prompt_tokens,
-                completion_tokens: tokens.len(),
-                total_tokens: prompt_tokens + tokens.len(),
-                speculative: spec.map(SpeculativeUsage::from),
+                prompt_tokens: g.prompt_tokens,
+                completion_tokens: g.completion_tokens,
+                total_tokens: g.prompt_tokens + g.completion_tokens,
+                speculative: g.spec.map(SpeculativeUsage::from),
             },
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
