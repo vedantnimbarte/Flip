@@ -402,6 +402,33 @@ page-aligned host allocations (same layout contract, promotable in place later
 via `cudaHostRegister` / `hipHostRegister`), so nothing about the pipeline shape
 changes between builds.
 
+### Running on unofficially-supported AMD cards
+
+ROCm ships kernels only for a short list of "officially supported" GPUs, but many
+Radeon cards that aren't on that list share an ISA with one that is. The
+`HSA_OVERRIDE_GFX_VERSION` env var tells ROCm to treat your GPU as the nearest
+supported `gfx` target — no rebuild, just a runtime override on the `rocm` build:
+
+```bash
+# Set the gfx version of the nearest supported card in your GPU's family:
+HSA_OVERRIDE_GFX_VERSION=10.3.0 dlm serve <model>
+```
+
+Pick the value from your GPU's architecture:
+
+| Architecture | Example cards | `HSA_OVERRIDE_GFX_VERSION` |
+|---|---|---|
+| RDNA 3 | RX 7600 / 7700 XT | `11.0.0` |
+| RDNA 2 | RX 6600 / 6700 / 6800 | `10.3.0` |
+| RDNA 1 | RX 5500 / 5700 | `10.1.0` |
+| Vega / GCN 5 | Vega 56/64, Radeon VII | `9.0.0` |
+
+This is unofficial: it only works when the override matches your card's real ISA,
+and a mismatch can hang or return garbage rather than error cleanly — verify with
+`dlm doctor` (runs a self-test) before trusting output. It does **not** enable
+most integrated APUs, whose iGPUs ROCm can't drive regardless. When in doubt,
+`rocminfo` prints your GPU's actual `gfx` name.
+
 ## Distributed & scaling
 
 The Phase 3 serving and scaling components (all CPU-testable, driven by the same
