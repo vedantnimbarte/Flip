@@ -45,6 +45,12 @@ see [Building for GPU](#building-for-gpu-nvidia--amd).
 Rust users can also `cargo install --git https://github.com/vedantnimbarte/dlm`
 (builds from source).
 
+To update to the latest release (just reinstalls; same env as install):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/update.sh | sh
+```
+
 To uninstall (removes the binary; respects `DLM_INSTALL_DIR`):
 
 ```sh
