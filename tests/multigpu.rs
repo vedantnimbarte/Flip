@@ -83,8 +83,22 @@ fn greedy<K: dlm::forward::ComputeKernel>(gen: &Generator<K>, prompt: &[u32], n:
     .unwrap()
 }
 
+/// Multi-GPU parity needs the requested device ids to actually exist. Off-GPU
+/// `set_device` is a no-op so this always passes; under a real CUDA/HIP backend
+/// it confirms the hardware is present, letting a runner with too few GPUs skip
+/// rather than fail on `cudaSetDevice`.
+fn devices_available(ids: &[u32]) -> bool {
+    let ok = ids.iter().all(|&id| dlm::gpu::set_device(id).is_ok());
+    let _ = dlm::gpu::set_device(0);
+    ok
+}
+
 #[test]
 fn pipeline_parallel_matches_single_device() {
+    if !devices_available(&[0, 1, 2]) {
+        eprintln!("skipping: needs 3 GPUs, not present on this runner");
+        return;
+    }
     let single = build_parts().into_cpu_generator().unwrap();
 
     // Split 5 layers across 3 GPUs (2/2/1). Output must be identical.
@@ -103,6 +117,8 @@ fn pipeline_parallel_matches_single_device() {
 #[test]
 fn single_gpu_id_is_whole_model_on_one_device() {
     let single = build_parts().into_cpu_generator().unwrap();
-    let one_gpu = build_parts().into_pipeline_parallel_generator(&[3]).unwrap();
+    // Device 0 (not an arbitrary id like 3) so this runs for real on any GPU
+    // box; a single-element list still maps the whole model to one device.
+    let one_gpu = build_parts().into_pipeline_parallel_generator(&[0]).unwrap();
     assert_eq!(greedy(&one_gpu, &[1, 2, 3], 6), greedy(&single, &[1, 2, 3], 6));
 }
