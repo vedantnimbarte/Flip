@@ -10,7 +10,7 @@ jobs:
   # Windows is not a special case — but it was never actually exercised in CI,
   # and the only OS-specific code (page size, mmap hints, the nvcc host-compiler
   # probe) lives exactly where an untested platform would break.
-  test:
+  test-matrix:
     strategy:
       fail-fast: false
       matrix:
@@ -69,3 +69,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  # Single aggregate gate. `main`'s branch protection requires a status check
+  # named exactly `test`; a matrix job reports as `test (ubuntu-latest)` etc., so
+  # without this the required context would never appear and every PR would wedge.
+  # Depending on all legs also means the one required check now gates the whole
+  # suite rather than a single Linux run.
+  test:
+    if: always()
+    needs: [test-matrix, real-model, cuda-check, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job did not succeed
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "upstream results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "a required job failed"; exit 1; }
+          done
+          echo "all required jobs passed"
