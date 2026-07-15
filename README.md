@@ -36,12 +36,19 @@ irm https://raw.githubusercontent.com/vedantnimbarte/dlm/main/install.ps1 | iex
 Prebuilt targets: Linux x86-64/arm64, macOS Apple Silicon, Windows x86-64. (Intel
 Macs: build from source with `cargo install`.)
 
-On **Linux x86-64 with an NVIDIA GPU** the installer picks the **CUDA (GPU)
-build** automatically, and it runs on the GPU by default — pass `--device cpu` to
-`serve` or `generate` to force CPU. Everywhere else it installs the portable
-**CPU build**. Force the CPU build with `DLM_CPU=1 curl … | sh`. (The GPU build
-links the CUDA runtime; if it can't load, the installer falls back to the CPU
-build on its own.)
+On **x86-64 Linux or Windows with an NVIDIA GPU**, the installer picks the
+**GPU (CUDA) build** automatically and runs on the GPU by default — pass
+`--device cpu` to `serve` or `generate` to force CPU per-command. Everywhere else
+(no NVIDIA GPU, arm64, macOS) it installs the portable **CPU build**.
+
+The GPU build **statically embeds the CUDA runtime**, so it needs only the
+**NVIDIA driver** — no CUDA toolkit install. An **AMD GPU** gets the CPU build for
+now (AMD GPU support is planned; see [Building for GPU](#building-for-gpu-nvidia--amd)).
+
+- Force the CPU build: `DLM_CPU=1 curl … | sh` (or set `DLM_CPU=1` before the
+  Windows one-liner).
+- If the GPU build won't start (driver missing or too old), the installer says so
+  and falls back to the CPU build on its own.
 
 Then:
 
@@ -171,9 +178,10 @@ any machine.
   - Linux: `build-essential`
   - macOS: Xcode Command Line Tools (`xcode-select --install`)
   - Windows: the Visual Studio C++ Build Tools (MSVC)
-- **(Optional, for the GPU path)** one of:
-  - NVIDIA CUDA Toolkit 12.x with `cudart` on the library path, or
-  - AMD ROCm 6.x with `amdhip64` on the library path.
+- **(Optional, for the GPU path)** NVIDIA CUDA Toolkit 12.x with `cudart` on the
+  library path. (AMD ROCm is memory-only for now — see
+  [Building for GPU](#building-for-gpu-nvidia--amd) — so it needs no toolkit to
+  build.)
 
   Not required for building, testing, or the demo — the host fallback needs no GPU.
 
@@ -406,17 +414,34 @@ The GPU path is vendor-neutral behind [`src/gpu`](src/gpu), selected by a Cargo
 feature. Everything above the backend (storage, profiler, pipeline) is identical
 across vendors.
 
+> **GPU compute status:** NVIDIA (CUDA) is the only backend with working compute
+> kernels today, and it is verified on real hardware against the CPU oracle
+> ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)). The `rocm` (AMD) feature
+> currently provides **memory management only** — VRAM query and pinned host
+> memory — and has **no compute kernels**, so on an AMD GPU inference falls back
+> to the CPU. **AMD GPU compute (a HIP port of `kernels.cu`) is planned, not yet
+> available.**
+
 | Feature | Vendor | Runtime | Env var |
 |---|---|---|---|
-| `cuda` | NVIDIA | `cudart` | `CUDA_PATH` |
-| `cuda-kernels` | NVIDIA | `cudart` + compiled `kernels.cu` (nvcc) | `CUDA_PATH` |
-| `rocm` | AMD | `amdhip64` | `ROCM_PATH` |
+| `cuda` | NVIDIA | `cudart` (dynamic) | `CUDA_PATH` |
+| `cuda-kernels` | NVIDIA | dynamic `cudart` + compiled `kernels.cu` (nvcc) | `CUDA_PATH` |
+| `cuda-static` | NVIDIA | **static** `cudart` baked in — runs on driver alone | `CUDA_PATH` |
+| `rocm` | AMD | `amdhip64` — memory only, no compute yet (planned) | `ROCM_PATH` |
 | _(none)_ | — | host fallback | — |
 
 `cuda-kernels` additionally compiles [`src/gpu/kernels.cu`](src/gpu/kernels.cu)
 with nvcc and enables `GpuKernel` (the device `run_block`). `cargo check
 --features cuda-kernels` type-checks the Rust FFI without the toolkit; building a
 binary that runs the kernels needs nvcc + a GPU.
+
+**The prebuilt release ships the `cuda-static` build** (Linux and Windows
+x86-64). Statically embedding the CUDA runtime means the toolkit is needed only
+at *build* time — the shipped binary runs on any machine with just the NVIDIA
+driver. `cuda-static` is a strict superset of the dynamic `cuda-kernels` build
+(it also runs where the toolkit is present), so there is no separate dynamic
+release asset; build the dynamic variant yourself with
+`cargo install --git … --features cuda-kernels` if you specifically want it.
 
 On a CUDA machine, `cargo test --features cuda-kernels` runs
 [`tests/gpu_parity.rs`](tests/gpu_parity.rs), which decodes the same random model
@@ -442,6 +467,10 @@ via `cudaHostRegister` / `hipHostRegister`), so nothing about the pipeline shape
 changes between builds.
 
 ### Running on unofficially-supported AMD cards
+
+> **Not functional yet.** This applies only once AMD GPU compute lands (see the
+> status note above). It is kept here as reference for that work — today the
+> `rocm` build has no compute kernels and runs inference on the CPU.
 
 ROCm ships kernels only for a short list of "officially supported" GPUs, but many
 Radeon cards that aren't on that list share an ISA with one that is. The

@@ -42,14 +42,26 @@ fi
 target="${arch_part}-${os_part}"
 cpu_asset="${BIN}-${target}.tar.gz"
 
-# GPU build only exists for Linux x86-64. Pick it when an NVIDIA GPU is present
-# (nvidia-smi answers) unless DLM_CPU=1 forces the portable CPU build.
+# Build selection. The GPU (static-CUDA) build exists for Linux x86-64 only; its
+# CUDA runtime is statically embedded, so it runs on any machine with just the
+# NVIDIA driver (no toolkit needed). Pick it when an NVIDIA GPU is present
+# (nvidia-smi answers), unless DLM_CPU=1 forces the portable CPU build.
+#
+# If nvidia-smi is absent we install the CPU build and say so; an AMD GPU lands
+# here too — AMD GPU support is planned, so it runs on CPU for now.
 asset="$cpu_asset"
 kind="CPU"
-if [ "${DLM_CPU:-}" != "1" ] && [ "$os" = "Linux" ] && [ "$arch_part" = "x86_64" ] \
-   && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-  asset="${BIN}-${target}-cuda.tar.gz"
+gpu_capable=0
+if [ "$os" = "Linux" ] && [ "$arch_part" = "x86_64" ]; then gpu_capable=1; fi
+
+if [ "${DLM_CPU:-}" = "1" ]; then
+  info "DLM_CPU=1 set — installing the CPU build."
+elif [ "$gpu_capable" = "1" ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  asset="${BIN}-${target}-cuda-static.tar.gz"
   kind="GPU (CUDA)"
+  info "NVIDIA GPU detected — installing the GPU (CUDA) build."
+else
+  info "No NVIDIA GPU detected — installing the CPU build. (AMD GPU support is planned; it runs on CPU for now.)"
 fi
 
 tmp=$(mktemp -d)
@@ -107,11 +119,12 @@ fetch() {
 info "Installing ${BIN} (${target}, ${kind} build)…"
 fetch "$asset"
 
-# The GPU build dynamically links the CUDA runtime; if it's absent the binary
-# won't even start. Detect that here and fall back to the portable CPU build so
-# the install never leaves a binary that can't run.
+# The GPU build embeds the CUDA runtime but still needs a usable NVIDIA driver.
+# If the driver is missing or too old the binary won't start — detect that and
+# fall back to the CPU build so the install never leaves a binary that can't run.
 if [ "$asset" != "$cpu_asset" ] && ! "$tmp/$BIN" --version >/dev/null 2>&1; then
-  info "GPU build won't start here (CUDA runtime missing?) — falling back to the CPU build."
+  info "GPU build won't start here (NVIDIA driver missing or too old?) — falling back to the CPU build."
+  info "Update your NVIDIA driver and re-run to get the GPU build."
   rm -f "$tmp/$BIN"
   fetch "$cpu_asset"
   kind="CPU"
