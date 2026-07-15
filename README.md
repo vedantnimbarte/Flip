@@ -4,14 +4,24 @@
 
 # dlm
 
-**dlm (Dynamic LLM)** — a dynamic layer-streaming inference engine. Run massive
-LLMs (70B, 405B+) on consumer GPUs (e.g. 16 GB VRAM) by streaming transformer
-layers in and out of VRAM instead of resident-loading the whole model.
+**dlm (Dynamic LLM)** — a dynamic layer-streaming inference engine. **Run models
+bigger than your VRAM**, whatever card you have — 4 GB, 6 GB, 8 GB, 16 GB, or
+more. dlm streams transformer layers in and out of VRAM instead of loading the
+whole model at once, so your GPU can run LLMs several times larger than it could
+normally hold.
 
 Rather than keeping every weight in VRAM, `dlm` keeps only a small window of
 transformer blocks resident and continuously streams the next window in over the
 PCIe bus while the GPU computes the current one — trading a bit of speed for the
-ability to run models many times larger than the card.
+ability to run models many times larger than the card. The smaller your card,
+the more it streams (and the slower it runs), but the model that wouldn't load
+at all now runs.
+
+It's not a 16 GB tool. It's for **anyone the VRAM wall has been telling "no"** —
+the 4 GB laptop GPU, the 6 GB gaming card, the 8 GB workstation — giving each of
+them the headroom to run models above their weight class. Tune the resident
+window to your card with `--vram-budget-gb` and `--safety-margin-gb` (drop the
+safety cushion on a small card to fit more layers).
 
 ---
 

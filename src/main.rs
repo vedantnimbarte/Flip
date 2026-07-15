@@ -506,6 +506,7 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
         args.model_path.as_deref(),
         args.context_length,
         args.vram_budget_gb,
+        args.safety_margin_gb,
         args.ram_cache_gb,
     )
 }
@@ -693,8 +694,19 @@ fn resident_window(config: &ModelConfig, args: &ServeArgs) -> usize {
         return n.max(1);
     }
     let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
-    let plan = VramProfiler::new(args.context_length).plan_with_free(config, free_bytes);
+    let plan = build_profiler(args.context_length, args.safety_margin_gb)
+        .plan_with_free(config, free_bytes);
     (plan.layers_to_load as usize).max(1)
+}
+
+/// Build a VRAM profiler, overriding the default safety cushion when the user
+/// passed `--safety-margin-gb` (small cards claw back the fixed 1.5 GiB default).
+fn build_profiler(context_length: u32, safety_margin_gb: Option<f64>) -> VramProfiler {
+    let p = VramProfiler::new(context_length);
+    match safety_margin_gb {
+        Some(gb) => p.with_safety_margin_bytes((gb.max(0.0) * GIB as f64) as u64),
+        None => p,
+    }
 }
 
 /// Serve with the GPU kernel (all layers resident in VRAM). Feature-gated on
@@ -922,6 +934,7 @@ fn report_plan(
     model_dir: Option<&Path>,
     context_length: u32,
     vram_budget_gb: Option<f64>,
+    safety_margin_gb: Option<f64>,
     ram_cache_gb: Option<f64>,
 ) -> Result<()> {
     // Map shards + measure real weight sizes when a directory is supplied.
@@ -948,7 +961,7 @@ fn report_plan(
     let catalog = mapped.as_ref().map(|(_, cat)| cat);
 
     // Resolve free VRAM: explicit budget > live device query > simulated 16 GiB.
-    let profiler = VramProfiler::new(context_length);
+    let profiler = build_profiler(context_length, safety_margin_gb);
     let (free_bytes, free_source) = resolve_free_bytes(vram_budget_gb);
     println!("free VRAM    : {free_source}");
 
