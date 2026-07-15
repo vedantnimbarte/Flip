@@ -12,10 +12,12 @@ normally hold.
 
 Rather than keeping every weight in VRAM, `dlm` keeps only a small window of
 transformer blocks resident and continuously streams the next window in over the
-PCIe bus while the GPU computes the current one — trading a bit of speed for the
-ability to run models many times larger than the card. The smaller your card,
-the more it streams (and the slower it runs), but the model that wouldn't load
-at all now runs.
+PCIe bus while the GPU computes the current one — trading throughput for the
+ability to run models many times larger than the card. This is a **capability,
+not a speed** play: streaming is disk-bound and slow, and the compute kernels are
+not yet optimized — expect well under 1 token/s on a small card (see
+[Performance](#performance)). The smaller your card, the more it streams (and the
+slower it runs), but the model that wouldn't load at all now runs.
 
 It's not a 16 GB tool. It's for **anyone the VRAM wall has been telling "no"** —
 the 4 GB laptop GPU, the 6 GB gaming card, the 8 GB workstation — giving each of
@@ -99,6 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.s
 ## Table of contents
 
 - [Install](#install)
+- [Performance](#performance)
 - [How it works](#how-it-works)
 - [Prerequisites](#prerequisites)
 - [Build & run locally](#build--run-locally)
@@ -106,6 +109,30 @@ curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.s
 - [The VRAM budget math](#the-vram-budget-math)
 - [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
 - [Distributed & scaling](#distributed--scaling)
+
+---
+
+## Performance
+
+**dlm is about capability, not speed.** It exists to run a model your card
+otherwise couldn't load at all — not to run one *fast*. Set expectations
+accordingly before you install:
+
+- **Throughput is low.** Measured on a 4 GB GTX 1650, Llama-3.2-1B (int4)
+  generates at **~0.7 tok/s fully resident** and **~0.2 tok/s** when streaming a
+  small window from disk. Mainstream GPU runners (llama.cpp, ollama) are one to
+  two orders of magnitude faster on the same card. The compute kernels are not
+  yet optimized (no fused attention/MLP, no tensor-core paths) — the GPU path
+  currently runs only modestly faster than the CPU path. **Closing this gap is
+  the top roadmap item**, but it is not there today.
+- **Streaming is disk-bound.** The smaller the resident window, the more layers
+  cross the PCIe bus per token, and throughput drops accordingly. Prefetch hides
+  some of that latency, but at very small windows it thrashes and streaming
+  serializes to load-then-compute. **If the model fits in VRAM, don't pass
+  `--stream`** — run it fully resident.
+
+Reach for dlm for experimentation, batch/offline generation, and running models
+above your card's weight class — not interactive chat at conversational speed.
 
 ---
 
