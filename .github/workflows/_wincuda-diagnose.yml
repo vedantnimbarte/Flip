@@ -21,10 +21,14 @@ jobs:
       # MSVC 195x (VS 2026 / toolset 14.5x). CUDA 12.5's cudafe++ segfaults on it
       # (ACCESS_VIOLATION) — the runner ships only the newest MSVC, so pinning an
       # older toolkit is not an option. v0.2.35 is the first action tag with 13.2.
+      # CUDA 13 restructured its network packages: the ["nvcc","cudart"] subset no
+      # longer carries crt/host_config.h, so nvcc dies with C1083. Install the full
+      # toolkit — this is a rarely-run release job, so a fuller download beats
+      # chasing per-version component names. ponytail: full install; slim the
+      # sub-packages later if download time ever matters.
       - uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "13.2.0"
           method: network
-          sub-packages: '["nvcc", "cudart"]'
       - name: Build cuda-static
         run: cargo build --release --features cuda-static
