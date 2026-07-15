@@ -29,6 +29,10 @@ fn main() {
                 println!("cargo:rustc-link-lib=dylib=rt");
                 println!("cargo:rustc-link-lib=dylib=pthread");
                 println!("cargo:rustc-link-lib=dylib=dl");
+                // CUDA 13's cudart_static drags in C++ runtime code (__cxa_guard_*,
+                // __gxx_personality_v0) that 12.x did not; link libstdc++ so those
+                // resolve. Emitted last so it satisfies cudart_static's references.
+                println!("cargo:rustc-link-lib=dylib=stdc++");
             }
         } else {
             println!("cargo:rustc-link-lib=dylib=cudart");
