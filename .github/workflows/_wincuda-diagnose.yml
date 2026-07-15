@@ -10,11 +10,16 @@ on:
 
 jobs:
   win-cuda:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Show default MSVC
+        if: runner.os == 'Windows'
         run: |
           Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory | Select-Object Name
       # CUDA 13.2 is the first release whose nvcc frontend supports the runner's
