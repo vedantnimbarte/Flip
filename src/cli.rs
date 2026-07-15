@@ -181,6 +181,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "GB")]
     pub vram_budget_gb: Option<f64>,
 
+    /// VRAM safety cushion (GiB) held back for activation spikes. Default 1.5.
+    /// Lower it on small cards (e.g. `--safety-margin-gb 0.5` on a 4 GB GPU) to
+    /// free room for more resident layers; raise it if you hit OOM.
+    #[arg(long, value_name = "GB")]
+    pub safety_margin_gb: Option<f64>,
+
     /// Target conversation context window (tokens).
     #[arg(long, default_value_t = 8192)]
     pub context_length: u32,
@@ -300,6 +306,12 @@ pub struct ProfileArgs {
     /// Manual upper VRAM cap in gigabytes. Overrides the live device query.
     #[arg(long, value_name = "GB")]
     pub vram_budget_gb: Option<f64>,
+
+    /// VRAM safety cushion (GiB) held back for activation spikes. Default 1.5.
+    /// Lower it on small cards (e.g. `--safety-margin-gb 0.5` on a 4 GB GPU) to
+    /// free room for more resident layers; raise it if you hit OOM.
+    #[arg(long, value_name = "GB")]
+    pub safety_margin_gb: Option<f64>,
 
     /// System-RAM budget (GiB) for the tiered layer cache between NVMe and GPU.
     #[arg(long, value_name = "GB")]
