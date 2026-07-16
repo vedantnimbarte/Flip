@@ -13,10 +13,10 @@
 //! layers are allocated up front and persist across weight evictions, so
 //! attention still sees full history.
 //!
-//! **Status: compiled under `cuda-kernels`, but NOT yet validated on real GPU
-//! hardware** (no GPU in CI). The transformer math is the same FFI the CPU-parity
-//! test covers ([`tests/gpu_parity.rs`]); the streaming/eviction layer around it
-//! is new and unproven on-device. Treat as experimental until run on a GPU.
+//! Validated on-device against the CPU oracle by [`tests/gpu_parity.rs`]
+//! (`streaming_gpu_matches_resident` drives real evictions and asserts the output
+//! equals the fully-resident kernel's). CI has no GPU, so that check is manual —
+//! run the `cuda-kernels` suite on a real card before tagging a release.
 
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
