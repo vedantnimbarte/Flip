@@ -133,11 +133,13 @@ pub enum QuantArg {
     /// 4-bit group-affine (0.5 bytes/param). Quantized from the checkpoint at
     /// load: 4x less VRAM and PCIe per layer, at some accuracy cost.
     Int4,
-    /// 8-bit (1 byte/param).
+    /// 8-bit (1 byte/param) — NOT IMPLEMENTED; errors if requested.
     Int8,
-    /// 16-bit FP16/BF16 (2 bytes/param) — the checkpoint's own precision.
+    /// 16-bit FP16/BF16 (2 bytes/param). Accepted only if the checkpoint is
+    /// already 16-bit; dlm does not convert between float widths.
     Fp16,
-    /// 32-bit F32 (4 bytes/param) — the checkpoint's own precision.
+    /// 32-bit F32 (4 bytes/param). Accepted only if the checkpoint is already
+    /// f32; dlm does not convert between float widths.
     F32,
 }
 

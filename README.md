@@ -105,6 +105,7 @@ curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.s
 - [Running the tests](#running-the-tests)
 - [The VRAM budget math](#the-vram-budget-math)
 - [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
+- [Weight precision (`--quant`)](#weight-precision---quant)
 - [Distributed & scaling](#distributed--scaling)
 
 ---
@@ -251,7 +252,7 @@ dlm v0.1.0
 
 model source : built-in Llama-3-70B-class sample
 geometry     : 80 layers, hidden 8192, 64 q-heads / 8 kv-heads, head_dim 128
-quantization : Int4 (0.5 bytes/param), ~70.6 B params
+quantization : Fp16 (2 bytes/param), ~70.6 B params
 
 free VRAM    : simulated 16 GiB (no GPU device)
 
@@ -260,16 +261,20 @@ free VRAM    : simulated 16 GiB (no GPU device)
   M_safety         :     1536.0 MiB
   M_kv_total       :     2560.0 MiB
   pinned_zone      :        0.0 MiB
-  M_layer_weight   :      420.5 MiB
+  M_layer_weight   :     1682.1 MiB
   usable           :    12288.0 MiB
-  ▶ layers_to_load :         29 / 80
-  ▶ resident       :      36.2%
+  ▶ layers_to_load :          7 / 80
+  ▶ resident       :       8.8%
 ──────────────────────────────────────────────
 
 kv cache     : 512 paged blocks × 16 tok, 5.00 MiB/block → 8192 token capacity
-swap cycle   : 3 streaming pass(es), window of 29 layer(s)
+swap cycle   : 12 streaming pass(es), window of 7 layer(s)
 pipeline     : 4 steps, 2 overlapped (DMA hidden under compute)
 ```
+
+The sample assumes 16-bit weights, so a layer is 1.7 GiB and only 7 of 80 fit.
+`--quant int4` quantizes the weights at load, dropping a layer to 420 MiB so the
+same 16 GiB holds 29 — see [weight precision](#weight-precision---quant).
 
 Point it at a real model directory (containing `config.json` and
 `*.safetensors` shards) to map the actual weights and profile from measured
@@ -507,6 +512,52 @@ and a mismatch can hang or return garbage rather than error cleanly — verify w
 most integrated APUs, whose iGPUs ROCm can't drive regardless. When in doubt,
 `rocminfo` prints your GPU's actual `gfx` name.
 
+## Weight precision (`--quant`)
+
+**Omit it and dlm computes in the checkpoint's own precision** — it reads the
+dtype the file actually holds (`bf16`/`f16` → 16-bit, `f32` → 32-bit) and
+converts to f32 only in the register that consumes each weight. There is no
+default to get wrong, and nothing is upsized: an f32 copy of bf16 weights is
+lossless (every bf16 value is exactly an f32), so it would buy no precision while
+doubling VRAM, PCIe per streamed layer, and GEMV bandwidth.
+
+| `--quant` | bytes/param | what happens |
+| --- | --- | --- |
+| *(omitted)* | 2.0 / 4.0 | the checkpoint's own dtype — no conversion |
+| `int4` | 0.5 | quantized from the checkpoint at load (group-affine, groups of 128) |
+| `fp16` / `f32` | 2.0 / 4.0 | accepted only if it *matches* the checkpoint |
+| `int8` | — | not implemented; errors |
+
+A scheme dlm cannot actually deliver is an error, not a silent no-op — `--quant`
+never describes weights that don't exist.
+
+**`--quant int4` is the lever that matters on a small card.** It shrinks a layer
+4x, so more of the model stays resident and each streamed layer costs a quarter
+as much to move. Often it removes streaming entirely, which is worth more than
+making streaming faster — on a 4 GB GTX 1650, Llama-3.2-3B (5.6 GiB of bf16
+layers, i.e. a model that does **not** fit):
+
+| | resident | tok/s |
+| --- | --- | --- |
+| bf16, `--stream` | 5 / 28 layers | 0.024 |
+| `--quant int4` | all 28 (no streaming) | **4.2** |
+
+It is lossy — 4-bit group-affine rounding, without the calibration GPTQ/AWQ use —
+so check your model's output rather than assuming. Two caveats worth knowing:
+
+- **Quantizing costs load time** (it runs over every weight) and reads the full
+  16-bit tensors from disk regardless; the win is in VRAM and on the bus, not in
+  what is read.
+- **`--stream --quant int4` currently re-quantizes a layer on every window miss**,
+  which is far slower than either flag alone. Pair it with `--ram-cache-gb` (which
+  caches the quantized layer), or prefer plain `--quant int4` when the model fits.
+
+Already-quantized checkpoints (GPTQ/AWQ `qweight` triplets) are a different
+thing and are still refused at load — `--quant int4` quantizes a *float*
+checkpoint itself.
+
+---
+
 ## Distributed & scaling
 
 The Phase 3 serving and scaling components (all CPU-testable, driven by the same
@@ -537,6 +588,11 @@ inference engine):
     next `--prefetch-depth N` layers ahead of compute (`--auto-prefetch` tunes the
     depth from measured load-vs-compute time); `0` disables it. Output is
     bit-for-bit identical to a fully-resident run (tested end-to-end).
+    `--ram-cache-gb N` keeps materialized layers in a host-RAM LRU of at most `N`
+    GiB, so a layer evicted from the window is not re-read and re-materialized
+    from the checkpoint the next time it comes round — roughly **2x** on the
+    streamed path. Off by default: the cache duplicates weights in RAM on top of
+    the OS page cache, and on a memory-tight box that trade is a loss.
   - `--device gpu` — run the batched engine on the CUDA `GpuKernel`
     (all layers resident in VRAM; requires a `cuda-kernels` build).
   - `--stream --device gpu` — stream a window of layer weights **through VRAM**
@@ -547,9 +603,11 @@ inference engine):
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
 
   Two orthogonal memory knobs apply to any kernel:
+  - `--quant {int4}` — see [weight precision](#weight-precision---quant) below.
   - `--kv-quant {none,int8,int4}` — quantize the KV cache to int8 (~½ the KV
     memory) or int4 (~¼, more error), trading precision for a longer context in
-    the same budget. Defaults to exact `f32`.
+    the same budget. Defaults to exact `f32`. Independent of `--quant`: one sizes
+    the weights, the other the KV history.
   - `--prefix-cache-size N` — cache up to `N` prompt-prefix KV snapshots so
     requests sharing a prefix (e.g. a common system prompt) skip re-prefilling it.
     Each entry holds its prefix's KV in RAM; `0` disables it.
