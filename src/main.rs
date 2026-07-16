@@ -606,6 +606,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     window,
                     args.prefetch_depth,
                     args.auto_prefetch,
+                    ram_cache_bytes(args.ram_cache_gb),
                 )?;
                 return start_batched_server(generator, None, &args, &config, &listen);
             }
@@ -752,7 +753,13 @@ fn serve_streaming_gpu(
 ) -> Result<()> {
     println!("device       : gpu ({}) — VRAM layer streaming [experimental]", gpu::active_vendor().label());
     let generator =
-        dlm::loader::build_streaming_gpu_generator(store, config, args.context_length, window)?;
+        dlm::loader::build_streaming_gpu_generator(
+            store,
+            config,
+            args.context_length,
+            window,
+            ram_cache_bytes(args.ram_cache_gb),
+        )?;
     start_batched_server(generator, None, args, config, listen)
 }
 
@@ -1059,6 +1066,13 @@ fn report_plan(
 }
 
 /// Resolve the free-VRAM figure and a human-readable description of its source.
+/// Host-RAM budget (bytes) for the streaming layer cache. `None` disables it:
+/// the cache duplicates layer weights in RAM on top of the page cache, so it is
+/// opt-in rather than a surprise allocation on a memory-tight box.
+fn ram_cache_bytes(gb: Option<f64>) -> usize {
+    gb.map_or(0, |g| (g * GIB as f64) as usize)
+}
+
 fn resolve_free_bytes(vram_budget_gb: Option<f64>) -> (u64, String) {
     if let Some(gb) = vram_budget_gb {
         let bytes = (gb * GIB as f64) as u64;

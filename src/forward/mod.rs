@@ -24,6 +24,6 @@ pub use gpu::GpuKernel;
 pub use kernel::{ComputeKernel, StubKernel};
 pub use multigpu::PipelineParallelKernel;
 pub use orchestrator::{ForwardOrchestrator, KvSnapshot};
-pub use streaming::{LayerSource, StreamStats, StreamingKernel};
+pub use streaming::{CachedLayerSource, LayerSource, StreamStats, StreamingKernel};
 #[cfg(feature = "cuda-kernels")]
 pub use streaming_gpu::StreamingGpuKernel;

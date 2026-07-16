@@ -299,8 +299,8 @@ fn start_streaming_server() -> SocketAddr {
         fn num_layers(&self) -> u32 {
             self.n
         }
-        fn load_layer(&self, _layer: u32) -> dlm::Result<LayerTensors> {
-            Ok(LayerTensors::zeros(&self.cfg))
+        fn load_layer(&self, _layer: u32) -> dlm::Result<std::sync::Arc<LayerTensors>> {
+            Ok(std::sync::Arc::new(LayerTensors::zeros(&self.cfg)))
         }
     }
     let kernel = StreamingKernel::new(cfg, Src { cfg, n: layers_n }, 2); // window 2 of 4

@@ -22,8 +22,8 @@
 use crate::cache::KvCacheConfig;
 use crate::error::{DlmError, Result};
 use crate::forward::{
-    BlockConfig, CpuKernel, LayerSource, LayerTensors, PipelineParallelKernel, StreamingKernel,
-    Weights,
+    BlockConfig, CachedLayerSource, CpuKernel, LayerSource, LayerTensors, PipelineParallelKernel,
+    StreamingKernel, Weights,
 };
 use crate::generate::Generator;
 use crate::model::ModelConfig;
@@ -311,8 +311,8 @@ impl LayerSource for MmapLayerSource {
     fn num_layers(&self) -> u32 {
         self.num_layers
     }
-    fn load_layer(&self, layer: u32) -> Result<LayerTensors> {
-        load_layer_tensors(&self.store, &self.cfg, layer)
+    fn load_layer(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
+        load_layer_tensors(&self.store, &self.cfg, layer).map(std::sync::Arc::new)
     }
 }
 
@@ -380,10 +380,12 @@ pub fn build_streaming_generator(
     resident_layers: usize,
     prefetch_depth: usize,
     auto_prefetch: bool,
-) -> Result<Generator<StreamingKernel<MmapLayerSource>>> {
+    ram_cache_bytes: usize,
+) -> Result<Generator<StreamingKernel<CachedLayerSource<MmapLayerSource>>>> {
     let p = load_streaming_pieces(store, config, max_context)?;
     let cfg = p.source.cfg;
-    let base = StreamingKernel::new(cfg, p.source, resident_layers);
+    let source = CachedLayerSource::new(p.source, ram_cache_bytes);
+    let base = StreamingKernel::new(cfg, source, resident_layers);
     let kernel = if auto_prefetch {
         base.with_auto_prefetch()
     } else {
@@ -403,19 +405,22 @@ pub fn build_streaming_generator(
 
 /// GPU counterpart of [`build_streaming_generator`]: stream a window of layer
 /// weights through VRAM ([`StreamingGpuKernel`]) while KV stays resident.
-/// Experimental — the device path is compile-checked but unvalidated on hardware.
+/// `ram_cache_bytes` bounds a host-RAM LRU of materialized layers so a VRAM miss
+/// doesn't re-read and re-materialize the layer every token (`0` disables it).
 #[cfg(feature = "cuda-kernels")]
 pub fn build_streaming_gpu_generator(
     store: MmapStore,
     config: &ModelConfig,
     max_context: u32,
     resident_layers: usize,
-) -> Result<Generator<crate::forward::StreamingGpuKernel<MmapLayerSource>>> {
+    ram_cache_bytes: usize,
+) -> Result<Generator<crate::forward::StreamingGpuKernel<CachedLayerSource<MmapLayerSource>>>> {
     let p = load_streaming_pieces(store, config, max_context)?;
     let cfg = p.source.cfg;
     let max_kv_tokens = p.kv_blocks as usize * p.kv_config.block_size as usize;
+    let source = CachedLayerSource::new(p.source, ram_cache_bytes);
     let kernel =
-        crate::forward::StreamingGpuKernel::new(cfg, p.source, max_kv_tokens, resident_layers)?;
+        crate::forward::StreamingGpuKernel::new(cfg, source, max_kv_tokens, resident_layers)?;
     Generator::new(
         kernel,
         p.embedding,

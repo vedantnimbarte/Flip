@@ -198,6 +198,26 @@ pub struct LayerTensors {
 }
 
 impl LayerTensors {
+    /// Approximate host bytes this layer occupies — the projection matrices in
+    /// their native dtype plus the norms/biases. Used to bound a byte-budgeted
+    /// cache; ignores per-`Vec` overhead, which is negligible against tens of MB
+    /// of weights.
+    pub fn byte_size(&self) -> usize {
+        let bias = |b: &Option<Vec<f32>>| b.as_ref().map_or(0, std::mem::size_of_val);
+        self.q_proj.as_bytes().len()
+            + self.k_proj.as_bytes().len()
+            + self.v_proj.as_bytes().len()
+            + self.o_proj.as_bytes().len()
+            + self.gate_proj.as_bytes().len()
+            + self.up_proj.as_bytes().len()
+            + self.down_proj.as_bytes().len()
+            + std::mem::size_of_val(&self.input_layernorm[..])
+            + std::mem::size_of_val(&self.post_attention_layernorm[..])
+            + bias(&self.q_bias)
+            + bias(&self.k_bias)
+            + bias(&self.v_bias)
+    }
+
     /// Validate every matrix against the config's expected dimensions.
     pub fn validate(&self, cfg: &BlockConfig) -> Result<()> {
         let checks = [

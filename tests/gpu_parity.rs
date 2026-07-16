@@ -22,8 +22,8 @@ impl LayerSource for VecSource {
     fn num_layers(&self) -> u32 {
         self.0.len() as u32
     }
-    fn load_layer(&self, layer: u32) -> dlm::Result<LayerTensors> {
-        Ok(self.0[layer as usize].clone())
+    fn load_layer(&self, layer: u32) -> dlm::Result<std::sync::Arc<LayerTensors>> {
+        Ok(std::sync::Arc::new(self.0[layer as usize].clone()))
     }
 }
 

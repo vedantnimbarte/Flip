@@ -37,7 +37,114 @@ pub trait LayerSource: Send + Sync {
     /// Total transformer layers available.
     fn num_layers(&self) -> u32;
     /// Materialize layer `layer`'s weights.
-    fn load_layer(&self, layer: u32) -> Result<LayerTensors>;
+    ///
+    /// Returns an `Arc` so a caching source ([`CachedLayerSource`]) can hand the
+    /// same layer to repeated callers without copying it — a layer is tens of MB,
+    /// so cloning one per VRAM miss would cost as much as re-reading it.
+    fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>>;
+}
+
+/// A [`LayerSource`] that keeps materialized layers in a byte-budgeted host-RAM
+/// LRU, so a VRAM miss doesn't re-read and re-materialize the layer every time.
+///
+/// Without this, streaming re-runs the whole host load — locate each tensor in
+/// the mmap, allocate tens of MB of fresh pages, copy — on *every* VRAM miss, of
+/// *every* layer, on *every* token, for bytes that never change. That was ~half
+/// the cost of a miss. Layers are handed out as `Arc`, so a hit costs a refcount
+/// bump rather than a copy.
+///
+/// The budget is in bytes; `0` disables caching (every call delegates). Eviction
+/// is LRU by last access.
+pub struct CachedLayerSource<S: LayerSource> {
+    inner: S,
+    state: Mutex<RamCache>,
+}
+
+/// LRU state for [`CachedLayerSource`].
+struct RamCache {
+    map: HashMap<u32, Arc<LayerTensors>>,
+    /// Least-recently-used first.
+    order: VecDeque<u32>,
+    bytes: usize,
+    budget: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl<S: LayerSource> CachedLayerSource<S> {
+    /// Wrap `inner`, caching up to `budget_bytes` of materialized layers.
+    pub fn new(inner: S, budget_bytes: usize) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(RamCache {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+                budget: budget_bytes,
+                hits: 0,
+                misses: 0,
+            }),
+        }
+    }
+
+    /// `(hits, misses)` against the host-RAM cache.
+    pub fn stats(&self) -> (u64, u64) {
+        let s = self.state.lock().unwrap();
+        (s.hits, s.misses)
+    }
+
+    #[cfg(test)]
+    fn inner_for_test(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
+    fn num_layers(&self) -> u32 {
+        self.inner.num_layers()
+    }
+
+    fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+        {
+            let mut s = self.state.lock().unwrap();
+            if let Some(t) = s.map.get(&layer) {
+                let t = Arc::clone(t);
+                s.hits += 1;
+                s.order.retain(|&l| l != layer);
+                s.order.push_back(layer);
+                return Ok(t);
+            }
+            s.misses += 1;
+        }
+        // Load with the lock released so concurrent loads (and the prefetch
+        // worker) overlap. A duplicate concurrent load of the same layer just
+        // wastes one read; the second insert replaces an identical value.
+        let t = self.inner.load_layer(layer)?;
+
+        let mut s = self.state.lock().unwrap();
+        if s.budget == 0 {
+            return Ok(t);
+        }
+        let size = t.byte_size();
+        // A layer bigger than the whole budget is never cached (caching it would
+        // evict everything and still not fit).
+        if size <= s.budget && !s.map.contains_key(&layer) {
+            while s.bytes + size > s.budget {
+                match s.order.pop_front() {
+                    Some(victim) => {
+                        if let Some(v) = s.map.remove(&victim) {
+                            s.bytes -= v.byte_size();
+                        }
+                    }
+                    None => break,
+                }
+            }
+            s.map.insert(layer, Arc::clone(&t));
+            s.order.push_back(layer);
+            s.bytes += size;
+        }
+        Ok(t)
+    }
 }
 
 /// Cache-effectiveness snapshot for a [`StreamingKernel`]. `prefetched` counts
@@ -147,7 +254,7 @@ impl<S: LayerSource> Shared<S> {
             let mut cache = self.cache.lock().unwrap();
             cache.loading.remove(&layer);
             self.ready.notify_all();
-            let arc = Arc::new(loaded?);
+            let arc = loaded?;
             cache.insert(layer, Arc::clone(&arc));
             if by_worker {
                 cache.stats.prefetched += 1;
@@ -367,8 +474,8 @@ mod tests {
         fn num_layers(&self) -> u32 {
             self.0.len() as u32
         }
-        fn load_layer(&self, layer: u32) -> Result<LayerTensors> {
-            Ok(self.0[layer as usize].clone())
+        fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+            Ok(Arc::new(self.0[layer as usize].clone()))
         }
     }
 
@@ -382,6 +489,73 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None,
         }
+    }
+
+    /// A source that counts how many times it actually materialized a layer.
+    struct CountingSource(Vec<LayerTensors>, AtomicU64);
+    impl LayerSource for CountingSource {
+        fn num_layers(&self) -> u32 {
+            self.0.len() as u32
+        }
+        fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(self.0[layer as usize].clone()))
+        }
+    }
+
+    #[test]
+    fn ram_cache_serves_repeats_without_reloading() {
+        let c = cfg();
+        let ls = layers(&c, 4);
+        let one = ls[0].byte_size();
+        let src = CachedLayerSource::new(CountingSource(ls, AtomicU64::new(0)), one * 4);
+
+        let first = src.load_layer(1).unwrap();
+        for _ in 0..5 {
+            let again = src.load_layer(1).unwrap();
+            // Same allocation, not a copy.
+            assert!(Arc::ptr_eq(&first, &again));
+        }
+        let (hits, misses) = src.stats();
+        assert_eq!((hits, misses), (5, 1));
+        // The underlying source was touched exactly once.
+        assert_eq!(src_loads(&src), 1);
+    }
+
+    #[test]
+    fn ram_cache_evicts_lru_when_over_budget() {
+        let c = cfg();
+        let ls = layers(&c, 4);
+        let one = ls[0].byte_size();
+        // Budget for two layers only.
+        let src = CachedLayerSource::new(CountingSource(ls, AtomicU64::new(0)), one * 2);
+
+        src.load_layer(0).unwrap();
+        src.load_layer(1).unwrap();
+        src.load_layer(0).unwrap(); // touch 0 so 1 is now least-recent
+        src.load_layer(2).unwrap(); // evicts 1
+        assert_eq!(src_loads(&src), 3);
+
+        src.load_layer(0).unwrap(); // still cached -> no reload
+        assert_eq!(src_loads(&src), 3);
+        src.load_layer(1).unwrap(); // was evicted -> reloads
+        assert_eq!(src_loads(&src), 4);
+    }
+
+    #[test]
+    fn ram_cache_disabled_by_zero_budget() {
+        let c = cfg();
+        let ls = layers(&c, 2);
+        let src = CachedLayerSource::new(CountingSource(ls, AtomicU64::new(0)), 0);
+        for _ in 0..3 {
+            src.load_layer(0).unwrap();
+        }
+        // Every call goes through to the source.
+        assert_eq!(src_loads(&src), 3);
+    }
+
+    fn src_loads(s: &CachedLayerSource<CountingSource>) -> u64 {
+        s.inner_for_test().1.load(Ordering::Relaxed)
     }
 
     fn layers(c: &BlockConfig, n: usize) -> Vec<LayerTensors> {
@@ -437,9 +611,9 @@ mod tests {
         fn num_layers(&self) -> u32 {
             self.0.len() as u32
         }
-        fn load_layer(&self, layer: u32) -> Result<LayerTensors> {
+        fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
             std::thread::sleep(std::time::Duration::from_millis(1));
-            Ok(self.0[layer as usize].clone())
+            Ok(Arc::new(self.0[layer as usize].clone()))
         }
     }
 
