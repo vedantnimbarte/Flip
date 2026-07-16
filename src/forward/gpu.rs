@@ -18,6 +18,7 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
+use std::ffi::c_void;
 use crate::forward::kernel::ComputeKernel;
 use crate::gpu::device::DeviceBuffer;
 
@@ -40,13 +41,14 @@ extern "C" {
         head_dim: i32,
         inter: i32,
         rms_eps: f32,
-        q_proj: *const f32,
-        k_proj: *const f32,
-        v_proj: *const f32,
-        o_proj: *const f32,
-        gate_proj: *const f32,
-        up_proj: *const f32,
-        down_proj: *const f32,
+        w_dtype: i32,
+        q_proj: *const c_void,
+        k_proj: *const c_void,
+        v_proj: *const c_void,
+        o_proj: *const c_void,
+        gate_proj: *const c_void,
+        up_proj: *const c_void,
+        down_proj: *const c_void,
         in_norm: *const f32,
         post_norm: *const f32,
         q_bias: *const f32,
@@ -94,18 +96,20 @@ struct GpuLayer {
     v_bias: Option<DeviceBuffer>,
     kv_keys: DeviceBuffer,
     kv_values: DeviceBuffer,
+    /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
+    w_dtype: i32,
 }
 
 impl GpuLayer {
     fn upload(t: &LayerTensors, kv_buffer_len: usize) -> Result<Self> {
         Ok(Self {
-            q_proj: DeviceBuffer::from_slice(&t.q_proj)?,
-            k_proj: DeviceBuffer::from_slice(&t.k_proj)?,
-            v_proj: DeviceBuffer::from_slice(&t.v_proj)?,
-            o_proj: DeviceBuffer::from_slice(&t.o_proj)?,
-            gate_proj: DeviceBuffer::from_slice(&t.gate_proj)?,
-            up_proj: DeviceBuffer::from_slice(&t.up_proj)?,
-            down_proj: DeviceBuffer::from_slice(&t.down_proj)?,
+            q_proj: DeviceBuffer::from_bytes(t.q_proj.as_bytes(), t.q_proj.len())?,
+            k_proj: DeviceBuffer::from_bytes(t.k_proj.as_bytes(), t.k_proj.len())?,
+            v_proj: DeviceBuffer::from_bytes(t.v_proj.as_bytes(), t.v_proj.len())?,
+            o_proj: DeviceBuffer::from_bytes(t.o_proj.as_bytes(), t.o_proj.len())?,
+            gate_proj: DeviceBuffer::from_bytes(t.gate_proj.as_bytes(), t.gate_proj.len())?,
+            up_proj: DeviceBuffer::from_bytes(t.up_proj.as_bytes(), t.up_proj.len())?,
+            down_proj: DeviceBuffer::from_bytes(t.down_proj.as_bytes(), t.down_proj.len())?,
             input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
             post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
             q_bias: upload_bias(t.q_bias.as_ref())?,
@@ -113,6 +117,7 @@ impl GpuLayer {
             v_bias: upload_bias(t.v_bias.as_ref())?,
             kv_keys: DeviceBuffer::new(kv_buffer_len)?,
             kv_values: DeviceBuffer::new(kv_buffer_len)?,
+            w_dtype: t.q_proj.dtype_code(),
         })
     }
 }
@@ -222,13 +227,14 @@ impl ComputeKernel for GpuKernel {
                 self.cfg.head_dim as i32,
                 self.cfg.intermediate_size as i32,
                 self.cfg.rms_eps,
-                w.q_proj.as_ptr(),
-                w.k_proj.as_ptr(),
-                w.v_proj.as_ptr(),
-                w.o_proj.as_ptr(),
-                w.gate_proj.as_ptr(),
-                w.up_proj.as_ptr(),
-                w.down_proj.as_ptr(),
+                w.w_dtype,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.gate_proj.as_ptr() as *const c_void,
+                w.up_proj.as_ptr() as *const c_void,
+                w.down_proj.as_ptr() as *const c_void,
                 w.input_layernorm.as_ptr(),
                 w.post_attention_layernorm.as_ptr(),
                 bias_ptr(&w.q_bias),

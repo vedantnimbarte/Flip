@@ -31,6 +31,27 @@ impl DeviceBuffer {
         Ok(buf)
     }
 
+    /// Allocate and upload raw bytes **verbatim** — weights in their native
+    /// checkpoint dtype (bf16/f16 bit patterns), which the kernel converts to f32
+    /// in-register. Halves VRAM and PCIe traffic versus upsizing to f32 first.
+    ///
+    /// `len` is the logical *element* count (not the byte count), so `len()` keeps
+    /// meaning the same thing it does for an f32 buffer.
+    pub fn from_bytes(bytes: &[u8], len: usize) -> Result<Self> {
+        let buf = Self::new_bytes(bytes.len(), len)?;
+        if !bytes.is_empty() {
+            ffi_cuda::copy_h2d(buf.ptr, bytes.as_ptr() as *const c_void, bytes.len())?;
+        }
+        Ok(buf)
+    }
+
+    /// Allocate `bytes` of device memory holding `len` logical elements
+    /// (uninitialized). For weights whose byte length is not `len * 4`.
+    pub fn new_bytes(bytes: usize, len: usize) -> Result<Self> {
+        let ptr = ffi_cuda::device_malloc(bytes.max(1))?;
+        Ok(Self { ptr, len })
+    }
+
     /// Element count.
     pub fn len(&self) -> usize {
         self.len
@@ -135,6 +156,18 @@ impl DeviceBuffer {
             self.len * std::mem::size_of::<f32>(),
             stream.raw(),
         )
+    }
+
+    /// Enqueue an async host→device copy of exactly `bytes` from page-locked
+    /// `src`. Used for weights in their native dtype, whose byte length is not
+    /// `len * 4`.
+    pub fn upload_async_bytes(
+        &self,
+        src: *const c_void,
+        bytes: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ffi_cuda::copy_h2d_async(self.ptr, src, bytes, stream.raw())
     }
 }
 

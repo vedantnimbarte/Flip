@@ -51,21 +51,31 @@ struct GpuWeights {
     q_bias: Option<DeviceBuffer>,
     k_bias: Option<DeviceBuffer>,
     v_bias: Option<DeviceBuffer>,
+    /// Native dtype of the projection weights (see `Weights::dtype_code`).
+    w_dtype: i32,
 }
 
 impl GpuWeights {
-    /// The layer's nine weight tensors, in a fixed order (for staging/upload).
-    fn tensors(t: &LayerTensors) -> [&[f32]; 9] {
+    /// The layer's nine weight tensors as `(native bytes, element count)`, in a
+    /// fixed order (for staging/upload). The seven projections keep their native
+    /// checkpoint dtype — they are staged and uploaded verbatim, so a bf16 layer
+    /// puts half as many bytes across PCIe as an upsized f32 copy would. The two
+    /// norms are f32 (a few KB; not worth a dtype path).
+    fn tensors(t: &LayerTensors) -> [(&[u8], usize); 9] {
+        use crate::forward::cpu::bytemuck_cast;
         [
-            &t.q_proj,
-            &t.k_proj,
-            &t.v_proj,
-            &t.o_proj,
-            &t.gate_proj,
-            &t.up_proj,
-            &t.down_proj,
-            &t.input_layernorm,
-            &t.post_attention_layernorm,
+            (t.q_proj.as_bytes(), t.q_proj.len()),
+            (t.k_proj.as_bytes(), t.k_proj.len()),
+            (t.v_proj.as_bytes(), t.v_proj.len()),
+            (t.o_proj.as_bytes(), t.o_proj.len()),
+            (t.gate_proj.as_bytes(), t.gate_proj.len()),
+            (t.up_proj.as_bytes(), t.up_proj.len()),
+            (t.down_proj.as_bytes(), t.down_proj.len()),
+            (bytemuck_cast(&t.input_layernorm), t.input_layernorm.len()),
+            (
+                bytemuck_cast(&t.post_attention_layernorm),
+                t.post_attention_layernorm.len(),
+            ),
         ]
     }
 
@@ -89,25 +99,25 @@ impl GpuWeights {
     fn upload_async(t: &LayerTensors, stream: &Stream, staging: &mut PinnedBuffer) -> Result<Self> {
         let tensors = Self::tensors(t);
         // Phase 1: stage all tensors into pinned memory, recording layout.
-        let mut layout: Vec<(usize, usize)> = Vec::with_capacity(9); // (byte offset, f32 len)
+        // (byte offset, byte length, element count)
+        let mut layout: Vec<(usize, usize, usize)> = Vec::with_capacity(9);
         {
             let dst = staging.as_mut_slice();
             let mut byte_off = 0usize;
-            for s in tensors {
-                let bytes = std::mem::size_of_val(s);
-                let src = unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, bytes) };
+            for (src, len) in tensors {
+                let bytes = src.len();
                 dst[byte_off..byte_off + bytes].copy_from_slice(src);
-                layout.push((byte_off, s.len()));
+                layout.push((byte_off, bytes, len));
                 byte_off += bytes;
             }
         }
         // Phase 2: allocate device buffers and enqueue async copies from staging.
         let base = staging.as_ptr();
         let mut bufs: Vec<DeviceBuffer> = Vec::with_capacity(9);
-        for &(off, len) in &layout {
-            let buf = DeviceBuffer::new(len.max(1))?;
-            let pinned = unsafe { base.add(off) } as *const f32;
-            buf.upload_async(pinned, stream)?;
+        for &(off, bytes, len) in &layout {
+            let buf = DeviceBuffer::new_bytes(bytes, len.max(1))?;
+            let pinned = unsafe { base.add(off) } as *const std::ffi::c_void;
+            buf.upload_async_bytes(pinned, bytes, stream)?;
             bufs.push(buf);
         }
         // Wait for the copies (staging becomes reusable; weights are ready).
@@ -126,6 +136,7 @@ impl GpuWeights {
             q_bias: upload_bias(t.q_bias.as_ref())?,
             k_bias: upload_bias(t.k_bias.as_ref())?,
             v_bias: upload_bias(t.v_bias.as_ref())?,
+            w_dtype: t.q_proj.dtype_code(),
         })
     }
 }
@@ -403,13 +414,14 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 cfg.head_dim as i32,
                 cfg.intermediate_size as i32,
                 cfg.rms_eps,
-                w.q_proj.as_ptr(),
-                w.k_proj.as_ptr(),
-                w.v_proj.as_ptr(),
-                w.o_proj.as_ptr(),
-                w.gate_proj.as_ptr(),
-                w.up_proj.as_ptr(),
-                w.down_proj.as_ptr(),
+                w.w_dtype,
+                w.q_proj.as_ptr() as *const std::ffi::c_void,
+                w.k_proj.as_ptr() as *const std::ffi::c_void,
+                w.v_proj.as_ptr() as *const std::ffi::c_void,
+                w.o_proj.as_ptr() as *const std::ffi::c_void,
+                w.gate_proj.as_ptr() as *const std::ffi::c_void,
+                w.up_proj.as_ptr() as *const std::ffi::c_void,
+                w.down_proj.as_ptr() as *const std::ffi::c_void,
                 w.input_layernorm.as_ptr(),
                 w.post_attention_layernorm.as_ptr(),
                 bias_ptr(&w.q_bias),

@@ -7,6 +7,7 @@
 //!   engine. The inference/serving loop itself is Phase 3; this validates the
 //!   config and runs the planning pipeline so the setup is verifiable today.
 
+use dlm::forward::Weights;
 use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
@@ -159,13 +160,13 @@ fn gpu_parity_probe() -> Result<f32> {
     let mut rng = Rng::new(3);
     let s = 0.05;
     let layer = LayerTensors {
-        q_proj: rng.vec(cfg.q_dim() * cfg.hidden_size, s),
-        k_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, s),
-        v_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, s),
-        o_proj: rng.vec(cfg.hidden_size * cfg.q_dim(), s),
-        gate_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
-        up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
-        down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, s),
+        q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * cfg.hidden_size, s)),
+        k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
+        v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
+        o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), s)),
+        gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+        up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+        down_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
         input_layernorm: vec![1.0; cfg.hidden_size],
         post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
     };
@@ -437,13 +438,13 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
     let mut rng = Rng::new(args.seed);
     let layers: Vec<LayerTensors> = (0..args.num_layers)
         .map(|_| LayerTensors {
-            q_proj: rng.vec(cfg.q_dim() * cfg.hidden_size, scale),
-            k_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, scale),
-            v_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, scale),
-            o_proj: rng.vec(cfg.hidden_size * cfg.q_dim(), scale),
-            gate_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, scale),
-            up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, scale),
-            down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, scale),
+            q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * cfg.hidden_size, scale)),
+            k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, scale)),
+            v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, scale)),
+            o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), scale)),
+            gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
+            up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
+            down_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, scale)),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
         })

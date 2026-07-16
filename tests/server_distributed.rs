@@ -3,6 +3,7 @@
 //! the test exercises the HTTP layer + coordinator without real workers — the
 //! networked pipeline itself is covered by tests/distributed.rs.
 
+use dlm::forward::Weights;
 use dlm::distributed::{partition_layers, Coordinator, ShardRoute};
 use dlm::forward::{BlockConfig, LayerTensors};
 use dlm::server::engine::ChatTemplate;
@@ -45,13 +46,13 @@ fn coordinator() -> Coordinator {
     let mut r = Rng::new(9);
     let layers: Vec<LayerTensors> = (0..num_layers)
         .map(|_| LayerTensors {
-            q_proj: r.vec(cfg.q_dim() * hidden),
-            k_proj: r.vec(cfg.kv_dim() * hidden),
-            v_proj: r.vec(cfg.kv_dim() * hidden),
-            o_proj: r.vec(hidden * cfg.q_dim()),
-            gate_proj: r.vec(cfg.intermediate_size * hidden),
-            up_proj: r.vec(cfg.intermediate_size * hidden),
-            down_proj: r.vec(hidden * cfg.intermediate_size),
+            q_proj: Weights::from_f32(r.vec(cfg.q_dim() * hidden)),
+            k_proj: Weights::from_f32(r.vec(cfg.kv_dim() * hidden)),
+            v_proj: Weights::from_f32(r.vec(cfg.kv_dim() * hidden)),
+            o_proj: Weights::from_f32(r.vec(hidden * cfg.q_dim())),
+            gate_proj: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)),
+            up_proj: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)),
+            down_proj: Weights::from_f32(r.vec(hidden * cfg.intermediate_size)),
             input_layernorm: vec![1.0; hidden],
             post_attention_layernorm: vec![1.0; hidden], ..Default::default()
         })

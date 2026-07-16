@@ -1,19 +1,22 @@
 // CUDA reference kernels for one transformer decode block.
 //
 // This mirrors the CPU oracle in `src/forward/cpu.rs` op-for-op so the two can
-// be cross-validated on hardware. The kernels are deliberately naive (one
-// thread per output element, no tiling, no fusion, no cuBLAS) — correctness and
-// readability over speed. A production version would fuse these and use cuBLAS /
-// tensor cores.
+// be cross-validated on hardware. The kernels are simple (no tiling, no fusion,
+// no cuBLAS) — correctness and readability over speed — with one exception: the
+// GEMV is coalesced (one block per output row, shared-memory reduction), because
+// it is the decode stack's dominant cost. Weights are consumed in their native
+// checkpoint dtype and decoded to f32 in-register. A production version would
+// fuse the elementwise ops and use cuBLAS / tensor cores.
 //
 // Entry point: `dlm_decode_block`, called from Rust (see src/forward/gpu.rs)
 // via FFI. All pointers are device pointers. Returns a cudaError_t (0 == ok).
 //
 // NOTE: this file requires nvcc to compile and a GPU to run; it is compiled only
-// under the `cuda-kernels` Cargo feature and has not been executed in the
-// environment it was authored in. Treat as reference until validated on device.
+// under the `cuda-kernels` Cargo feature. Validated on device against the CPU
+// oracle by tests/gpu_parity.rs.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <math.h>
 
 // Threads per block for the reduction kernels. Must be <= 1024 (the CUDA
@@ -50,6 +53,35 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* out, int n
 // Threads per block for the GEMV reduction; power of two for the tree reduction.
 #define MATVEC_THREADS 256
 
+// Weight dtype tags — must match `Weights::dtype_code()` in src/forward/cpu.rs.
+// Weights are uploaded in their NATIVE checkpoint dtype and decoded to f32 in the
+// register that consumes them. Upsizing to f32 host-side is lossless (an f32
+// exactly represents every bf16/f16 value) so it buys no precision, while doubling
+// VRAM, PCIe traffic per streamed layer, and the bandwidth of this memory-bound
+// GEMV. Accumulation stays f32 regardless — no hardware accumulates in 16-bit.
+#define DLM_W_F32  0
+#define DLM_W_BF16 1
+#define DLM_W_F16  2
+
+// Decode weight element `i`. Specialized at compile time, so the inner loop has
+// no branch. bf16 is literally the high half of an f32 — a 16-bit shift, which
+// needs no hardware bf16 support (works on Turing and older).
+template <int DT>
+__device__ __forceinline__ float load_w(const void* W, long i);
+
+template <>
+__device__ __forceinline__ float load_w<DLM_W_F32>(const void* W, long i) {
+    return ((const float*)W)[i];
+}
+template <>
+__device__ __forceinline__ float load_w<DLM_W_BF16>(const void* W, long i) {
+    return __int_as_float(((unsigned int)((const unsigned short*)W)[i]) << 16);
+}
+template <>
+__device__ __forceinline__ float load_w<DLM_W_F16>(const void* W, long i) {
+    return __half2float(((const __half*)W)[i]);
+}
+
 // out[o] = dot(W[o], x) (+ bias[o]). `bias` may be NULL (Llama/Mistral have no
 // attention bias; Qwen2 does — dropping it silently corrupts attention).
 //
@@ -63,14 +95,15 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* out, int n
 // load pulled a full cache line to use one float — ~1/32 of memory bandwidth on a
 // bandwidth-bound GEMV. This is the dominant cost of the decode stack; coalescing
 // it is the single biggest kernel speedup.
-__global__ void matvec_kernel(const float* W, const float* x, const float* bias, float* out,
+template <int DT>
+__global__ void matvec_kernel(const void* W, const float* x, const float* bias, float* out,
                               int out_dim, int in_dim) {
     int o = blockIdx.x;
     if (o >= out_dim) return;
-    const float* row = W + (long)o * in_dim;
+    long base = (long)o * in_dim;
     __shared__ float partial[MATVEC_THREADS];
     float s = 0.0f;
-    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) s += row[i] * x[i];
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) s += load_w<DT>(W, base + i) * x[i];
     partial[threadIdx.x] = s;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -78,6 +111,22 @@ __global__ void matvec_kernel(const float* W, const float* x, const float* bias,
         __syncthreads();
     }
     if (threadIdx.x == 0) out[o] = partial[0] + (bias ? bias[o] : 0.0f);
+}
+
+// Dispatch the GEMV on the runtime weight dtype (one block per output row).
+static void launch_matvec(int dt, const void* W, const float* x, const float* bias, float* out,
+                          int out_dim, int in_dim) {
+    switch (dt) {
+        case DLM_W_BF16:
+            matvec_kernel<DLM_W_BF16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim);
+            break;
+        case DLM_W_F16:
+            matvec_kernel<DLM_W_F16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim);
+            break;
+        default:
+            matvec_kernel<DLM_W_F32><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim);
+            break;
+    }
 }
 
 // In-place rotary embedding over [num_heads * head_dim]. One thread per rotated pair.
@@ -200,8 +249,9 @@ static cudaError_t scratch_ensure(int i, int n) {
 extern "C" int dlm_decode_block(
     int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
     int inter, float rms_eps,
-    const float* q_proj, const float* k_proj, const float* v_proj, const float* o_proj,
-    const float* gate_proj, const float* up_proj, const float* down_proj,
+    int w_dtype,                           // DLM_W_* tag for the projection weights
+    const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
+    const void* gate_proj, const void* up_proj, const void* down_proj,
     const float* in_norm, const float* post_norm,
     const float* q_bias, const float* k_bias, const float* v_bias,  // may be NULL
     const float* inv_freq,                 // [head_dim/2], precomputed host-side
@@ -237,9 +287,9 @@ extern "C" int dlm_decode_block(
     if (e == cudaSuccess) {
         // Attention sublayer.
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
-        matvec_kernel<<<q_dim, MATVEC_THREADS>>>(q_proj, normed, q_bias, q, q_dim, hidden_size);
-        matvec_kernel<<<kv_dim, MATVEC_THREADS>>>(k_proj, normed, k_bias, k, kv_dim, hidden_size);
-        matvec_kernel<<<kv_dim, MATVEC_THREADS>>>(v_proj, normed, v_bias, v, kv_dim, hidden_size);
+        launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size);
+        launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size);
+        launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size);
         rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
 
@@ -249,15 +299,15 @@ extern "C" int dlm_decode_block(
 
         // Attend over history + this token, reading the persistent buffers directly.
         attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos);
-        matvec_kernel<<<hidden_size, MATVEC_THREADS>>>(o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim);
+        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
         // MLP sublayer (SwiGLU).
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);
-        matvec_kernel<<<inter, MATVEC_THREADS>>>(gate_proj, normed2, (const float*)0, gate, inter, hidden_size);
-        matvec_kernel<<<inter, MATVEC_THREADS>>>(up_proj, normed2, (const float*)0, up, inter, hidden_size);
+        launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size);
+        launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size);
         swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter);
-        matvec_kernel<<<hidden_size, MATVEC_THREADS>>>(down_proj, inter_buf, (const float*)0, down, hidden_size, inter);
+        launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
         // No blocking cudaDeviceSynchronize here: all kernels run on the in-order

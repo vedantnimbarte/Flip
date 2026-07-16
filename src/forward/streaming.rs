@@ -358,6 +358,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::Weights;
     use crate::forward::CpuKernel;
 
     /// In-memory layer source for tests.
@@ -390,13 +391,13 @@ mod tests {
             .map(|i| {
                 let s = 0.01 * (i as f32 + 1.0);
                 LayerTensors {
-                    q_proj: vec![s; c.q_dim() * c.hidden_size],
-                    k_proj: vec![s; c.kv_dim() * c.hidden_size],
-                    v_proj: vec![s; c.kv_dim() * c.hidden_size],
-                    o_proj: vec![s; c.hidden_size * c.q_dim()],
-                    gate_proj: vec![s; c.intermediate_size * c.hidden_size],
-                    up_proj: vec![s; c.intermediate_size * c.hidden_size],
-                    down_proj: vec![s; c.hidden_size * c.intermediate_size],
+                    q_proj: Weights::from_f32(vec![s; c.q_dim() * c.hidden_size]),
+                    k_proj: Weights::from_f32(vec![s; c.kv_dim() * c.hidden_size]),
+                    v_proj: Weights::from_f32(vec![s; c.kv_dim() * c.hidden_size]),
+                    o_proj: Weights::from_f32(vec![s; c.hidden_size * c.q_dim()]),
+                    gate_proj: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
+                    up_proj: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
+                    down_proj: Weights::from_f32(vec![s; c.hidden_size * c.intermediate_size]),
                     input_layernorm: vec![1.0; c.hidden_size],
                     post_attention_layernorm: vec![1.0; c.hidden_size], ..Default::default()
                 }

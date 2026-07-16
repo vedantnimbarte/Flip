@@ -84,7 +84,7 @@ struct RawTensor {
 }
 
 /// Convert a half-precision (IEEE 754 binary16) bit pattern to `f32`.
-fn f16_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = (h >> 15) & 1;
     let exp = (h >> 10) & 0x1f;
     let mant = h & 0x3ff;

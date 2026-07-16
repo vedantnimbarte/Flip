@@ -9,6 +9,7 @@
 //! `exp`/`rsqrt`/`pow`).
 #![cfg(feature = "cuda-kernels")]
 
+use dlm::forward::Weights;
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::forward::{
     BlockConfig, ComputeKernel, CpuKernel, ForwardOrchestrator, GpuKernel, KvLayerCache,
@@ -55,13 +56,13 @@ fn random_layers(cfg: &BlockConfig, num_layers: u32, seed: u64) -> Vec<LayerTens
     let s = 0.05;
     (0..num_layers)
         .map(|_| LayerTensors {
-            q_proj: rng.vec(cfg.q_dim() * cfg.hidden_size, s),
-            k_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, s),
-            v_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, s),
-            o_proj: rng.vec(cfg.hidden_size * cfg.q_dim(), s),
-            gate_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
-            up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
-            down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, s),
+            q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * cfg.hidden_size, s)),
+            k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
+            v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
+            o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), s)),
+            gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+            up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+            down_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
         })

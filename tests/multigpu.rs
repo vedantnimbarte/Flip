@@ -4,6 +4,7 @@
 //! the real partitioning + per-layer dispatch on the CPU kernel — the same way
 //! `distributed.rs` validates the cross-node path over localhost.
 
+use dlm::forward::Weights;
 use dlm::cache::KvCacheConfig;
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 use dlm::loader::ModelParts;
@@ -45,13 +46,13 @@ fn build_parts() -> ModelParts {
     let s = 0.05;
     let layers = (0..num_layers)
         .map(|_| LayerTensors {
-            q_proj: rng.vec(cfg.q_dim() * hidden, s),
-            k_proj: rng.vec(cfg.kv_dim() * hidden, s),
-            v_proj: rng.vec(cfg.kv_dim() * hidden, s),
-            o_proj: rng.vec(hidden * cfg.q_dim(), s),
-            gate_proj: rng.vec(cfg.intermediate_size * hidden, s),
-            up_proj: rng.vec(cfg.intermediate_size * hidden, s),
-            down_proj: rng.vec(hidden * cfg.intermediate_size, s),
+            q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * hidden, s)),
+            k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
+            v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
+            o_proj: Weights::from_f32(rng.vec(hidden * cfg.q_dim(), s)),
+            gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+            up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+            down_proj: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)),
             input_layernorm: vec![1.0; hidden],
             post_attention_layernorm: vec![1.0; hidden], ..Default::default()
         })

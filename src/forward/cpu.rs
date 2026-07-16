@@ -80,6 +80,100 @@ impl BlockConfig {
     }
 }
 
+/// A weight matrix in its **native checkpoint dtype**.
+///
+/// Weights are kept exactly as the checkpoint ships them and converted to f32
+/// only in the register that consumes them — never materialized as an upsized
+/// f32 copy. Upsizing is *lossless* (an f32 exactly represents every f16/bf16
+/// value), so it buys no precision at all, while doubling VRAM, the PCIe traffic
+/// per streamed layer, and the bandwidth of the memory-bound GEMV that dominates
+/// decode.
+///
+/// Variants carry the native bit patterns (bf16/f16 as raw `u16`) rather than a
+/// byte blob so the F32 path keeps a real `&[f32]` slice for the CPU oracle's
+/// autovectorized dot product.
+#[derive(Debug, Clone)]
+pub enum Weights {
+    F32(Vec<f32>),
+    /// bf16 bit patterns: the high 16 bits of the equivalent f32.
+    Bf16(Vec<u16>),
+    /// IEEE half bit patterns.
+    F16(Vec<u16>),
+}
+
+impl Default for Weights {
+    fn default() -> Self {
+        Weights::F32(Vec::new())
+    }
+}
+
+/// bf16 → f32 is exactly a 16-bit shift: bf16 *is* the top half of an f32.
+#[inline(always)]
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+impl Weights {
+    /// Element count.
+    pub fn len(&self) -> usize {
+        match self {
+            Weights::F32(v) => v.len(),
+            Weights::Bf16(v) | Weights::F16(v) => v.len(),
+        }
+    }
+
+    /// True if there are no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Build from f32 values (synthetic models, and genuinely-F32 checkpoints).
+    pub fn from_f32(v: Vec<f32>) -> Self {
+        Weights::F32(v)
+    }
+
+    /// An all-zero F32 matrix of `len` elements.
+    pub fn zeros(len: usize) -> Self {
+        Weights::F32(vec![0.0; len])
+    }
+
+    /// Element `i` as f32.
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> f32 {
+        match self {
+            Weights::F32(v) => v[i],
+            Weights::Bf16(v) => bf16_to_f32(v[i]),
+            Weights::F16(v) => crate::storage::f16_to_f32(v[i]),
+        }
+    }
+
+    /// The raw native bytes, for a verbatim upload to the device.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Weights::F32(v) => bytemuck_cast(v),
+            Weights::Bf16(v) | Weights::F16(v) => bytemuck_cast(v),
+        }
+    }
+
+    /// Dtype tag handed to the CUDA kernel so it can decode elements in-register.
+    /// Must match the `DLM_W_*` constants in `src/gpu/kernels.cu`.
+    pub fn dtype_code(&self) -> i32 {
+        match self {
+            Weights::F32(_) => 0,
+            Weights::Bf16(_) => 1,
+            Weights::F16(_) => 2,
+        }
+    }
+}
+
+/// Reinterpret a POD slice as bytes. Safe: `T` is a plain numeric type with no
+/// padding or invalid bit patterns, and the result borrows the same lifetime.
+pub(crate) fn bytemuck_cast<T>(v: &[T]) -> &[u8] {
+    // SAFETY: T is f32/u16 (POD, no niches); the byte view has the same lifetime
+    // and a length scaled by size_of::<T>().
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
 /// Dense weight matrices for one block (row-major `[out, in]`).
 ///
 /// The Q/K/V biases are `Option` because the Llama/Mistral families have none,
@@ -88,13 +182,13 @@ impl BlockConfig {
 /// loader reads them whenever they are present.
 #[derive(Debug, Clone, Default)]
 pub struct LayerTensors {
-    pub q_proj: Vec<f32>,   // [q_dim, hidden]
-    pub k_proj: Vec<f32>,   // [kv_dim, hidden]
-    pub v_proj: Vec<f32>,   // [kv_dim, hidden]
-    pub o_proj: Vec<f32>,   // [hidden, q_dim]
-    pub gate_proj: Vec<f32>, // [intermediate, hidden]
-    pub up_proj: Vec<f32>,   // [intermediate, hidden]
-    pub down_proj: Vec<f32>, // [hidden, intermediate]
+    pub q_proj: Weights,   // [q_dim, hidden]
+    pub k_proj: Weights,   // [kv_dim, hidden]
+    pub v_proj: Weights,   // [kv_dim, hidden]
+    pub o_proj: Weights,   // [hidden, q_dim]
+    pub gate_proj: Weights, // [intermediate, hidden]
+    pub up_proj: Weights,   // [intermediate, hidden]
+    pub down_proj: Weights, // [hidden, intermediate]
     pub input_layernorm: Vec<f32>,          // [hidden]
     pub post_attention_layernorm: Vec<f32>, // [hidden]
     /// Attention projection biases (Qwen2 et al.); `None` for Llama/Mistral.
@@ -146,13 +240,13 @@ impl LayerTensors {
     /// identity on the residual stream (useful as a test baseline).
     pub fn zeros(cfg: &BlockConfig) -> Self {
         Self {
-            q_proj: vec![0.0; cfg.q_dim() * cfg.hidden_size],
-            k_proj: vec![0.0; cfg.kv_dim() * cfg.hidden_size],
-            v_proj: vec![0.0; cfg.kv_dim() * cfg.hidden_size],
-            o_proj: vec![0.0; cfg.hidden_size * cfg.q_dim()],
-            gate_proj: vec![0.0; cfg.intermediate_size * cfg.hidden_size],
-            up_proj: vec![0.0; cfg.intermediate_size * cfg.hidden_size],
-            down_proj: vec![0.0; cfg.hidden_size * cfg.intermediate_size],
+            q_proj: Weights::zeros(cfg.q_dim() * cfg.hidden_size),
+            k_proj: Weights::zeros(cfg.kv_dim() * cfg.hidden_size),
+            v_proj: Weights::zeros(cfg.kv_dim() * cfg.hidden_size),
+            o_proj: Weights::zeros(cfg.hidden_size * cfg.q_dim()),
+            gate_proj: Weights::zeros(cfg.intermediate_size * cfg.hidden_size),
+            up_proj: Weights::zeros(cfg.intermediate_size * cfg.hidden_size),
+            down_proj: Weights::zeros(cfg.hidden_size * cfg.intermediate_size),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size],
             ..Default::default()
@@ -395,30 +489,64 @@ impl KvLayerCache {
 /// Matrix-vector product for a row-major `[out_dim, in_dim]` matrix.
 pub(crate) fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_dim * in_dim);
+    matvec_rows(out_dim, in_dim, x, |o, x| {
+        let row = &w[o * in_dim..(o + 1) * in_dim];
+        row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum()
+    })
+}
+
+/// `matvec` over weights in their native dtype. Dispatches on the dtype **once**
+/// so each row's inner loop is monomorphic — the F32 arm keeps the plain
+/// `&[f32]` dot product (and its autovectorization) unchanged.
+pub(crate) fn matvec_native(w: &Weights, x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    debug_assert_eq!(w.len(), out_dim * in_dim);
+    match w {
+        Weights::F32(v) => matvec(v, x, out_dim, in_dim),
+        Weights::Bf16(v) => matvec_rows(out_dim, in_dim, x, |o, x| {
+            let row = &v[o * in_dim..(o + 1) * in_dim];
+            row.iter().zip(x).map(|(&b, &xj)| bf16_to_f32(b) * xj).sum()
+        }),
+        Weights::F16(v) => matvec_rows(out_dim, in_dim, x, |o, x| {
+            let row = &v[o * in_dim..(o + 1) * in_dim];
+            row.iter()
+                .zip(x)
+                .map(|(&h, &xj)| crate::storage::f16_to_f32(h) * xj)
+                .sum()
+        }),
+    }
+}
+
+/// Shared driver: compute `out_dim` independent row dot products via `row_dot`,
+/// in parallel for large GEMVs.
+///
+/// The LM head is [vocab≈128k, hidden] — ~1 GB streamed per token — and
+/// single-threaded it dominates decode latency (the GPU path still computes
+/// logits on the CPU). Output rows are independent, so split them across cores.
+/// ponytail: parallelize only large GEMVs; small per-layer projections aren't
+/// worth the thread hop. Threshold in MACs, not a tuned constant.
+fn matvec_rows<F>(out_dim: usize, in_dim: usize, x: &[f32], row_dot: F) -> Vec<f32>
+where
+    F: Fn(usize, &[f32]) -> f32 + Sync,
+{
     debug_assert_eq!(x.len(), in_dim);
     let mut y = vec![0.0f32; out_dim];
-    let dot = |row: &[f32]| -> f32 { row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum() };
-
-    // The LM head is [vocab≈128k, hidden] — ~1 GB streamed per token — and
-    // single-threaded it dominates decode latency (the GPU path still computes
-    // logits on the CPU). Output rows are independent, so split them across cores.
-    // ponytail: parallelize only large GEMVs; small per-layer projections aren't
-    // worth the thread hop. Threshold in MACs, not a tuned constant.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     if threads > 1 && out_dim.saturating_mul(in_dim) >= (1 << 20) {
         let rows_per = out_dim.div_ceil(threads);
+        let row_dot = &row_dot;
         std::thread::scope(|s| {
-            for (wrows, yrows) in w.chunks(rows_per * in_dim).zip(y.chunks_mut(rows_per)) {
+            for (chunk, yrows) in y.chunks_mut(rows_per).enumerate() {
+                let base = chunk * rows_per;
                 s.spawn(move || {
-                    for (o, slot) in yrows.iter_mut().enumerate() {
-                        *slot = dot(&wrows[o * in_dim..(o + 1) * in_dim]);
+                    for (i, slot) in yrows.iter_mut().enumerate() {
+                        *slot = row_dot(base + i, x);
                     }
                 });
             }
         });
     } else {
         for (o, slot) in y.iter_mut().enumerate() {
-            *slot = dot(&w[o * in_dim..(o + 1) * in_dim]);
+            *slot = row_dot(o, x);
         }
     }
     y
@@ -578,9 +706,9 @@ pub fn decode_block(
 
     // ── attention sublayer ──
     let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
-    let mut q = matvec(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
-    let mut k = matvec(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
-    let mut v = matvec(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
+    let mut q = matvec_native(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
+    let mut k = matvec_native(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
+    let mut v = matvec_native(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
 
     add_bias(&mut q, w.q_bias.as_ref());
     add_bias(&mut k, w.k_bias.as_ref());
@@ -592,7 +720,7 @@ pub fn decode_block(
 
     kv.append(&k, &v)?;
     let ctx = attention(cfg, &q, kv);
-    let attn_out = matvec(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
+    let attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
 
     let mut h1: Vec<f32> = hidden
         .iter()
@@ -602,10 +730,10 @@ pub fn decode_block(
 
     // ── MLP sublayer (SwiGLU) ──
     let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
-    let gate = matvec(&w.gate_proj, &normed2, cfg.intermediate_size, cfg.hidden_size);
-    let up = matvec(&w.up_proj, &normed2, cfg.intermediate_size, cfg.hidden_size);
+    let gate = matvec_native(&w.gate_proj, &normed2, cfg.intermediate_size, cfg.hidden_size);
+    let up = matvec_native(&w.up_proj, &normed2, cfg.intermediate_size, cfg.hidden_size);
     let inter: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
-    let down = matvec(&w.down_proj, &inter, cfg.hidden_size, cfg.intermediate_size);
+    let down = matvec_native(&w.down_proj, &inter, cfg.hidden_size, cfg.intermediate_size);
 
     for (h, d) in h1.iter_mut().zip(&down) {
         *h += *d;
@@ -788,10 +916,11 @@ mod tests {
         // through attention → o_proj, but o_proj is zero, so still identity;
         // give o_proj an identity-ish row so the bias can reach the output.
         let mut w = LayerTensors::zeros(&cfg);
-        w.o_proj = vec![0.0; cfg.hidden_size * cfg.q_dim()];
+        let mut o = vec![0.0f32; cfg.hidden_size * cfg.q_dim()];
         for i in 0..cfg.hidden_size.min(cfg.q_dim()) {
-            w.o_proj[i * cfg.q_dim() + i] = 1.0;
+            o[i * cfg.q_dim() + i] = 1.0;
         }
+        w.o_proj = Weights::from_f32(o);
 
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         let base = decode_block(&cfg, &w, &hidden, &mut kv, 0).unwrap();

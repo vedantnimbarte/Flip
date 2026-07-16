@@ -471,6 +471,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::Weights;
     use crate::forward::{BlockConfig, CpuKernel, LayerTensors};
 
     /// A tiny deterministic model: identity transformer block, one-hot
@@ -614,13 +615,13 @@ mod tests {
             (0..n).map(|_| r.next_f32() * 0.1 - 0.05).collect()
         };
         let layers = vec![LayerTensors {
-            q_proj: vec(cfg.q_dim() * hidden),
-            k_proj: vec(cfg.kv_dim() * hidden),
-            v_proj: vec(cfg.kv_dim() * hidden),
-            o_proj: vec(hidden * cfg.q_dim()),
-            gate_proj: vec(cfg.intermediate_size * hidden),
-            up_proj: vec(cfg.intermediate_size * hidden),
-            down_proj: vec(hidden * cfg.intermediate_size),
+            q_proj: Weights::from_f32(vec(cfg.q_dim() * hidden)),
+            k_proj: Weights::from_f32(vec(cfg.kv_dim() * hidden)),
+            v_proj: Weights::from_f32(vec(cfg.kv_dim() * hidden)),
+            o_proj: Weights::from_f32(vec(hidden * cfg.q_dim())),
+            gate_proj: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
+            up_proj: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
+            down_proj: Weights::from_f32(vec(hidden * cfg.intermediate_size)),
             input_layernorm: std::vec::from_elem(1.0, hidden),
             post_attention_layernorm: std::vec::from_elem(1.0, hidden),
             ..Default::default()

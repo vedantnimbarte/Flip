@@ -1,6 +1,7 @@
 //! Continuous batching must produce, per request, exactly the same tokens as
 //! running that request in isolation — regardless of interleaving or batch size.
 
+use dlm::forward::Weights;
 use dlm::batching::BatchScheduler;
 use dlm::cache::KvCacheConfig;
 use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
@@ -39,13 +40,13 @@ fn build_generator() -> Generator<CpuKernel> {
     let mut rng = Rng::new(7);
     let s = 0.05;
     let layers = vec![LayerTensors {
-        q_proj: rng.vec(cfg.q_dim() * hidden, s),
-        k_proj: rng.vec(cfg.kv_dim() * hidden, s),
-        v_proj: rng.vec(cfg.kv_dim() * hidden, s),
-        o_proj: rng.vec(hidden * cfg.q_dim(), s),
-        gate_proj: rng.vec(cfg.intermediate_size * hidden, s),
-        up_proj: rng.vec(cfg.intermediate_size * hidden, s),
-        down_proj: rng.vec(hidden * cfg.intermediate_size, s),
+        q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * hidden, s)),
+        k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
+        v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
+        o_proj: Weights::from_f32(rng.vec(hidden * cfg.q_dim(), s)),
+        gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+        up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+        down_proj: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)),
         input_layernorm: vec![1.0; hidden],
         post_attention_layernorm: vec![1.0; hidden], ..Default::default()
     }];

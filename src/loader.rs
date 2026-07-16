@@ -1,9 +1,15 @@
 //! Load a runnable CPU model from a memory-mapped safetensors checkpoint.
 //!
 //! Bridges the storage layer to the compute path: it reads the standard
-//! HuggingFace-named tensors out of an [`MmapStore`], converts them to `f32`
-//! ([`bytes_to_f32`] handles F32/F16/BF16), and assembles a
+//! HuggingFace-named tensors out of an [`MmapStore`] and assembles a
 //! [`Generator`] over a [`CpuKernel`] ready to run [`generate`].
+//!
+//! Weight matrices keep their **native checkpoint dtype** (F32/F16/BF16) — see
+//! [`Weights`]. Upsizing them to f32 here would be lossless (an f32 exactly
+//! represents every f16/bf16 value) and therefore buys no precision, while
+//! doubling host RAM, the PCIe traffic per streamed layer, and the bandwidth of
+//! the memory-bound GEMV that dominates decode. The small tensors (norms, biases,
+//! embedding, LM head) are read as f32.
 //!
 //! This is the connector that lets `dlm generate --model-path <dir>` run a real
 //! (small) model on CPU. Quantized checkpoints (AWQ/GPTQ `qweight` triplets)
@@ -17,10 +23,11 @@ use crate::cache::KvCacheConfig;
 use crate::error::{DlmError, Result};
 use crate::forward::{
     BlockConfig, CpuKernel, LayerSource, LayerTensors, PipelineParallelKernel, StreamingKernel,
+    Weights,
 };
 use crate::generate::Generator;
 use crate::model::ModelConfig;
-use crate::storage::{bytes_to_f32, MmapStore};
+use crate::storage::{bytes_to_f32, Dtype, MmapStore};
 
 /// Read a named tensor as `f32`, verifying it has exactly `expected_len` elements.
 fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec<f32>> {
@@ -42,6 +49,52 @@ fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     bytes_to_f32(shard.tensor_bytes(name)?, info.dtype)
 }
 
+/// Reinterpret raw little-endian bytes as 16-bit bit patterns (bf16/f16), with no
+/// numeric conversion.
+fn bytes_to_u16(bytes: &[u8], name: &str) -> Result<Vec<u16>> {
+    if bytes.len() % 2 != 0 {
+        return Err(DlmError::SafetensorsHeader(format!(
+            "tensor {name:?}: 16-bit tensor byte length {} is not a multiple of 2",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+
+/// Read a weight matrix **in its native dtype, without converting it**.
+///
+/// The compute path converts to f32 in the register that consumes each element,
+/// so materializing an upsized f32 copy here would be lossless (f32 exactly
+/// represents every f16/bf16 value) yet cost 2x host RAM, 2x PCIe per streamed
+/// layer, and 2x the bandwidth of the memory-bound GEMV. See [`Weights`].
+fn load_native(store: &MmapStore, name: &str, expected_len: usize) -> Result<Weights> {
+    let (shard, info) = store
+        .locate(name)
+        .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+    let bytes = shard.tensor_bytes(name)?;
+    let w = match info.dtype {
+        Dtype::F32 => Weights::F32(bytes_to_f32(bytes, info.dtype)?),
+        Dtype::BF16 => Weights::Bf16(bytes_to_u16(bytes, name)?),
+        Dtype::F16 => Weights::F16(bytes_to_u16(bytes, name)?),
+        other => {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "tensor {name:?} has dtype {other:?}; dlm's compute path handles \
+                 F32/F16/BF16 weights"
+            )))
+        }
+    };
+    if w.len() != expected_len {
+        return Err(DlmError::InvalidConfig(format!(
+            "tensor {name:?}: expected {expected_len} elements, got {}",
+            w.len()
+        )));
+    }
+    Ok(w)
+}
+
 
 /// Load a linear layer's weight as dense row-major `[out, in]`, transparently
 /// handling both float (`{base}.weight`) and GPTQ-style quantized
@@ -51,11 +104,11 @@ fn load_linear(
     base: &str,
     in_features: usize,
     out_features: usize,
-) -> Result<Vec<f32>> {
+) -> Result<Weights> {
     // Float weight: already row-major [out, in].
     let weight_name = format!("{base}.weight");
     if store.locate(&weight_name).is_some() {
-        return load_tensor(store, &weight_name, out_features * in_features);
+        return load_native(store, &weight_name, out_features * in_features);
     }
 
     // A packed 4-bit checkpoint. `config.json` normally declares this and is
