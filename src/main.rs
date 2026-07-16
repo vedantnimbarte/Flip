@@ -593,7 +593,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         "--stream does not support speculative decoding (--draft-model-path) yet".into(),
                     ));
                 }
-                let window = resident_window(&config, &args, &store);
+                let plan = stream_plan(&config, &args, &store);
+                let window = resident_window(&plan, &args);
+                let ram_cache = resolve_ram_cache_bytes(&args, quant, &plan);
                 println!();
                 let dest = if device == Device::Gpu { "VRAM" } else { "host RAM" };
                 println!(
@@ -608,8 +610,15 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 } else {
                     println!("  prefetch   : off (window too small or --prefetch-depth 0)");
                 }
+                if ram_cache > 0 {
+                    println!(
+                        "  ram cache  : {:.1} MiB of materialized layers held in host RAM{}",
+                        ram_cache as f64 / (1024.0 * 1024.0),
+                        if args.ram_cache_gb.is_some() { "" } else { " (default: weights are quantized at load)" },
+                    );
+                }
                 if device == Device::Gpu {
-                    return serve_streaming_gpu(store, &config, &args, window, &listen);
+                    return serve_streaming_gpu(store, &config, &args, window, ram_cache, &listen);
                 }
                 let generator = dlm::loader::build_streaming_generator(
                     store,
@@ -618,7 +627,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     window,
                     args.prefetch_depth,
                     args.auto_prefetch,
-                    ram_cache_bytes(args.ram_cache_gb),
+                    ram_cache,
                 )?;
                 return start_batched_server(generator, None, &args, &config, &listen);
             }
@@ -713,20 +722,23 @@ fn resolve_device(requested: Device) -> Device {
 /// engine then believes the whole model is resident and never streams at all,
 /// leaving the driver to page VRAM behind its back: silently and very slowly
 /// under Windows WDDM, and an outright OOM where there is no such paging.
-fn resident_window(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> usize {
-    if let Some(n) = args.resident_layers {
-        return n.max(1);
-    }
+fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> VramPlan {
     let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
     let profiler = build_profiler(args.context_length, args.safety_margin_gb);
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
-    let plan = if catalog.is_empty() {
+    if catalog.is_empty() {
         profiler.plan_with_free(config, free_bytes)
     } else {
         profiler.plan_from_catalog(config, &catalog, native, free_bytes)
-    };
-    (plan.layers_to_load as usize).max(1)
+    }
+}
+
+/// The resident-layer window: the explicit `--resident-layers`, else the plan's.
+fn resident_window(plan: &VramPlan, args: &ServeArgs) -> usize {
+    args.resident_layers
+        .unwrap_or(plan.layers_to_load as usize)
+        .max(1)
 }
 
 /// Resolve the weight precision: the explicit `--quant`, else the checkpoint's
@@ -805,6 +817,7 @@ fn serve_streaming_gpu(
     config: &ModelConfig,
     args: &ServeArgs,
     window: usize,
+    ram_cache: usize,
     listen: &str,
 ) -> Result<()> {
     println!("device       : gpu ({}) — VRAM layer streaming [experimental]", gpu::active_vendor().label());
@@ -814,7 +827,7 @@ fn serve_streaming_gpu(
             config,
             args.context_length,
             window,
-            ram_cache_bytes(args.ram_cache_gb),
+            ram_cache,
         )?;
     start_batched_server(generator, None, args, config, listen)
 }
@@ -1143,8 +1156,48 @@ fn report_plan(
 /// Host-RAM budget (bytes) for the streaming layer cache. `None` disables it:
 /// the cache duplicates layer weights in RAM on top of the page cache, so it is
 /// opt-in rather than a surprise allocation on a memory-tight box.
-fn ram_cache_bytes(gb: Option<f64>) -> usize {
-    gb.map_or(0, |g| (g * GIB as f64) as usize)
+/// Cap on the *defaulted* host-RAM layer cache. An explicit `--ram-cache-gb`
+/// overrides it in either direction.
+///
+/// ponytail: a fixed ceiling, because dlm has no dependency that can ask the OS
+/// how much RAM is free. Sized so the default can hold a small quantized model
+/// outright while never silently claiming a big fraction of a modest box; raise
+/// it explicitly if you have the memory.
+const DEFAULT_RAM_CACHE_CAP: u64 = 4 * GIB;
+
+/// Host-RAM budget for the streaming layer cache.
+///
+/// `--ram-cache-gb` wins when given (including `0` to disable). Otherwise the
+/// cache defaults **on only when the weights are being quantized at load and
+/// streamed**, sized to hold the whole quantized layer set (capped).
+///
+/// That combination is the one case where the cache is not an optimization but a
+/// correctness-of-design fix: a streamed layer is re-materialized on every window
+/// miss, so quantizing per-miss redoes the same arithmetic on the same bytes for
+/// the life of the process — measured at 12x slower than caching it (0.025 vs
+/// 0.295 tok/s on a 3B). Quantizing also makes the cache cheap: the set to hold
+/// is 2-4x smaller precisely because it was quantized. Unquantized streaming
+/// stays opt-in, where the cache duplicates full-size weights on top of the OS
+/// page cache and can lose.
+fn resolve_ram_cache_bytes(args: &ServeArgs, quant: QuantScheme, plan: &VramPlan) -> usize {
+    if let Some(gb) = args.ram_cache_gb {
+        return (gb.max(0.0) * GIB as f64) as usize;
+    }
+    let quantizing = matches!(quant, QuantScheme::Int4 | QuantScheme::Int8);
+    if !(quantizing && args.stream) {
+        return 0;
+    }
+    // Headroom matters more than precision here. `per_layer_weight_bytes` is what
+    // a layer costs in *VRAM* — bare codes. The host cache holds the whole
+    // materialized layer: codes plus the per-group scales and zero-points (at
+    // group 128 that alone is +12.5% for int4), plus the f32 norms and biases. A
+    // budget a few percent short does not degrade gracefully — the LRU evicts
+    // every layer before it comes round again and the hit rate collapses to zero,
+    // which is the exact cliff this default exists to prevent. Overshooting only
+    // reserves RAM the cache never fills.
+    let whole_model = plan.per_layer_weight_bytes * plan.num_layers as u64;
+    let with_headroom = whole_model + whole_model / 4; // +25%
+    with_headroom.min(DEFAULT_RAM_CACHE_CAP) as usize
 }
 
 fn resolve_free_bytes(vram_budget_gb: Option<f64>) -> (u64, String) {
