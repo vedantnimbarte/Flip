@@ -81,11 +81,23 @@ impl LayerSwapPlan {
         self.passes.len()
     }
 
+    /// Bytes a staging buffer needs to hold the largest window — the size
+    /// [`allocate_staging_buffer`] would ask for, without asking for it.
+    ///
+    /// Planning wants this number; only serving wants the memory. On a big model
+    /// it is many gigabytes of page-locked host RAM, so a planner that allocates
+    /// merely to print a size fails on exactly the configurations it exists to
+    /// help you reason about.
+    ///
+    /// [`allocate_staging_buffer`]: LayerSwapPlan::allocate_staging_buffer
+    pub fn staging_bytes(&self, per_layer_weight_bytes: u64) -> u64 {
+        (per_layer_weight_bytes * self.window_size as u64).max(1)
+    }
+
     /// Allocate a single reusable pinned staging buffer big enough for the
     /// largest window, given the per-layer weight size. This buffer is the DMA
     /// source that Phase 2 copies into the streaming-zone VRAM buffers.
     pub fn allocate_staging_buffer(&self, per_layer_weight_bytes: u64) -> Result<PinnedBuffer> {
-        let bytes = per_layer_weight_bytes as usize * self.window_size as usize;
-        PinnedBuffer::with_len(bytes.max(1))
+        PinnedBuffer::with_len(self.staging_bytes(per_layer_weight_bytes) as usize)
     }
 }

@@ -18,7 +18,7 @@ use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 use dlm::loader::ModelParts;
 use dlm::tokenizer::BpeTokenizer;
-use dlm::memory::{page_size, PinnedBuffer};
+use dlm::memory::page_size;
 use dlm::model::{ModelConfig, QuantScheme};
 use dlm::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, TieredWeightSource};
 use dlm::profiler::{VramPlan, VramProfiler};
@@ -1061,12 +1061,14 @@ fn report_plan(
         swap.window_size,
     );
 
-    // Allocate the pinned staging buffer the pipeline will DMA from.
-    let staging: PinnedBuffer = swap.allocate_staging_buffer(plan.per_layer_weight_bytes)?;
+    // Report the pinned staging buffer the pipeline *would* DMA from — computed,
+    // not allocated. `profile` is a planning command ("no GPU required"); it has
+    // no business page-locking gigabytes of host RAM to print a size, and on a
+    // large model it cannot: the 70B sample at a 16 GiB budget wants ~11.8 GiB of
+    // pinned memory, so `cudaHostAlloc` failed and the whole plan went with it.
     println!(
-        "staging buf  : {:.1} MiB pinned ({:?})",
-        staging.capacity() as f64 / (1024.0 * 1024.0),
-        staging.kind(),
+        "staging buf  : {:.1} MiB pinned (at serve time)",
+        swap.staging_bytes(plan.per_layer_weight_bytes) as f64 / (1024.0 * 1024.0),
     );
 
     // Build the double-buffered A/B schedule (specs §3.2).
@@ -1088,7 +1090,17 @@ fn report_plan(
             .max()
             .unwrap_or(0)
             .max(1);
-        let mut pipeline = HostPipeline::new(max_window as usize)?;
+        // This part *does* stream the real weights, so it really does need the
+        // pinned window. If the host won't page-lock that much, say so and skip
+        // it — the plan above is what `profile` is for, and it should not be lost
+        // to a demo that could not get its buffer.
+        let Ok(mut pipeline) = HostPipeline::new(max_window as usize) else {
+            println!(
+                "streamed     : skipped — could not page-lock {:.1} MiB for the staging window",
+                max_window as f64 / (1024.0 * 1024.0),
+            );
+            return Ok(());
+        };
 
         match ram_cache_gb {
             // Tiered RAM cache: run two forward passes to show cross-step reuse.
