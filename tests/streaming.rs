@@ -70,6 +70,53 @@ fn write_checkpoint(dir: &std::path::Path) -> ModelConfig {
     ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Fp16).unwrap()
 }
 
+/// The planned resident window must fit the free VRAM it was planned against,
+/// measured at the checkpoint's **real** on-disk layer size.
+///
+/// Regression: `serve --stream` sized its window from `--quant`'s parameter-count
+/// estimate, which defaults to Int4 (0.5 bytes/param). dlm does not quantize
+/// weights — it loads them in their native dtype — so for an F32/BF16 checkpoint
+/// the estimate claims layers are 4–8x smaller than they are, and the window it
+/// derived exceeded free VRAM (on a 3B/4GB card it returned all 28 layers). The
+/// engine then thought the whole model was resident and never streamed, leaving
+/// the driver to page VRAM behind its back — silent and glacial under Windows
+/// WDDM, an OOM where no such paging exists. Planning from the catalog (real
+/// tensor sizes) is what keeps this honest.
+#[test]
+fn planned_window_fits_free_vram_at_real_layer_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = write_checkpoint(tmp.path());
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let catalog = dlm::storage::LayerCatalog::build(&store);
+    assert!(!catalog.is_empty(), "catalog should see the layers");
+
+    let per_layer = catalog.max_layer_bytes();
+    let profiler = dlm::profiler::VramProfiler::new(128);
+    // Free VRAM deliberately too small for the whole model.
+    let free = per_layer * 3 + profiler.plan_with_free(&config, u64::MAX).kv_total_bytes;
+
+    let plan = profiler.plan_from_catalog(&config, &catalog, free);
+    assert!(
+        plan.layers_to_load < config.num_layers,
+        "window {} should be < {} layers when the model cannot fit",
+        plan.layers_to_load,
+        config.num_layers
+    );
+    let resident = plan.layers_to_load as u64 * per_layer;
+    assert!(
+        resident <= free,
+        "planned {} layers = {resident} B of weights, over the {free} B budget",
+        plan.layers_to_load
+    );
+
+    // The estimate is not asserted against here: how far it strays from the real
+    // layer size is model-dependent (it happens to be *conservative* for this tiny
+    // synthetic geometry, and wildly optimistic for a real bf16 checkpoint under
+    // the Int4 default), so there is no direction to pin. The invariant above is
+    // the one that matters — whatever sizes a plan is built from, the window it
+    // returns has to fit.
+}
+
 #[test]
 fn streaming_generation_matches_resident() {
     let tmp = tempfile::tempdir().unwrap();

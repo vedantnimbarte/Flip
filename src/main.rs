@@ -581,7 +581,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         "--stream does not support speculative decoding (--draft-model-path) yet".into(),
                     ));
                 }
-                let window = resident_window(&config, &args);
+                let window = resident_window(&config, &args, &store);
                 println!();
                 let dest = if device == Device::Gpu { "VRAM" } else { "host RAM" };
                 println!(
@@ -691,13 +691,28 @@ fn resolve_device(requested: Device) -> Device {
 
 /// Resolve the streaming resident-layer window: the explicit override, else the
 /// VRAM plan's `layers_to_load` for the model + context.
-fn resident_window(config: &ModelConfig, args: &ServeArgs) -> usize {
+///
+/// The plan comes from the **catalog** — the real per-layer tensor sizes in the
+/// checkpoint — and not from `--quant`'s parameter-count estimate, which is what
+/// `profile` has always done. dlm does not quantize weights; it loads them in
+/// their native dtype. So the estimate (defaulting to Int4, 0.5 bytes/param)
+/// claims a bf16 layer is a quarter of its real size, and the window it derives
+/// overshoots free VRAM — on a 3B/4GB card it returned the full 28 layers. The
+/// engine then believes the whole model is resident and never streams at all,
+/// leaving the driver to page VRAM behind its back: silently and very slowly
+/// under Windows WDDM, and an outright OOM where there is no such paging.
+fn resident_window(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> usize {
     if let Some(n) = args.resident_layers {
         return n.max(1);
     }
     let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
-    let plan = build_profiler(args.context_length, args.safety_margin_gb)
-        .plan_with_free(config, free_bytes);
+    let profiler = build_profiler(args.context_length, args.safety_margin_gb);
+    let catalog = LayerCatalog::build(store);
+    let plan = if catalog.is_empty() {
+        profiler.plan_with_free(config, free_bytes)
+    } else {
+        profiler.plan_from_catalog(config, &catalog, free_bytes)
+    };
     (plan.layers_to_load as usize).max(1)
 }
 
