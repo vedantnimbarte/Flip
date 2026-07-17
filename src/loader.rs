@@ -11,10 +11,12 @@
 //! the memory-bound GEMV that dominates decode. The small tensors (norms, biases,
 //! embedding, LM head) are read as f32.
 //!
-//! This is the connector that lets `dlm generate --model-path <dir>` run a real
-//! (small) model on CPU. Quantized checkpoints (AWQ/GPTQ `qweight` triplets)
-//! would be materialized through the [`quant`](crate::quant) dequant kernel here
-//! — this loader covers the float dtypes small models ship in.
+//! Already-quantized checkpoints (4-bit GPTQ `qweight`/`qzeros`/`scales`) are
+//! decoded here too, and are *relabeled* rather than dequantized: their codes and
+//! per-group scales go straight into [`Weights::Int4`], so the accuracy GPTQ's
+//! calibration bought survives and the layer stays a quarter the size of an fp16
+//! one. Only the variant validated against a real export is accepted — see
+//! `check_quant_supported`.
 //!
 //! [`bytes_to_f32`]: crate::storage::bytes_to_f32
 //! [`generate`]: crate::generate::Generator::generate
@@ -26,7 +28,7 @@ use crate::forward::{
     StreamingKernel, Weights,
 };
 use crate::generate::Generator;
-use crate::model::{ModelConfig, QuantScheme};
+use crate::model::{ModelConfig, PackedQuant, QuantScheme};
 use crate::storage::{bytes_to_f32, Dtype, MmapStore};
 
 /// The [`QuantScheme`] matching a checkpoint's own weight dtype.
@@ -37,6 +39,11 @@ use crate::storage::{bytes_to_f32, Dtype, MmapStore};
 /// 4x. Probes a layer-0 projection — every weight matrix in a checkpoint shares
 /// one dtype — and falls back to the first weight tensor it can find.
 pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
+    // An already-packed 4-bit checkpoint (GPTQ) has no float `.weight` to probe —
+    // its precision is int4 by construction.
+    if store.locate("model.layers.0.self_attn.q_proj.qweight").is_some() {
+        return Ok(QuantScheme::Int4);
+    }
     let probe = ["model.layers.0.self_attn.q_proj.weight", "model.embed_tokens.weight"];
     let dtype = probe
         .iter()
@@ -179,6 +186,7 @@ fn load_linear(
     in_features: usize,
     out_features: usize,
     quant: QuantScheme,
+    packed: Option<PackedQuant>,
 ) -> Result<Weights> {
     // Float weight: already row-major [out, in].
     let weight_name = format!("{base}.weight");
@@ -186,20 +194,60 @@ fn load_linear(
         return load_native(store, &weight_name, out_features * in_features, quant);
     }
 
-    // A packed 4-bit checkpoint. `config.json` normally declares this and is
-    // refused up front (see `check_quant_supported`), but a checkpoint can carry
-    // `qweight` with no `quantization_config` at all — refuse here too rather
-    // than run it through an unvalidated dequantizer and emit fluent nonsense.
+    // A packed 4-bit checkpoint (GPTQ). `config.json` declares the layout, and
+    // `check_quant_supported` has already refused any variant dlm cannot decode
+    // correctly. A `qweight` with no `quantization_config` at all is still refused
+    // rather than guessed at — the zero-point convention alone decides whether the
+    // weights come out right or merely plausible.
     if store.locate(&format!("{base}.qweight")).is_some() {
-        return Err(DlmError::UnsupportedQuant(format!(
-            "{base} is a packed 4-bit (GPTQ/AWQ) tensor; dlm's dequantizer is not yet \
-             validated against real quantized exports. Use an fp16/bf16 checkpoint."
-        )));
+        let Some(pq) = packed else {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "{base} is a packed 4-bit tensor but config.json declares no \
+                 quantization_config, so its group size and zero-point convention are \
+                 unknown. dlm will not guess at them: decoding them wrong yields \
+                 plausible-looking but incorrect output."
+            )));
+        };
+        return load_gptq_linear(store, base, in_features, out_features, pq);
     }
 
     Err(DlmError::UnknownTensor(format!(
         "{base}.weight or {base}.qweight"
     )))
+}
+
+/// Load a GPTQ 4-bit linear, keeping its codes.
+///
+/// The checkpoint is already int4, so it is *relabeled* into dlm's blob order
+/// rather than dequantized and re-quantized: the accuracy GPTQ's calibration
+/// bought survives intact, and the layer costs a quarter of an fp16 one in VRAM
+/// and on the bus. Decoding then runs through the same `load_w<DLM_W_INT4>`
+/// kernel as `--quant int4`.
+fn load_gptq_linear(
+    store: &MmapStore,
+    base: &str,
+    in_features: usize,
+    out_features: usize,
+    pq: PackedQuant,
+) -> Result<Weights> {
+    let qweight = load_i32(store, &format!("{base}.qweight"))?;
+    let qzeros = load_i32(store, &format!("{base}.qzeros"))?;
+    let scales = load_floats(store, &format!("{base}.scales"))?;
+    let cfg = crate::quant::PackedQuantConfig {
+        in_features,
+        out_features,
+        group_size: pq.group_size,
+    };
+    let (codes, sc, ze) = crate::quant::unpack_gptq_4bit(&qweight, &qzeros, &scales, &cfg)?;
+    Weights::from_int4_parts(&codes, &sc, &ze, pq.group_size)
+}
+
+/// Read an `i32` tensor (GPTQ packs its codes and zero-points as `int32`).
+fn load_i32(store: &MmapStore, name: &str) -> Result<Vec<i32>> {
+    let (shard, info) = store
+        .locate(name)
+        .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+    crate::storage::bytes_to_i32(shard.tensor_bytes(name)?, info.dtype)
 }
 
 /// Read a linear layer's bias (`{base}.bias`) when the checkpoint ships one.
@@ -319,6 +367,7 @@ pub(crate) fn load_layer_tensors(
     cfg: &BlockConfig,
     layer: u32,
     quant: QuantScheme,
+    packed: Option<PackedQuant>,
 ) -> Result<LayerTensors> {
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
@@ -327,13 +376,13 @@ pub(crate) fn load_layer_tensors(
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     // load_linear takes (in_features, out_features) of the underlying Linear.
     let tensors = LayerTensors {
-        q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant)?,
-        k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant)?,
-        v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant)?,
-        o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant)?,
-        gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate, quant)?,
-        up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate, quant)?,
-        down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden, quant)?,
+        q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant, packed)?,
+        k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant, packed)?,
+        v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
+        o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
+        gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate, quant, packed)?,
+        up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate, quant, packed)?,
+        down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden, quant, packed)?,
         input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
         post_attention_layernorm: load_tensor(
             store,
@@ -357,6 +406,8 @@ pub struct MmapLayerSource {
     num_layers: u32,
     /// Weight precision to materialize each layer in (see `--quant`).
     quant: QuantScheme,
+    /// Set when the checkpoint is already packed-quantized (GPTQ).
+    packed: Option<PackedQuant>,
 }
 
 impl LayerSource for MmapLayerSource {
@@ -364,7 +415,8 @@ impl LayerSource for MmapLayerSource {
         self.num_layers
     }
     fn load_layer(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
-        load_layer_tensors(&self.store, &self.cfg, layer, self.quant).map(std::sync::Arc::new)
+        load_layer_tensors(&self.store, &self.cfg, layer, self.quant, self.packed)
+            .map(std::sync::Arc::new)
     }
 }
 
@@ -408,7 +460,13 @@ fn load_streaming_pieces(
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
     Ok(StreamingPieces {
-        source: MmapLayerSource { store, cfg, num_layers: config.num_layers, quant: config.quant },
+        source: MmapLayerSource {
+            store,
+            cfg,
+            num_layers: config.num_layers,
+            quant: config.quant,
+            packed: config.packed_quant,
+        },
         embedding,
         final_norm,
         lm_head,
@@ -505,7 +563,7 @@ pub fn load_model_parts(
 
     let mut layers = Vec::with_capacity(config.num_layers as usize);
     for i in 0..config.num_layers {
-        layers.push(load_layer_tensors(store, &cfg, i, config.quant)?);
+        layers.push(load_layer_tensors(store, &cfg, i, config.quant, config.packed_quant)?);
     }
 
     let embedding = load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?;

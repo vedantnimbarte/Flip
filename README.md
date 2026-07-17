@@ -609,9 +609,34 @@ check your model's output rather than assuming. Three caveats worth knowing:
 - **A quantized weight is still lossy even if it fits.** Verify on your own
   prompts; a model that fits but answers worse is not obviously a win.
 
-Already-quantized checkpoints (GPTQ/AWQ `qweight` triplets) are a different
-thing and are still refused at load — `--quant` quantizes a *float* checkpoint
-itself.
+### Already-quantized checkpoints (GPTQ)
+
+`--quant` quantizes a *float* checkpoint at load. A checkpoint that is **already**
+4-bit is a different thing, and dlm loads those directly:
+
+```sh
+dlm pull Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4 --local-dir models/qwen-gptq
+dlm serve --model-path models/qwen-gptq --chat-template chatml
+```
+
+Its codes are *relabeled* into dlm's layout, not dequantized and re-quantized, so
+the accuracy the export's calibration bought survives — a GPTQ int4 model is
+generally better than the same model through `--quant int4`, which rounds to
+nearest with no calibration. No `--quant` is needed (or accepted): the file's
+precision is already int4.
+
+Supported: **4-bit GPTQ with `desc_act: false`** and the classic `gptq`
+checkpoint format — the combination validated end-to-end against a real export
+([`tests/gptq_model.rs`](tests/gptq_model.rs)). These are refused by name rather
+than decoded on a guess, because a wrong assumption here yields weights that
+still generate fluent text that means nothing:
+
+| refused | why |
+| --- | --- |
+| `desc_act: true` (act-order) | rows are permuted by `g_idx`; dlm does not un-permute them |
+| `checkpoint_format: gptq_v2` | stores the true zero-point; dlm decodes the classic `zero - 1` convention and has no v2 fixture to check against |
+| AWQ | packs nibbles in a permuted order dlm does not unpack |
+| non-4-bit | dlm decodes 4-bit only |
 
 ---
 

@@ -83,47 +83,81 @@ struct QuantizationConfig {
     quant_method: Option<String>,
     #[serde(default)]
     bits: Option<u32>,
+    #[serde(default)]
+    group_size: Option<i64>,
+    /// GPTQ act-order: weights are permuted by `g_idx` and must be un-permuted.
+    #[serde(default)]
+    desc_act: Option<bool>,
+    /// `gptq_v2` stores the true zero-point; classic `gptq` stores `zero - 1`.
+    #[serde(default)]
+    checkpoint_format: Option<String>,
+}
+
+/// A packed-quantized checkpoint dlm can decode, as declared by `config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedQuant {
+    /// Weights per quantization group along the input dimension.
+    pub group_size: usize,
 }
 
 /// Refuse quantized checkpoints the dequantizer can't decode correctly, with a
 /// message naming the working alternative. Silent wrong output is worse than a
 /// clear error — see [`crate::quant`] for what the canonical path handles.
-fn check_quant_supported(q: &QuantizationConfig) -> Result<()> {
+/// Decide whether a packed-quantized checkpoint is one dlm can decode correctly,
+/// returning its layout when it is.
+///
+/// Only the case that has been **validated against a real export** is accepted:
+/// 4-bit GPTQ, `desc_act: false`, classic (`v1`) checkpoint format. Everything
+/// else is refused by name rather than guessed at, because wrong-but-plausible
+/// weights generate fluent nonsense — the worst failure mode there is.
+fn check_quant_supported(q: &QuantizationConfig) -> Result<Option<PackedQuant>> {
     let method = q.quant_method.as_deref().unwrap_or("").to_ascii_lowercase();
+    if method.is_empty() {
+        return Ok(None); // a plain float checkpoint
+    }
     if let Some(bits) = q.bits {
         if bits != 4 {
             return Err(DlmError::UnsupportedQuant(format!(
-                "{bits}-bit {method} checkpoint; dlm dequantizes 4-bit only. \
-                 Use an fp16 or 4-bit GPTQ (desc_act=false) checkpoint."
+                "{bits}-bit {method} checkpoint; dlm decodes 4-bit only.                  Use an fp16/bf16 or 4-bit GPTQ (desc_act=false) checkpoint."
             )));
         }
     }
     match method.as_str() {
-        // GPTQ is refused until the dequantizer is validated against a real
-        // checkpoint. The unpacking/grouping/transpose logic is only round-trip
-        // tested against dlm's own packer, and real exporters differ in at least
-        // one way that silently corrupts weights: AutoGPTQ stores `zero - 1` in
-        // `qzeros`, so `(q - z) * scale` is off by one scale step per element.
-        // Wrong-but-plausible weights produce fluent nonsense, which is the worst
-        // possible failure — so refuse rather than guess. Re-enable once a real
-        // GPTQ fixture is checked in and a parity test passes.
-        "gptq" => Err(DlmError::UnsupportedQuant(
-            "GPTQ checkpoints are not supported yet: dlm's 4-bit dequantizer has not been \
-             validated against a real GPTQ export (zero-point convention and act-order \
-             reordering both differ between exporters, and getting either wrong yields \
-             plausible-looking but incorrect output). Use an fp16/bf16 checkpoint."
-                .into(),
-        )),
+        "gptq" => {
+            // act-order permutes rows by `g_idx`; decoding without un-permuting
+            // silently scrambles every weight.
+            if q.desc_act == Some(true) {
+                return Err(DlmError::UnsupportedQuant(
+                    "GPTQ checkpoint uses desc_act (act-order): its rows are permuted by                      g_idx and dlm does not un-permute them. Use a desc_act=false GPTQ                      export, or an fp16/bf16 checkpoint."
+                        .into(),
+                ));
+            }
+            // `gptq_v2` stores the true zero-point; classic `gptq` stores zero-1.
+            // dlm's decoder assumes the classic convention (verified against a real
+            // export) and has no v2 fixture to check the other against.
+            match q.checkpoint_format.as_deref().map(|f| f.to_ascii_lowercase()) {
+                None => {}
+                Some(ref f) if f == "gptq" => {}
+                Some(other) => {
+                    return Err(DlmError::UnsupportedQuant(format!(
+                        "GPTQ checkpoint_format {other:?} is not supported; dlm decodes the                          classic `gptq` format, whose zero-point convention it has been                          validated against."
+                    )))
+                }
+            }
+            let group_size = q.group_size.unwrap_or(-1);
+            if group_size <= 0 {
+                return Err(DlmError::UnsupportedQuant(format!(
+                    "GPTQ checkpoint declares group_size {group_size}; dlm needs a positive                      per-group size (act-order/whole-row grouping is not supported)."
+                )));
+            }
+            Ok(Some(PackedQuant { group_size: group_size as usize }))
+        }
         "awq" => Err(DlmError::UnsupportedQuant(
-            "AWQ uses a permuted nibble order dlm does not unpack. Use an fp16/bf16 \
-             checkpoint."
+            "AWQ packs its nibbles in a permuted order dlm does not unpack, and no real AWQ              fixture has been validated against. Use a 4-bit GPTQ (desc_act=false) or              fp16/bf16 checkpoint."
                 .into(),
         )),
-        // No method declared: nothing to refuse (a plain float checkpoint).
-        "" => Ok(()),
         other => Err(DlmError::UnsupportedQuant(format!(
-            "unrecognized quant_method {other:?}; dlm currently loads fp16/bf16 \
-             checkpoints. Use one of those."
+            "unrecognized quant_method {other:?}; dlm loads fp16/bf16 and 4-bit GPTQ              (desc_act=false) checkpoints."
         ))),
     }
 }
@@ -212,6 +246,10 @@ pub struct ModelConfig {
     pub explicit_head_dim: Option<u32>,
     /// On-disk weight precision.
     pub quant: QuantScheme,
+    /// Set when the checkpoint ships **already** packed-quantized (4-bit GPTQ)
+    /// rather than as floats. Its codes are decoded as they are — no
+    /// re-quantization — so the calibration the export paid for survives.
+    pub packed_quant: Option<PackedQuant>,
 }
 
 impl ModelConfig {
@@ -283,10 +321,12 @@ impl ModelConfig {
             source,
         })?;
 
-        // Reject quant formats the dequantizer would silently mis-decode.
-        if let Some(qc) = &raw.quantization_config {
-            check_quant_supported(qc)?;
-        }
+        // Reject quant formats the decoder would silently mis-decode; keep the
+        // layout of the one it can.
+        let packed_quant = match &raw.quantization_config {
+            Some(qc) => check_quant_supported(qc)?,
+            None => None,
+        };
 
         let config = ModelConfig {
             hidden_size: raw.hidden_size,
@@ -312,6 +352,7 @@ impl ModelConfig {
             },
             explicit_head_dim: raw.head_dim,
             quant,
+            packed_quant,
         };
 
         config.validate()?;

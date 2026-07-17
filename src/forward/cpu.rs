@@ -242,6 +242,46 @@ impl Weights {
         Ok(Weights::Int4 { blob, group_size, num_elements: n })
     }
 
+    /// Assemble an int4 [`Weights`] from codes and per-group scales/zeros that are
+    /// **already quantized** — e.g. a GPTQ checkpoint, relabeled into dlm's order
+    /// by [`unpack_gptq_4bit`](crate::quant::unpack_gptq_4bit).
+    ///
+    /// Nothing is re-quantized: the checkpoint's own codes and scales are packed
+    /// verbatim, so a GPTQ export keeps the accuracy its calibration bought.
+    /// `codes` is row-major `[out, in]`; `scales`/`zeros` cover flat groups of
+    /// `group_size` in that same order.
+    pub fn from_int4_parts(
+        codes: &[u8],
+        scales: &[f32],
+        zeros: &[f32],
+        group_size: usize,
+    ) -> Result<Self> {
+        let n = codes.len();
+        let layout = QuantLayout::int4(n, group_size);
+        if scales.len() != layout.num_groups || zeros.len() != layout.num_groups {
+            return Err(DlmError::QuantLayout(format!(
+                "expected {} scales and zeros for {n} codes in groups of {group_size}, got {} / {}",
+                layout.num_groups,
+                scales.len(),
+                zeros.len()
+            )));
+        }
+        let mut blob = vec![0u8; layout.total_bytes];
+        for (i, &c) in codes.iter().enumerate() {
+            let nib = c & 0x0F;
+            if i % 2 == 0 {
+                blob[i / 2] |= nib;
+            } else {
+                blob[i / 2] |= nib << 4;
+            }
+        }
+        for (g, (&s, &z)) in scales.iter().zip(zeros).enumerate() {
+            blob[layout.scales_off + g * 4..][..4].copy_from_slice(&s.to_le_bytes());
+            blob[layout.zeros_off + g * 4..][..4].copy_from_slice(&z.to_le_bytes());
+        }
+        Ok(Weights::Int4 { blob, group_size, num_elements: n })
+    }
+
     /// Quantize float weights to 8-bit group-affine codes, in the same blob
     /// layout the kernel reads. Half the shrink of int4, a fraction of the error.
     pub fn quantize_int8(values: &[f32], group_size: usize) -> Result<Self> {

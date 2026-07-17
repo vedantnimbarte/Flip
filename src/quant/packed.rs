@@ -116,6 +116,78 @@ pub fn dequantize_gptq_4bit(
     Ok(dense)
 }
 
+/// Unpack a GPTQ 4-bit linear into dlm's canonical order: codes in row-major
+/// `[out, in]`, plus scales/zeros for *flat* groups of `group_size` over that
+/// same order. This is a pure relabeling — no dequantize/requantize round trip —
+/// so the checkpoint's own codes and scales survive exactly.
+///
+/// ## The zero-point convention
+///
+/// AutoGPTQ stores `zero - 1` in `qzeros`, so the true zero-point is the stored
+/// nibble **plus one**. Verified against a real export
+/// (`Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4`, `sym: true`): every packed zero is
+/// `7`, and a symmetric 4-bit zero-point must be `8`. Using the stored value
+/// as-is shifts every weight by one scale step — weights that still look
+/// plausible and generate fluent nonsense, which is why this path was refused
+/// until a real fixture pinned the convention down.
+///
+/// `in_features` must be a multiple of `group_size` so a flat group over
+/// `[out, in]` never straddles two of GPTQ's per-column groups; the caller checks
+/// this (real exports satisfy it — group_size divides the hidden size).
+pub fn unpack_gptq_4bit(
+    qweight: &[i32],
+    qzeros: &[i32],
+    scales: &[f32],
+    cfg: &PackedQuantConfig,
+) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
+    cfg.validate()?;
+    let (inf, out, gs) = (cfg.in_features, cfg.out_features, cfg.group_size);
+    if inf % gs != 0 {
+        return Err(DlmError::QuantLayout(format!(
+            "in_features {inf} is not a multiple of group_size {gs}; dlm's flat grouping              would straddle two GPTQ groups"
+        )));
+    }
+    let groups = cfg.num_groups();
+    let expect = [
+        ("qweight", qweight.len(), (inf / NIBBLES_PER_WORD) * out),
+        ("scales", scales.len(), groups * out),
+        ("qzeros", qzeros.len(), groups * (out / NIBBLES_PER_WORD)),
+    ];
+    for (name, got, want) in expect {
+        if got != want {
+            return Err(DlmError::QuantLayout(format!(
+                "{name}: expected {want} elements, got {got}"
+            )));
+        }
+    }
+
+    let zeros_per_row = out / NIBBLES_PER_WORD;
+    let mut codes = vec![0u8; out * inf];
+    // Flat groups over [out, in]: row `j` owns groups `j*groups .. (j+1)*groups`.
+    let mut out_scales = vec![0.0f32; out * groups];
+    let mut out_zeros = vec![0.0f32; out * groups];
+
+    // Codes: transpose GPTQ's [in/8, out] word grid into row-major [out, in].
+    for i in 0..inf {
+        let w_row = i / NIBBLES_PER_WORD;
+        let w_nib = i % NIBBLES_PER_WORD;
+        for j in 0..out {
+            codes[j * inf + i] = nibble(qweight[w_row * out + j], w_nib) as u8;
+        }
+    }
+    // Scales/zeros: GPTQ indexes them by (group along in, out); dlm's flat groups
+    // over [out, in] map to them 1:1 because in_features % group_size == 0.
+    for g in 0..groups {
+        for j in 0..out {
+            let z = nibble(qzeros[g * zeros_per_row + j / NIBBLES_PER_WORD], j % NIBBLES_PER_WORD);
+            // +1: AutoGPTQ stores zero-1 (see above).
+            out_zeros[j * groups + g] = z as f32 + 1.0;
+            out_scales[j * groups + g] = scales[g * out + j];
+        }
+    }
+    Ok((codes, out_scales, out_zeros))
+}
+
 /// Reference packer: quantize a dense `[in, out]` matrix into GPTQ-style
 /// `(qweight, qzeros, scales)`. For tests and tooling — inference consumes
 /// already-quantized checkpoints.

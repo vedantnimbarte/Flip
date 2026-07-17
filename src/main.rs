@@ -758,6 +758,14 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
     if scheme == native {
         return Ok(scheme);
     }
+    // An already-packed 4-bit checkpoint is decoded as it is; there are no floats
+    // left to quantize to something else, and re-quantizing 4-bit codes would only
+    // throw away the calibration the export paid for.
+    if native == QuantScheme::Int4 && store.locate("model.layers.0.self_attn.q_proj.qweight").is_some() {
+        return Err(DlmError::UnsupportedQuant(format!(
+            "--quant {scheme:?} cannot apply to an already-quantized 4-bit GPTQ checkpoint;              it is loaded at its own int4 precision. Omit --quant."
+        )));
+    }
     match scheme {
         // Quantized down from the checkpoint's floats at load time.
         QuantScheme::Int4 | QuantScheme::Int8 => Ok(scheme),
@@ -838,6 +846,7 @@ fn serve_streaming_gpu(
     _config: &ModelConfig,
     _args: &ServeArgs,
     _window: usize,
+    _ram_cache: usize,
     _listen: &str,
 ) -> Result<()> {
     Err(DlmError::InvalidConfig(
