@@ -107,10 +107,14 @@ try {
     Copy-Item $exe.FullName (Join-Path $InstallDir $Bin) -Force
     Write-Host "Installed the $kind build to $(Join-Path $InstallDir $Bin)"
 
-    # Put it on PATH for future sessions if it isn't already.
+    # Put it on PATH for future sessions if it isn't already. Match on exact
+    # path segments (not a substring) so a sibling dir like ...\dlm2 doesn't
+    # suppress adding ...\dlm, and an empty PATH doesn't get a leading ';'.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($userPath -notlike "*$InstallDir*") {
-        [Environment]::SetEnvironmentVariable('Path', "$userPath;$InstallDir", 'User')
+    $segments = @($userPath -split ';' | Where-Object { $_ -ne '' })
+    if ($segments -notcontains $InstallDir) {
+        $newPath = (@($segments) + $InstallDir) -join ';'
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
         Write-Host ""
         Write-Host "  Added $InstallDir to your user PATH."
         Write-Host "  Open a new terminal, or for this session run:"

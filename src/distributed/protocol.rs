@@ -15,10 +15,21 @@
 use prost::Message as _;
 use std::io::{self, Read, Write};
 
+/// Hard cap on an inbound frame's declared payload length. A worker or
+/// coordinator reads a `u32` length prefix and then allocates that many bytes,
+/// so without a cap a 4-byte header could force a ~4 GiB allocation (remote
+/// OOM). A single hidden state is `hidden_size * 4` bytes — a few KiB even for
+/// 70B-class models — so 64 MiB is orders of magnitude more headroom than any
+/// legitimate frame needs while still refusing an abusive one.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// A protocol message (the public, hand-written API; the Protobuf types below
 /// are an encoding detail).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
+    /// Master → worker: authenticate this connection with the shared cluster
+    /// secret. Must be the first frame when the worker requires auth.
+    Auth(String),
     /// Master → worker: run your layer shard for one token.
     RunShard { position: u64, hidden: Vec<f32> },
     /// Worker → master: the shard's output hidden state.
@@ -29,6 +40,16 @@ pub enum Message {
     Pong,
     /// An error string.
     Error(String),
+}
+
+/// Constant-time byte comparison, so a wrong cluster secret can't be recovered
+/// by timing how long the check takes to fail.
+pub fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ── Protobuf schema (equivalent to a hand-written `.proto`, so no `protoc`/
@@ -56,6 +77,12 @@ struct ErrorPb {
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
+struct AuthPb {
+    #[prost(string, tag = "1")]
+    token: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
 struct EmptyPb {}
 
 #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -70,17 +97,20 @@ enum Body {
     Pong(EmptyPb),
     #[prost(message, tag = "5")]
     Error(ErrorPb),
+    #[prost(message, tag = "6")]
+    Auth(AuthPb),
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct Envelope {
-    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6")]
     body: Option<Body>,
 }
 
 impl From<&Message> for Envelope {
     fn from(msg: &Message) -> Self {
         let body = match msg {
+            Message::Auth(token) => Body::Auth(AuthPb { token: token.clone() }),
             Message::RunShard { position, hidden } => Body::RunShard(RunShardPb {
                 position: *position,
                 hidden: hidden.clone(),
@@ -106,6 +136,7 @@ pub fn decode(payload: &[u8]) -> io::Result<Message> {
     let env = Envelope::decode(payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     match env.body {
+        Some(Body::Auth(a)) => Ok(Message::Auth(a.token)),
         Some(Body::RunShard(r)) => Ok(Message::RunShard {
             position: r.position,
             hidden: r.hidden,
@@ -131,6 +162,12 @@ pub fn read_message(r: &mut impl Read) -> io::Result<Message> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds cap {MAX_FRAME_LEN}"),
+        ));
+    }
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     decode(&payload)
@@ -172,6 +209,24 @@ mod tests {
             panic!("wrong message");
         };
         assert_eq!(got, hidden); // exact bit equality
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_without_allocating() {
+        // A hostile 4-byte header claiming ~4 GiB must be refused at the length
+        // check, before the payload vec is allocated.
+        let mut frame = (u32::MAX).to_le_bytes().to_vec();
+        frame.extend_from_slice(b"not really that long");
+        let err = read_message(&mut &frame[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn auth_round_trips_and_secret_eq_is_exact() {
+        round_trip(Message::Auth("s3cret".into()));
+        assert!(secret_eq("abc", "abc"));
+        assert!(!secret_eq("abc", "abd"));
+        assert!(!secret_eq("abc", "abcd"));
     }
 
     #[test]

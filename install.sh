@@ -92,8 +92,16 @@ verify() {
   elif command -v shasum >/dev/null 2>&1; then
     hash=$(shasum -a 256 "$tmp/$a" | cut -d' ' -f1)
   else
-    info "warning: no sha256sum/shasum — skipping checksum verification"
-    return 0
+    # Fail closed: the README promises every download is checksum-verified
+    # before it runs, so a machine with no hash tool must not silently install
+    # an unverified binary. Escape hatch for the rare toolless box:
+    # DLM_SKIP_CHECKSUM=1.
+    if [ "${DLM_SKIP_CHECKSUM:-0}" = "1" ]; then
+      info "warning: no sha256sum/shasum and DLM_SKIP_CHECKSUM=1 — installing WITHOUT verification"
+      return 0
+    fi
+    err "no sha256sum/shasum found, so the download cannot be verified.
+Install one (coreutils/perl) and re-run, or set DLM_SKIP_CHECKSUM=1 to install unverified."
   fi
 
   download "$sum_url" "$tmp/$stem.sha256"

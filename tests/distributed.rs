@@ -94,9 +94,13 @@ fn reference(m: &Model) -> Generator<CpuKernel> {
 }
 
 fn start_worker(cfg: BlockConfig, layers: Vec<LayerTensors>) -> String {
+    start_worker_auth(cfg, layers, None)
+}
+
+fn start_worker_auth(cfg: BlockConfig, layers: Vec<LayerTensors>, secret: Option<&str>) -> String {
     let listener: TcpListener = dlm::distributed::worker::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let worker = Worker::new(cfg, layers).unwrap();
+    let worker = Worker::new(cfg, layers).unwrap().with_auth(secret.map(String::from));
     std::thread::spawn(move || {
         let _ = worker.serve(listener);
     });
@@ -164,6 +168,39 @@ fn unreachable_worker_falls_back_to_local() {
     let dist = coord.generate(&[1, 2, 3], 5).unwrap();
     assert_eq!(dist, greedy(&reference(&m), &[1, 2, 3], 5));
     assert_eq!(coord.alive(), &[true, false]);
+}
+
+#[test]
+fn authenticated_worker_matches_local_and_rejects_wrong_secret() {
+    let m = build_model();
+    let shards = partition_layers(m.layers.len(), 2);
+    let a0 = start_worker_auth(m.cfg, m.layers[shards[0].start..shards[0].end].to_vec(), Some("s3cret"));
+    let a1 = start_worker_auth(m.cfg, m.layers[shards[1].start..shards[1].end].to_vec(), Some("s3cret"));
+    let routes = vec![
+        ShardRoute { shard: shards[0], worker_addr: Some(a0) },
+        ShardRoute { shard: shards[1], worker_addr: Some(a1) },
+    ];
+
+    // Right secret → distributed output equals a local run, workers stay alive.
+    let mut coord = Coordinator::new(
+        m.cfg, m.layers.clone(), m.embedding.clone(), m.final_norm.clone(),
+        m.lm_head.clone(), m.vocab, routes.clone(),
+    )
+    .unwrap()
+    .with_auth(Some("s3cret".into()));
+    assert_eq!(coord.generate(&[1, 2, 3], 6).unwrap(), greedy(&reference(&m), &[1, 2, 3], 6));
+    assert!(coord.alive().iter().all(|&a| a));
+
+    // Wrong secret → workers reject; coordinator falls back to local weights.
+    // Output is still correct (fallback from position 0), but no worker is alive.
+    let mut bad = Coordinator::new(
+        m.cfg, m.layers.clone(), m.embedding.clone(), m.final_norm.clone(),
+        m.lm_head.clone(), m.vocab, routes,
+    )
+    .unwrap()
+    .with_auth(Some("wrong".into()));
+    assert_eq!(bad.generate(&[1, 2, 3], 6).unwrap(), greedy(&reference(&m), &[1, 2, 3], 6));
+    assert!(bad.alive().iter().all(|&a| !a), "wrong secret should mark all workers dead");
 }
 
 #[test]

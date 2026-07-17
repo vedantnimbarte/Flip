@@ -9,7 +9,7 @@
 //! so a model too big for one node can still be served across several.
 
 use crate::distributed::Coordinator;
-use crate::server::engine::{ChatMessage, ChatTemplate};
+use crate::server::engine::{authorized, is_public_path, ChatMessage, ChatTemplate};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
 use serde::Deserialize;
@@ -36,6 +36,7 @@ pub struct DistributedEngine {
     vocab_size: usize,
     model_id: String,
     default_max_tokens: usize,
+    max_context: usize,
     created: u64,
     next_id: AtomicU64,
 }
@@ -49,6 +50,7 @@ impl DistributedEngine {
         vocab_size: usize,
         model_id: impl Into<String>,
         default_max_tokens: usize,
+        max_context: usize,
         created: u64,
     ) -> Self {
         Self {
@@ -58,6 +60,7 @@ impl DistributedEngine {
             vocab_size,
             model_id: model_id.into(),
             default_max_tokens,
+            max_context: max_context.max(1),
             created,
             next_id: AtomicU64::new(1),
         }
@@ -66,6 +69,23 @@ impl DistributedEngine {
 
 fn error_json(message: &str) -> Vec<u8> {
     format!(r#"{{"error":{{"message":{message:?},"type":"invalid_request_error"}}}}"#).into_bytes()
+}
+
+/// Wrap [`router`] with bearer-token auth, mirroring the batched engine: when
+/// `api_key` is set, every request except a liveness probe must carry a matching
+/// key. With `api_key = None` this is exactly [`router`] (open — trusted network
+/// only). The batched path's `--api-key` used to be silently ignored here.
+pub fn secured_router(engine: Arc<DistributedEngine>, api_key: Option<String>) -> Handler {
+    let inner = router(engine);
+    match api_key {
+        None => inner,
+        Some(key) => Arc::new(move |req: &Request| {
+            if !is_public_path(&req.path) && !authorized(req, &key) {
+                return Response::json(401, error_json("missing or invalid API key"));
+            }
+            inner(req)
+        }),
+    }
 }
 
 /// Build the HTTP router for the distributed engine (`/health`, `/v1/models`,
@@ -110,10 +130,34 @@ fn handle_chat(engine: &Arc<DistributedEngine>, req: &Request) -> Response {
     if ids.iter().any(|&t| t as usize >= engine.vocab_size) {
         return Response::json(400, error_json("prompt token out of model vocab range"));
     }
-    let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    // Clamp to the context window: reject an over-long prompt and cap generation
+    // to the remaining budget, so an attacker-supplied `max_tokens` can't force a
+    // huge allocation or an unbounded serialized generation loop.
+    if ids.len() >= engine.max_context {
+        return Response::json(
+            400,
+            error_json(&format!(
+                "prompt is {} tokens but the context window is {}",
+                ids.len(),
+                engine.max_context
+            )),
+        );
+    }
+    let budget = engine.max_context - ids.len();
+    let max_tokens = parsed
+        .max_tokens
+        .unwrap_or(engine.default_max_tokens)
+        .min(budget)
+        .max(1);
 
-    // The coordinator drives one sequence at a time; serialize on it.
-    let generated = match engine.coordinator.lock().unwrap().generate(&ids, max_tokens) {
+    // The coordinator drives one sequence at a time; serialize on it. Recover a
+    // poisoned lock so one panicked request can't wedge the whole server.
+    let generated = match engine
+        .coordinator
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .generate(&ids, max_tokens)
+    {
         Ok(g) => g,
         Err(e) => return Response::json(500, error_json(&e.to_string())),
     };

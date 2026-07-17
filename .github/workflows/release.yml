@@ -20,8 +20,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The tag drives the release, but the binaries' `--version` comes from
+      # Cargo.toml. If they disagree, users get a binary whose version doesn't
+      # match its release. Fail the release rather than publish the mismatch.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+      # A semver prerelease tag (contains a hyphen, e.g. v1.2.0-rc1) must NOT
+      # become GitHub's `latest`, which is what every `curl | sh` install pulls.
+      # Mark it --prerelease so `releases/latest/download/` skips it.
       - name: Create release if absent
-        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) pre=--prerelease ;;
+            *)   pre= ;;
+          esac
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes $pre
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

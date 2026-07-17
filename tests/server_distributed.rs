@@ -76,7 +76,10 @@ fn coordinator() -> Coordinator {
     .unwrap()
 }
 
-fn start_server() -> SocketAddr {
+/// Small context window (32 tokens) so the max_tokens clamp is easy to trip.
+const MAX_CONTEXT: usize = 32;
+
+fn start_server(api_key: Option<&str>) -> SocketAddr {
     let engine = Arc::new(DistributedEngine::new(
         coordinator(),
         BpeTokenizer::bytes_only(),
@@ -84,18 +87,27 @@ fn start_server() -> SocketAddr {
         256,
         "dlm-dist",
         16,
+        MAX_CONTEXT,
         0,
     ));
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
-    std::thread::spawn(move || server.serve(distributed::router(engine)).unwrap());
+    let router = distributed::secured_router(engine, api_key.map(String::from));
+    std::thread::spawn(move || server.serve(router).unwrap());
     addr
 }
 
 fn post(addr: SocketAddr, path: &str, body: &str) -> String {
+    post_auth(addr, path, body, None)
+}
+
+fn post_auth(addr: SocketAddr, path: &str, body: &str, key: Option<&str>) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
+    let auth = key
+        .map(|k| format!("Authorization: Bearer {k}\r\n"))
+        .unwrap_or_default();
     let raw = format!(
-        "POST {path} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nContent-Type: application/json\r\n{auth}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(raw.as_bytes()).unwrap();
@@ -106,7 +118,7 @@ fn post(addr: SocketAddr, path: &str, body: &str) -> String {
 
 #[test]
 fn distributed_chat_completion() {
-    let addr = start_server();
+    let addr = start_server(None);
     let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4}"#;
     let resp = post(addr, "/v1/chat/completions", body);
 
@@ -118,7 +130,47 @@ fn distributed_chat_completion() {
 
 #[test]
 fn distributed_rejects_empty_messages() {
-    let addr = start_server();
+    let addr = start_server(None);
     let resp = post(addr, "/v1/chat/completions", r#"{"messages":[]}"#);
     assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+}
+
+#[test]
+fn distributed_clamps_max_tokens_to_context_window() {
+    // A hostile max_tokens must not drive an unbounded generation loop: it's
+    // capped to the remaining context budget (MAX_CONTEXT − prompt tokens).
+    let addr = start_server(None);
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":100000000}"#;
+    let resp = post(addr, "/v1/chat/completions", body);
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    // "Hi" under the plain byte tokenizer is a few tokens, so the completion is
+    // clamped to well under MAX_CONTEXT, not 100M.
+    assert!(
+        !resp.contains(r#""completion_tokens":100000000"#),
+        "max_tokens was not clamped: {resp}"
+    );
+}
+
+#[test]
+fn distributed_api_key_gates_completions() {
+    let addr = start_server(Some("sk-secret"));
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":2}"#;
+
+    // No key → 401.
+    let resp = post(addr, "/v1/chat/completions", body);
+    assert!(resp.starts_with("HTTP/1.1 401"), "unauth should be 401: {resp}");
+
+    // Correct key → 200.
+    let ok = post_auth(addr, "/v1/chat/completions", body, Some("sk-secret"));
+    assert!(ok.starts_with("HTTP/1.1 200 OK"), "authed should be 200: {ok}");
+
+    // Health stays public.
+    let health = {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).unwrap();
+        r
+    };
+    assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
 }
