@@ -20,6 +20,14 @@ use crate::generate::argmax;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+/// Read/write timeout on the compute stream. Without it, a worker that accepts
+/// the connection then never replies (crash, hang, or a MITM on the plaintext
+/// link) would block the coordinator — and its global lock — forever. On
+/// timeout the read fails and `forward_token` routes that shard to the local
+/// CPU-RAM fallback, so a stalled worker degrades gracefully instead of wedging
+/// the whole server.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Connect with a bounded timeout so an unreachable worker fails fast (rather
 /// than blocking on the OS default connect timeout).
 fn connect_timeout(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
@@ -50,6 +58,7 @@ pub struct Coordinator {
     routes: Vec<ShardRoute>,
     connections: Vec<Option<TcpStream>>,
     alive: Vec<bool>,
+    secret: Option<String>,
 }
 
 impl Coordinator {
@@ -82,7 +91,15 @@ impl Coordinator {
             routes,
             connections: (0..n).map(|_| None).collect(),
             alive: vec![true; n],
+            secret: None,
         })
+    }
+
+    /// Authenticate to workers with `secret` (the shared cluster secret). Must
+    /// match what each worker was started with (see [`Worker::with_auth`]).
+    pub fn with_auth(mut self, secret: Option<String>) -> Self {
+        self.secret = secret;
+        self
     }
 
     /// Latest per-shard liveness (updated by forward passes and heartbeats).
@@ -121,7 +138,15 @@ impl Coordinator {
             let addr = self.routes[i].worker_addr.as_ref().unwrap();
             let stream = connect_timeout(addr, Duration::from_millis(300))
                 .map_err(|e| DlmError::Network(format!("connect {addr}: {e}")))?;
+            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
             self.connections[i] = Some(stream);
+            // Authenticate once per connection, before any compute frame.
+            if let Some(secret) = &self.secret {
+                let stream = self.connections[i].as_mut().unwrap();
+                write_message(stream, &Message::Auth(secret.clone()))
+                    .map_err(|e| DlmError::Network(e.to_string()))?;
+            }
         }
         let stream = self.connections[i].as_mut().unwrap();
         write_message(
@@ -201,7 +226,7 @@ impl Coordinator {
     pub fn heartbeat(&mut self) -> Vec<bool> {
         for i in 0..self.routes.len() {
             self.alive[i] = match self.routes[i].worker_addr.clone() {
-                Some(addr) => ping(&addr),
+                Some(addr) => ping(&addr, self.secret.as_deref()),
                 None => true,
             };
         }
@@ -209,12 +234,20 @@ impl Coordinator {
     }
 }
 
-/// Connect, Ping, expect Pong — a low-overhead liveness check.
-fn ping(addr: &str) -> bool {
+/// Connect, Ping, expect Pong — a low-overhead liveness check. Authenticates
+/// first when the cluster requires it, else an auth-gated worker always reads
+/// as dead.
+fn ping(addr: &str, secret: Option<&str>) -> bool {
     let Ok(mut stream) = connect_timeout(addr, Duration::from_millis(300)) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    if let Some(secret) = secret {
+        if write_message(&mut stream, &Message::Auth(secret.to_string())).is_err() {
+            return false;
+        }
+    }
     write_message(&mut stream, &Message::Ping).is_ok()
         && matches!(read_message(&mut stream), Ok(Message::Pong))
 }

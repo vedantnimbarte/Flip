@@ -352,9 +352,7 @@ fn generate_on_device(
             run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
         }
         #[cfg(not(feature = "cuda-kernels"))]
-        Device::Gpu => Err(DlmError::InvalidConfig(
-            "--device gpu requires building with `--features cuda-kernels`".into(),
-        )),
+        Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
     }
 }
 
@@ -556,10 +554,20 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         DistributedMode::Worker => {
             // Serve this node's layer shard (the whole model here) to a master.
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
-            let worker = dlm::distributed::Worker::new(parts.cfg, parts.layers)?;
+            let secret = cluster_secret(&args);
+            let worker =
+                dlm::distributed::Worker::new(parts.cfg, parts.layers)?.with_auth(secret.clone());
             let listener = dlm::distributed::worker::bind(&listen)?;
             println!();
             println!("worker node  : listening on {listen} ({} layers)", config.num_layers);
+            println!(
+                "  auth       : {}",
+                if secret.is_some() {
+                    "cluster secret required"
+                } else {
+                    "OPEN — any peer can drive this worker (set --cluster-secret)"
+                }
+            );
             worker.serve(listener)?; // blocks
             Ok(())
         }
@@ -688,6 +696,23 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 /// dies just because no GPU is present. On a CPU-only build, an explicit
 /// `--device gpu` passes through and the downstream `not(cuda-kernels)` arm
 /// reports the clearer "requires --features cuda-kernels" error.
+/// Error for a GPU request on a build without the CUDA compute kernels. On an
+/// AMD (`rocm`) build `--features cuda-kernels` is unsatisfiable — it pulls in
+/// `cuda` — so pointing AMD users at that flag is a dead end. Give them the real
+/// state (AMD compute isn't implemented yet, run on CPU) and keep the
+/// build-flag hint only for a plain CPU build that *could* enable it.
+fn gpu_compute_unavailable(what: &str) -> DlmError {
+    match gpu::active_vendor() {
+        gpu::GpuVendor::Amd => DlmError::InvalidConfig(format!(
+            "{what} on GPU is not supported on this AMD (ROCm) build — AMD GPU compute is \
+             not implemented yet. Run on CPU (drop --device gpu)."
+        )),
+        _ => DlmError::InvalidConfig(format!(
+            "{what} requires building with `--features cuda-kernels`"
+        )),
+    }
+}
+
 fn resolve_device(requested: Device) -> Device {
     if requested == Device::Cpu {
         return Device::Cpu;
@@ -812,9 +837,7 @@ fn serve_on_gpu(
     _config: &ModelConfig,
     _listen: &str,
 ) -> Result<()> {
-    Err(DlmError::InvalidConfig(
-        "--device gpu requires building with `--features cuda-kernels`".into(),
-    ))
+    Err(gpu_compute_unavailable("--device gpu"))
 }
 
 /// Serve with `--stream --device gpu`: stream a window of layer weights through
@@ -849,15 +872,23 @@ fn serve_streaming_gpu(
     _ram_cache: usize,
     _listen: &str,
 ) -> Result<()> {
-    Err(DlmError::InvalidConfig(
-        "--stream --device gpu requires building with `--features cuda-kernels`".into(),
-    ))
+    Err(gpu_compute_unavailable("--stream --device gpu"))
 }
 
 /// Master mode: partition the model's layers across the configured worker nodes
 /// and serve a (non-streaming, greedy) OpenAI-compatible endpoint backed by a
 /// pipeline-parallel [`Coordinator`](dlm::distributed::Coordinator). A shard
 /// whose worker is unreachable falls back to running locally.
+/// Resolve the shared cluster secret: the `--cluster-secret` flag, else the
+/// `DLM_CLUSTER_SECRET` env var (which keeps it out of the process argument
+/// list). `None` means no auth — trusted-network only.
+fn cluster_secret(args: &ServeArgs) -> Option<String> {
+    args.cluster_secret
+        .clone()
+        .or_else(|| std::env::var("DLM_CLUSTER_SECRET").ok())
+        .filter(|s| !s.is_empty())
+}
+
 fn serve_distributed(
     store: MmapStore,
     config: &ModelConfig,
@@ -878,6 +909,7 @@ fn serve_distributed(
         })
         .collect();
 
+    let secret = cluster_secret(args);
     let coordinator = dlm::distributed::Coordinator::new(
         parts.cfg,
         parts.layers,
@@ -886,7 +918,8 @@ fn serve_distributed(
         parts.lm_head,
         config.vocab_size as usize,
         routes,
-    )?;
+    )?
+    .with_auth(secret.clone());
 
     let template = dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
         DlmError::InvalidConfig(format!(
@@ -905,6 +938,7 @@ fn serve_distributed(
         config.vocab_size as usize,
         "dlm",
         128,
+        args.context_length as usize,
         created,
     ));
 
@@ -913,9 +947,19 @@ fn serve_distributed(
     println!("serving      : distributed (pipeline) API on http://{listen}");
     println!("  master     : {} shard(s) across {} worker(s)", shards.len(), args.worker_nodes.len());
     println!("  endpoints  : POST /v1/chat/completions (non-streaming, greedy), GET /v1/models");
+    println!(
+        "  auth       : {}",
+        if args.api_key.is_some() { "API key required" } else { "OPEN (set --api-key)" }
+    );
+    println!(
+        "  cluster    : worker link {}",
+        if secret.is_some() { "authenticated" } else { "UNAUTHENTICATED (set --cluster-secret)" }
+    );
     println!("  note       : distributed mode trades streaming/sampling/batching for");
     println!("               spanning the model across nodes; a dead worker runs locally.");
-    server.serve(dlm::server::distributed::router(engine)) // blocks
+    // secured_router honors --api-key here; the batched path already did, this
+    // path silently ignored it before.
+    server.serve(dlm::server::distributed::secured_router(engine, args.api_key.clone())) // blocks
 }
 
 /// Build the batched (optionally speculative) streaming engine over any compute

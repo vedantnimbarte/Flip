@@ -277,6 +277,15 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "ADDRS")]
     pub worker_nodes: Vec<String>,
 
+    /// Shared secret authenticating the master↔worker link. Set the *same* value
+    /// on every worker and the master; the master presents it on each connection
+    /// and workers reject peers that don't. Omit only on a fully trusted network
+    /// — an unauthenticated worker will run shard compute for anyone who can
+    /// reach its port. Falls back to the `DLM_CLUSTER_SECRET` env var (which
+    /// keeps the secret out of the process list).
+    #[arg(long, value_name = "SECRET")]
+    pub cluster_secret: Option<String>,
+
     /// Require this bearer token on `/v1/*` requests (`Authorization: Bearer …`).
     /// Omit to leave the API open (localhost default).
     #[arg(long, value_name = "KEY")]

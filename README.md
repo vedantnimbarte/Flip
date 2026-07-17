@@ -42,8 +42,11 @@ safety cushion on a small card to fit more layers).
 ## Install
 
 One line — downloads a prebuilt binary for your platform and installs it. No
-clone, no build, no Rust toolchain. Every download is checksum-verified against a
-published `.sha256` before it is unpacked or run.
+clone, no build, no Rust toolchain. Every download is checked against a published
+`.sha256` before it is unpacked or run, so a corrupted or truncated download is
+caught. Note this is an **integrity** check, not authenticity: the checksum is
+served from the same GitHub release as the binary, so it guards against corruption
+in transit, not a compromised release. Signed releases are on the roadmap.
 
 **Linux / macOS** (installs to `~/.local/bin`):
 
@@ -106,6 +109,12 @@ To uninstall (removes the binary; respects `DLM_INSTALL_DIR`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.sh | sh
+```
+
+On **Windows** (removes the binary and its user-PATH entry):
+
+```powershell
+irm https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.ps1 | iex
 ```
 
 ---

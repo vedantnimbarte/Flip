@@ -231,7 +231,7 @@ impl EngineService {
     ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = self.job_tx.lock().unwrap().send(Job {
+        let _ = self.job_tx.lock().unwrap_or_else(|e| e.into_inner()).send(Job {
             id,
             prompt,
             max_new,
@@ -591,7 +591,7 @@ fn secret_eq(a: &str, b: &str) -> bool {
 /// True if the request carries a matching key via `Authorization: Bearer <key>`
 /// (OpenAI style) or `x-api-key: <key>` (Anthropic style). The scheme name is
 /// matched case-insensitively, as RFC 7235 requires.
-fn authorized(req: &Request, key: &str) -> bool {
+pub(crate) fn authorized(req: &Request, key: &str) -> bool {
     let bearer = req.headers.get("authorization").and_then(|h| {
         let (scheme, value) = h.split_once(' ')?;
         scheme.eq_ignore_ascii_case("bearer").then(|| value.trim())
@@ -603,7 +603,7 @@ fn authorized(req: &Request, key: &str) -> bool {
 /// Paths that stay open when an API key is configured: a liveness probe and the
 /// root banner. Everything else — including `/metrics`, which leaks request and
 /// token counts — requires the key.
-fn is_public_path(path: &str) -> bool {
+pub(crate) fn is_public_path(path: &str) -> bool {
     matches!(path, "/" | "/health" | "/healthz")
 }
 
