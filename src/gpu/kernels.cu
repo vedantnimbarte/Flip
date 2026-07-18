@@ -247,6 +247,13 @@ __global__ void add_inplace_kernel(float* x, const float* y, int n) {
     if (i < n) x[i] += y[i];
 }
 
+// x[i] += w * y[i] — the residual add for one MoE expert, folding its gate weight
+// in so an expert's contribution is scaled without a second pass.
+__global__ void scaled_add_kernel(float* x, const float* y, float w, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += w * y[i];
+}
+
 // out[i] = silu(gate[i]) * up[i]
 __global__ void swiglu_kernel(const float* gate, const float* up, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -278,7 +285,12 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // runs cases in parallel threads — a single global would race and corrupt
 // buffers across them. Per-thread scratch is allocated on that thread's current
 // device and reclaimed by the driver at process exit.
-enum { SCRATCH_N = 11 };
+// Slots 0-10 are the dense decode block's scratch. Slots 11-12 are MoE-only:
+// 11 holds `normed2` (the FFN input) so it survives from `dlm_moe_attn` across
+// the router matvec and every per-expert apply on the same stream; 12 is the
+// router/shared-gate matvec output staged for the D2H copy.
+enum { SCRATCH_N = 13 };
+enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 static thread_local float* g_scratch[SCRATCH_N] = {0};
 static thread_local int g_scratch_cap[SCRATCH_N] = {0}; // capacity in floats
 
@@ -376,5 +388,123 @@ extern "C" int dlm_decode_block(
 
     // Scratch is persistent — not freed here. It is reused across every layer and
     // token and reclaimed by the driver at process exit.
+    return (int)e;
+}
+
+// ── Mixture-of-Experts device path ─────────────────────────────────────────
+//
+// A dense layer runs in one `dlm_decode_block` call. A MoE layer cannot: the
+// experts a token uses aren't known until the router runs, so the block is split
+// into three host-orchestrated calls on the same (in-order) default stream:
+//
+//   1. dlm_moe_attn   — attention sublayer (residual into x) + normed2 (FFN
+//                        input) left in persistent scratch slot MOE_NORMED2.
+//   2. dlm_moe_matvec — W·normed2 → host, for the router logits (and the shared
+//                        expert's sigmoid gate). The host does top-k + softmax.
+//   3. dlm_apply_expert — for each selected expert, x += weight · SwiGLU(expert).
+//
+// `normed2` persists in scratch between (1) and every (3) because all three run
+// on the same stream on the same thread, and the scratch is thread_local. This
+// mirrors `moe_ffn` in `src/forward/cpu.rs` — the CPU oracle these match.
+
+// Attention sublayer + post-attention norm for a MoE layer. Duplicates the
+// attention half of `dlm_decode_block` deliberately: refactoring that tested,
+// hot dense path to share code here risks a regression it can't easily catch.
+extern "C" int dlm_moe_attn(
+    int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
+    float rms_eps,
+    int w_dtype,                           // DLM_W_* tag for the core (attn) weights
+    int w_group_size,
+    const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
+    const float* in_norm, const float* post_norm,
+    const float* q_bias, const float* k_bias, const float* v_bias,  // may be NULL
+    const float* inv_freq,
+    float* x,                              // [hidden] in/out (attn residual folded in)
+    float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
+    int num_positions, int position)
+{
+    const int B = 256;
+    int total_pos = num_positions + 1;
+
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(0, hidden_size)
+    DLM_ALLOC(1, q_dim)
+    DLM_ALLOC(2, kv_dim)
+    DLM_ALLOC(3, kv_dim)
+    DLM_ALLOC(4, q_dim)
+    DLM_ALLOC(5, hidden_size)
+    DLM_ALLOC(MOE_NORMED2, hidden_size)
+    #undef DLM_ALLOC
+    float *normed = g_scratch[0], *q = g_scratch[1], *k = g_scratch[2];
+    float *v = g_scratch[3], *ctx = g_scratch[4], *attn_out = g_scratch[5];
+    float *normed2 = g_scratch[MOE_NORMED2];
+
+    if (e == cudaSuccess) {
+        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+        launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
+        launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
+        launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
+        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
+        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
+        copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
+        copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
+        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos);
+        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
+        add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
+        // FFN input, reused by the router matvec and every expert.
+        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);
+        e = cudaGetLastError();
+    }
+    return (int)e;
+}
+
+// `y_host[0..out_dim] = W · normed2`, copied to the host. Used for the router
+// logits (out_dim = num_experts) and the shared expert's gate (out_dim = 1).
+extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_group_size,
+                              const void* w, float* y_host)
+{
+    cudaError_t e = cudaSuccess;
+    if (e == cudaSuccess) e = scratch_ensure(MOE_MATVEC, out_dim);
+    if (e == cudaSuccess) {
+        launch_matvec(w_dtype, w, g_scratch[MOE_NORMED2], (const float*)0, g_scratch[MOE_MATVEC],
+                      out_dim, hidden_size, w_group_size);
+        e = cudaGetLastError();
+    }
+    // Blocking D2H: this also drains the launches above, so `y_host` is valid on
+    // return and the host can route. out_dim is tiny (expert count), so the stall
+    // is negligible against the expert GEMVs that follow.
+    if (e == cudaSuccess)
+        e = cudaMemcpy(y_host, g_scratch[MOE_MATVEC], (size_t)out_dim * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+    return (int)e;
+}
+
+// Apply one expert to the residual: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.
+// Reads normed2 from scratch (left by dlm_moe_attn). `w_dtype`/`w_group_size`
+// describe the expert's weights, which may differ from the core's.
+extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_group_size,
+                                const void* gate, const void* up, const void* down,
+                                float weight, float* x)
+{
+    const int B = 256;
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(7, inter)
+    DLM_ALLOC(8, inter)
+    DLM_ALLOC(9, inter)
+    DLM_ALLOC(10, hidden_size)
+    #undef DLM_ALLOC
+    float *g = g_scratch[7], *u = g_scratch[8], *inter_buf = g_scratch[9], *down_out = g_scratch[10];
+    float *normed2 = g_scratch[MOE_NORMED2];
+
+    if (e == cudaSuccess) {
+        launch_matvec(w_dtype, gate, normed2, (const float*)0, g, inter, hidden_size, w_group_size);
+        launch_matvec(w_dtype, up, normed2, (const float*)0, u, inter, hidden_size, w_group_size);
+        swiglu_kernel<<<grid_for(inter, B), B>>>(g, u, inter_buf, inter);
+        launch_matvec(w_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, w_group_size);
+        scaled_add_kernel<<<grid_for(hidden_size, B), B>>>(x, down_out, weight, hidden_size);
+        e = cudaGetLastError();
+    }
     return (int)e;
 }

@@ -21,6 +21,7 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::kernel::ComputeKernel;
+use crate::model::MoeConfig;
 
 /// RoPE frequency scaling, as declared by `rope_scaling` in `config.json`.
 ///
@@ -61,6 +62,10 @@ pub struct BlockConfig {
     pub rms_eps: f32,
     /// RoPE frequency scaling, when the model declares one.
     pub rope_scaling: Option<RopeScaling>,
+    /// Mixture-of-Experts geometry; `None` for a dense block. When set, the FFN
+    /// is routed: `intermediate_size` still describes any dense/shared FFN, while
+    /// [`MoeConfig::moe_intermediate_size`] sizes each routed expert.
+    pub moe: Option<MoeConfig>,
 }
 
 impl BlockConfig {
@@ -353,15 +358,80 @@ pub(crate) fn bytemuck_cast<T>(v: &[T]) -> &[u8] {
 /// while Qwen2 ships one per attention projection. Dropping a bias the checkpoint
 /// declares yields wrong attention and incoherent text with no error, so the
 /// loader reads them whenever they are present.
+/// One SwiGLU feed-forward network: the gate/up/down triple. A dense model has
+/// exactly one per layer; an MoE model has many routed experts (plus an optional
+/// shared expert) built from the same shape.
+#[derive(Debug, Clone, Default)]
+pub struct ExpertFfn {
+    pub gate: Weights, // [inter, hidden]
+    pub up: Weights,   // [inter, hidden]
+    pub down: Weights, // [hidden, inter]
+}
+
+impl ExpertFfn {
+    fn byte_size(&self) -> usize {
+        self.gate.as_bytes().len() + self.up.as_bytes().len() + self.down.as_bytes().len()
+    }
+
+    /// Validate the three matrices against `[inter, hidden]` / `[hidden, inter]`.
+    fn validate(&self, label: &str, hidden: usize, inter: usize) -> Result<()> {
+        for (name, got, expected) in [
+            ("gate", self.gate.len(), inter * hidden),
+            ("up", self.up.len(), inter * hidden),
+            ("down", self.down.len(), hidden * inter),
+        ] {
+            if got != expected {
+                return Err(DlmError::QuantLayout(format!(
+                    "{label}.{name}: expected {expected} elements, got {got}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn zeros(hidden: usize, inter: usize) -> Self {
+        Self {
+            gate: Weights::zeros(inter * hidden),
+            up: Weights::zeros(inter * hidden),
+            down: Weights::zeros(hidden * inter),
+        }
+    }
+}
+
+/// A layer's feed-forward block: a single dense FFN, or a routed set of experts.
+#[derive(Debug, Clone)]
+pub enum Ffn {
+    /// Standard Llama/Qwen2 dense SwiGLU MLP.
+    Dense(ExpertFfn),
+    /// Mixture-of-Experts: a router that scores experts per token, the routed
+    /// experts themselves, and an optional always-on shared expert.
+    ///
+    /// `experts` is populated for resident/host kernels; the GPU streaming kernel
+    /// leaves it empty and fetches each routed expert on demand into its own
+    /// device-side `(layer, expert)` cache — so a sparse model streams only the
+    /// experts a token selects, not all of them.
+    Moe {
+        router: Weights,              // [num_experts, hidden]
+        experts: Vec<ExpertFfn>,      // routed experts (may be empty when streamed)
+        shared: Option<ExpertFfn>,    // Qwen2-MoE shared expert; None otherwise
+        shared_gate: Option<Weights>, // [1, hidden] sigmoid gate for the shared expert
+    },
+}
+
+impl Default for Ffn {
+    fn default() -> Self {
+        Ffn::Dense(ExpertFfn::default())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LayerTensors {
     pub q_proj: Weights,   // [q_dim, hidden]
     pub k_proj: Weights,   // [kv_dim, hidden]
     pub v_proj: Weights,   // [kv_dim, hidden]
     pub o_proj: Weights,   // [hidden, q_dim]
-    pub gate_proj: Weights, // [intermediate, hidden]
-    pub up_proj: Weights,   // [intermediate, hidden]
-    pub down_proj: Weights, // [hidden, intermediate]
+    /// Feed-forward block: dense MLP or routed experts.
+    pub ffn: Ffn,
     pub input_layernorm: Vec<f32>,          // [hidden]
     pub post_attention_layernorm: Vec<f32>, // [hidden]
     /// Attention projection biases (Qwen2 et al.); `None` for Llama/Mistral.
@@ -377,18 +447,52 @@ impl LayerTensors {
     /// of weights.
     pub fn byte_size(&self) -> usize {
         let bias = |b: &Option<Vec<f32>>| b.as_ref().map_or(0, std::mem::size_of_val);
+        let ffn = match &self.ffn {
+            Ffn::Dense(f) => f.byte_size(),
+            Ffn::Moe { router, experts, shared, shared_gate } => {
+                router.as_bytes().len()
+                    + experts.iter().map(ExpertFfn::byte_size).sum::<usize>()
+                    + shared.as_ref().map_or(0, ExpertFfn::byte_size)
+                    + shared_gate.as_ref().map_or(0, |g| g.as_bytes().len())
+            }
+        };
         self.q_proj.as_bytes().len()
             + self.k_proj.as_bytes().len()
             + self.v_proj.as_bytes().len()
             + self.o_proj.as_bytes().len()
-            + self.gate_proj.as_bytes().len()
-            + self.up_proj.as_bytes().len()
-            + self.down_proj.as_bytes().len()
+            + ffn
             + std::mem::size_of_val(&self.input_layernorm[..])
             + std::mem::size_of_val(&self.post_attention_layernorm[..])
             + bias(&self.q_bias)
             + bias(&self.k_bias)
             + bias(&self.v_bias)
+    }
+
+    /// The dense FFN triple, or an error if this layer is MoE. Used by GPU paths
+    /// that do not yet route experts; the streaming GPU kernel handles MoE
+    /// separately via its per-expert cache.
+    pub fn dense_ffn(&self) -> Result<&ExpertFfn> {
+        match &self.ffn {
+            Ffn::Dense(f) => Ok(f),
+            Ffn::Moe { .. } => Err(DlmError::InvalidConfig(
+                "this GPU path does not support Mixture-of-Experts layers; use the \
+                 streaming GPU kernel (serve --stream) for MoE models"
+                    .into(),
+            )),
+        }
+    }
+
+    /// The MoE block (router + routed experts + optional shared expert), or an
+    /// error if this layer is dense.
+    pub fn moe(&self) -> Result<(&Weights, &[ExpertFfn], Option<&ExpertFfn>, Option<&Weights>)> {
+        match &self.ffn {
+            Ffn::Moe { router, experts, shared, shared_gate } => {
+                Ok((router, experts, shared.as_ref(), shared_gate.as_ref()))
+            }
+            Ffn::Dense(_) => Err(DlmError::InvalidConfig(
+                "expected a Mixture-of-Experts layer but found a dense FFN".into(),
+            )),
+        }
     }
 
     /// Validate every matrix against the config's expected dimensions.
@@ -398,9 +502,6 @@ impl LayerTensors {
             ("k_proj", self.k_proj.len(), cfg.kv_dim() * cfg.hidden_size),
             ("v_proj", self.v_proj.len(), cfg.kv_dim() * cfg.hidden_size),
             ("o_proj", self.o_proj.len(), cfg.hidden_size * cfg.q_dim()),
-            ("gate_proj", self.gate_proj.len(), cfg.intermediate_size * cfg.hidden_size),
-            ("up_proj", self.up_proj.len(), cfg.intermediate_size * cfg.hidden_size),
-            ("down_proj", self.down_proj.len(), cfg.hidden_size * cfg.intermediate_size),
             ("input_layernorm", self.input_layernorm.len(), cfg.hidden_size),
             ("post_attention_layernorm", self.post_attention_layernorm.len(), cfg.hidden_size),
         ];
@@ -426,7 +527,60 @@ impl LayerTensors {
                 )));
             }
         }
+        self.validate_ffn(cfg)?;
         Ok(())
+    }
+
+    /// Validate the FFN block against the config: a dense MLP uses
+    /// `intermediate_size`; MoE experts use the expert width, and the router /
+    /// shared expert are checked when present. A streamed MoE core carries an
+    /// empty `experts` vec (fetched on demand), which is valid here.
+    fn validate_ffn(&self, cfg: &BlockConfig) -> Result<()> {
+        let h = cfg.hidden_size;
+        match (&self.ffn, cfg.moe) {
+            (Ffn::Dense(f), None) => f.validate("ffn", h, cfg.intermediate_size),
+            (Ffn::Moe { router, experts, shared, shared_gate }, Some(m)) => {
+                let n = m.num_experts as usize;
+                let inter = m.moe_intermediate_size as usize;
+                if router.len() != n * h {
+                    return Err(DlmError::QuantLayout(format!(
+                        "router: expected {} elements, got {}",
+                        n * h,
+                        router.len()
+                    )));
+                }
+                for (e, ffn) in experts.iter().enumerate() {
+                    ffn.validate(&format!("expert[{e}]"), h, inter)?;
+                }
+                match (shared, m.shared_intermediate_size) {
+                    (Some(s), Some(si)) => {
+                        s.validate("shared_expert", h, si as usize)?;
+                        if let Some(g) = shared_gate {
+                            if g.len() != h {
+                                return Err(DlmError::QuantLayout(format!(
+                                    "shared_expert_gate: expected {h} elements, got {}",
+                                    g.len()
+                                )));
+                            }
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(DlmError::QuantLayout(
+                            "shared expert weights and shared_expert_intermediate_size disagree"
+                                .into(),
+                        ))
+                    }
+                }
+                Ok(())
+            }
+            (Ffn::Dense(_), Some(_)) => Err(DlmError::QuantLayout(
+                "dense FFN on a layer configured for MoE".into(),
+            )),
+            (Ffn::Moe { .. }, None) => Err(DlmError::QuantLayout(
+                "MoE FFN on a layer configured as dense".into(),
+            )),
+        }
     }
 
     /// All-zero projections with unit norms — a valid block that acts as the
@@ -437,9 +591,24 @@ impl LayerTensors {
             k_proj: Weights::zeros(cfg.kv_dim() * cfg.hidden_size),
             v_proj: Weights::zeros(cfg.kv_dim() * cfg.hidden_size),
             o_proj: Weights::zeros(cfg.hidden_size * cfg.q_dim()),
-            gate_proj: Weights::zeros(cfg.intermediate_size * cfg.hidden_size),
-            up_proj: Weights::zeros(cfg.intermediate_size * cfg.hidden_size),
-            down_proj: Weights::zeros(cfg.hidden_size * cfg.intermediate_size),
+            ffn: match cfg.moe {
+                None => Ffn::Dense(ExpertFfn::zeros(cfg.hidden_size, cfg.intermediate_size)),
+                Some(m) => {
+                    let inter = m.moe_intermediate_size as usize;
+                    Ffn::Moe {
+                        router: Weights::zeros(m.num_experts as usize * cfg.hidden_size),
+                        experts: (0..m.num_experts)
+                            .map(|_| ExpertFfn::zeros(cfg.hidden_size, inter))
+                            .collect(),
+                        shared: m
+                            .shared_intermediate_size
+                            .map(|si| ExpertFfn::zeros(cfg.hidden_size, si as usize)),
+                        shared_gate: m
+                            .shared_intermediate_size
+                            .map(|_| Weights::zeros(cfg.hidden_size)),
+                    }
+                }
+            },
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size],
             ..Default::default()
@@ -792,6 +961,92 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// One SwiGLU expert applied to `x`: `down · (silu(gate·x) ⊙ up·x)`, returning
+/// the `hidden`-wide contribution to the residual (the caller scales and adds it).
+fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+    let gate = matvec_native(&f.gate, x, inter, hidden);
+    let up = matvec_native(&f.up, x, inter, hidden);
+    let act: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
+    matvec_native(&f.down, &act, hidden, inter)
+}
+
+/// Select the top-`k` experts by routing probability and return
+/// `(expert_index, gate_weight)` pairs. Follows the Mixtral/Qwen recipe:
+/// softmax over **all** experts first, then take the top-k, then optionally
+/// renormalize the kept weights to sum to 1.
+///
+/// Shared with the streaming GPU kernel, which runs the router GEMV on-device,
+/// copies the logits back, and routes here so host and device agree exactly.
+pub(crate) fn route_topk(logits: &[f32], k: usize, norm: bool) -> Vec<(usize, f32)> {
+    let mut probs = logits.to_vec();
+    softmax_inplace(&mut probs);
+    let mut idx: Vec<usize> = (0..probs.len()).collect();
+    // Partial order is enough; NaN sorts last via unwrap_or(Equal).
+    idx.sort_unstable_by(|&a, &b| {
+        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.truncate(k.min(probs.len()));
+    let mut chosen: Vec<(usize, f32)> = idx.into_iter().map(|e| (e, probs[e])).collect();
+    if norm {
+        let sum: f32 = chosen.iter().map(|&(_, w)| w).sum();
+        if sum > 0.0 {
+            for (_, w) in &mut chosen {
+                *w /= sum;
+            }
+        }
+    }
+    chosen
+}
+
+/// The MoE feed-forward: route `x` (the post-attention-norm hidden) through the
+/// top-k experts, sum their SwiGLU outputs weighted by the gate, and add the
+/// shared expert (Qwen2-MoE) gated by its sigmoid. Returns the `hidden`-wide
+/// contribution to the residual.
+fn moe_ffn(
+    router: &Weights,
+    experts: &[ExpertFfn],
+    shared: Option<&ExpertFfn>,
+    shared_gate: Option<&Weights>,
+    x: &[f32],
+    cfg: &BlockConfig,
+) -> Result<Vec<f32>> {
+    let m = cfg.moe.ok_or_else(|| {
+        DlmError::QuantLayout("moe_ffn called on a layer without MoE config".into())
+    })?;
+    let hidden = cfg.hidden_size;
+    let inter = m.moe_intermediate_size as usize;
+    let logits = matvec_native(router, x, m.num_experts as usize, hidden);
+    let mut out = vec![0.0f32; hidden];
+    for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+        let expert = experts.get(e).ok_or_else(|| {
+            DlmError::QuantLayout(format!(
+                "router selected expert {e} but only {} are resident",
+                experts.len()
+            ))
+        })?;
+        let down = swiglu_ffn(expert, x, hidden, inter);
+        for (o, d) in out.iter_mut().zip(&down) {
+            *o += weight * d;
+        }
+    }
+    if let Some(s) = shared {
+        let si = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as usize;
+        // Sigmoid gate over the shared expert (Qwen2-MoE); ungated → weight 1.
+        let g = match shared_gate {
+            Some(gate) => {
+                let logit = matvec_native(gate, x, 1, hidden)[0];
+                1.0 / (1.0 + (-logit).exp())
+            }
+            None => 1.0,
+        };
+        let down = swiglu_ffn(s, x, hidden, si);
+        for (o, d) in out.iter_mut().zip(&down) {
+            *o += g * d;
+        }
+    }
+    Ok(out)
+}
+
 /// The RoPE inverse frequencies for one head: `head_dim / 2` values, with any
 /// declared [`RopeScaling`] already folded in.
 ///
@@ -937,14 +1192,21 @@ pub fn decode_block(
         .map(|(&a, &b)| a + b)
         .collect();
 
-    // ── MLP sublayer (SwiGLU) ──
+    // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
     let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
-    let gate = matvec_native(&w.gate_proj, &normed2, cfg.intermediate_size, cfg.hidden_size);
-    let up = matvec_native(&w.up_proj, &normed2, cfg.intermediate_size, cfg.hidden_size);
-    let inter: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
-    let down = matvec_native(&w.down_proj, &inter, cfg.hidden_size, cfg.intermediate_size);
+    let ffn_out = match &w.ffn {
+        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size),
+        Ffn::Moe { router, experts, shared, shared_gate } => moe_ffn(
+            router,
+            experts,
+            shared.as_ref(),
+            shared_gate.as_ref(),
+            &normed2,
+            cfg,
+        )?,
+    };
 
-    for (h, d) in h1.iter_mut().zip(&down) {
+    for (h, d) in h1.iter_mut().zip(&ffn_out) {
         *h += *d;
     }
     Ok(h1)
@@ -1007,6 +1269,7 @@ impl ComputeKernel for CpuKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MoeNaming;
 
     fn approx(a: &[f32], b: &[f32], eps: f32) {
         assert_eq!(a.len(), b.len());
@@ -1117,7 +1380,7 @@ mod tests {
             intermediate_size: 6,
             rope_theta: 10000.0,
             rms_eps: 1e-5,
-            rope_scaling: None,
+            rope_scaling: None, moe: None,
         };
         let hidden = vec![1.5, -2.0, 0.5, 3.0];
 
@@ -1153,7 +1416,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
@@ -1171,7 +1434,7 @@ mod tests {
             head_dim: 1,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
@@ -1189,7 +1452,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 6,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1223,7 +1486,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
@@ -1264,7 +1527,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
@@ -1289,11 +1552,173 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         // Wrong hidden length.
         assert!(decode_block(&cfg, &w, &[0.0; 3], &mut kv, 0).is_err());
+    }
+
+    // ── Mixture-of-Experts ──
+
+    fn moe_cfg(m: MoeConfig) -> BlockConfig {
+        BlockConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 2,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: Some(m),
+        }
+    }
+
+    #[test]
+    fn route_topk_selects_highest_and_renormalizes() {
+        // Softmax over all, then top-2. idx1 is largest, idx0 next, idx2 dropped.
+        let logits = [1.0f32, 2.0, 0.0];
+        let chosen = route_topk(&logits, 2, true);
+        assert_eq!(chosen.iter().map(|&(e, _)| e).collect::<Vec<_>>(), vec![1, 0]);
+        let sum: f32 = chosen.iter().map(|&(_, w)| w).sum();
+        assert!((sum - 1.0).abs() < 1e-6, "renormalized weights must sum to 1");
+
+        // Without renorm the kept probs are the raw softmax values (sum < 1,
+        // since the dropped expert carried some mass).
+        let raw = route_topk(&logits, 2, false);
+        let raw_sum: f32 = raw.iter().map(|&(_, w)| w).sum();
+        assert!(raw_sum < 0.9999, "unnormalized top-k must sum below 1: {raw_sum}");
+        // Relative ratio of the two kept weights is preserved by renormalization.
+        assert!((chosen[0].1 / chosen[1].1 - raw[0].1 / raw[1].1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn moe_routes_to_selected_expert_and_ignores_the_rest() {
+        // Two experts, top-1. A decisive router sends every token to expert 0, so
+        // the output must be independent of expert 1's weights entirely — the core
+        // guarantee of routing. Zero attention makes h1 == hidden.
+        let cfg = moe_cfg(MoeConfig {
+            num_experts: 2,
+            experts_per_tok: 1,
+            moe_intermediate_size: 2,
+            shared_intermediate_size: None,
+            norm_topk_prob: true,
+            naming: MoeNaming::Mixtral,
+        });
+        let hidden = vec![1.0f32, 1.0];
+
+        let mut w = LayerTensors::zeros(&cfg);
+        let e0 = ExpertFfn {
+            gate: Weights::from_f32(vec![1.0, 0.5, -0.5, 1.0]),
+            up: Weights::from_f32(vec![0.5, 0.5, 0.5, 0.5]),
+            down: Weights::from_f32(vec![1.0, 0.0, 0.0, 1.0]),
+        };
+        if let Ffn::Moe { router, experts, .. } = &mut w.ffn {
+            // logit0 = 10*(n0+n1), logit1 = -10*(n0+n1) ⇒ expert 0 wins decisively.
+            *router = Weights::from_f32(vec![10.0, 10.0, -10.0, -10.0]);
+            experts[0] = e0;
+            // experts[1] left as zeros for the first run.
+        }
+
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let with_zero_e1 = decode_block(&cfg, &w, &hidden, &mut kv, 0).unwrap();
+
+        // Expert 0 actually contributed — output moved off the residual.
+        assert!(
+            with_zero_e1.iter().zip(&hidden).any(|(a, b)| (a - b).abs() > 1e-6),
+            "selected expert had no effect"
+        );
+
+        // Now make expert 1 loud garbage. It is never routed to, so the output
+        // must not budge.
+        if let Ffn::Moe { experts, .. } = &mut w.ffn {
+            experts[1] = ExpertFfn {
+                gate: Weights::from_f32(vec![9.0, 9.0, 9.0, 9.0]),
+                up: Weights::from_f32(vec![9.0, 9.0, 9.0, 9.0]),
+                down: Weights::from_f32(vec![9.0, 9.0, 9.0, 9.0]),
+            };
+        }
+        let mut kv2 = KvLayerCache::new(cfg.kv_dim());
+        let with_loud_e1 = decode_block(&cfg, &w, &hidden, &mut kv2, 0).unwrap();
+        approx(&with_zero_e1, &with_loud_e1, 1e-6);
+    }
+
+    #[test]
+    fn moe_top2_is_gate_weighted_sum_of_experts() {
+        // Symmetric router ⇒ softmax [0.5, 0.5]; top-2 keeps both, so the output
+        // is exactly 0.5·expert0 + 0.5·expert1 on top of the residual.
+        let cfg = moe_cfg(MoeConfig {
+            num_experts: 2,
+            experts_per_tok: 2,
+            moe_intermediate_size: 2,
+            shared_intermediate_size: None,
+            norm_topk_prob: true,
+            naming: MoeNaming::Mixtral,
+        });
+        let hidden = vec![0.7f32, -1.3];
+        let mut w = LayerTensors::zeros(&cfg);
+        let e0 = ExpertFfn {
+            gate: Weights::from_f32(vec![0.3, -0.2, 0.1, 0.4]),
+            up: Weights::from_f32(vec![0.5, 0.1, -0.3, 0.2]),
+            down: Weights::from_f32(vec![1.0, 0.2, 0.1, -0.5]),
+        };
+        let e1 = ExpertFfn {
+            gate: Weights::from_f32(vec![-0.4, 0.6, 0.2, -0.1]),
+            up: Weights::from_f32(vec![0.2, -0.5, 0.3, 0.4]),
+            down: Weights::from_f32(vec![-0.2, 0.7, 0.5, 0.1]),
+        };
+        if let Ffn::Moe { router, experts, .. } = &mut w.ffn {
+            *router = Weights::zeros(4); // equal logits ⇒ equal 0.5 weights
+            experts[0] = e0.clone();
+            experts[1] = e1.clone();
+        }
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let out = decode_block(&cfg, &w, &hidden, &mut kv, 0).unwrap();
+
+        // Independent expected: attention is all-zero so h1 == hidden; the FFN
+        // input is rmsnorm(hidden, unit, eps); each expert's SwiGLU is weighted 0.5.
+        let normed2 = rmsnorm(&hidden, &w.post_attention_layernorm, cfg.rms_eps);
+        let d0 = swiglu_ffn(&e0, &normed2, cfg.hidden_size, 2);
+        let d1 = swiglu_ffn(&e1, &normed2, cfg.hidden_size, 2);
+        let expected: Vec<f32> = (0..cfg.hidden_size)
+            .map(|i| hidden[i] + 0.5 * d0[i] + 0.5 * d1[i])
+            .collect();
+        approx(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    fn moe_shared_expert_is_sigmoid_gated_and_added() {
+        // Qwen2-MoE shared expert: added on top of the routed output, scaled by
+        // sigmoid(shared_gate·x). A zero gate ⇒ sigmoid(0) = 0.5.
+        let cfg = moe_cfg(MoeConfig {
+            num_experts: 2,
+            experts_per_tok: 1,
+            moe_intermediate_size: 2,
+            shared_intermediate_size: Some(2),
+            norm_topk_prob: true,
+            naming: MoeNaming::Qwen,
+        });
+        let hidden = vec![1.0f32, 0.4];
+        let mut w = LayerTensors::zeros(&cfg);
+        let shared = ExpertFfn {
+            gate: Weights::from_f32(vec![0.6, -0.2, 0.3, 0.5]),
+            up: Weights::from_f32(vec![0.4, 0.1, -0.2, 0.3]),
+            down: Weights::from_f32(vec![0.9, 0.2, -0.1, 0.4]),
+        };
+        // Routed experts stay zero, so only the shared expert contributes.
+        if let Ffn::Moe { shared: s, shared_gate, .. } = &mut w.ffn {
+            *s = Some(shared.clone());
+            *shared_gate = Some(Weights::zeros(cfg.hidden_size)); // gate logit 0 ⇒ 0.5
+        }
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let out = decode_block(&cfg, &w, &hidden, &mut kv, 0).unwrap();
+
+        let normed2 = rmsnorm(&hidden, &w.post_attention_layernorm, cfg.rms_eps);
+        let sh = swiglu_ffn(&shared, &normed2, cfg.hidden_size, 2);
+        let expected: Vec<f32> =
+            (0..cfg.hidden_size).map(|i| hidden[i] + 0.5 * sh[i]).collect();
+        approx(&out, &expected, 1e-6);
     }
 }

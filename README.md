@@ -412,17 +412,30 @@ cargo run -- tokenize --text "Hello, world!"
 
 ### Supported models
 
-dlm implements the **Llama-style decoder block** and reads the standard
-`model.layers.{i}.{self_attn,mlp}.*` tensor names. That covers:
+dlm implements the **Llama-style decoder block** — dense and
+**Mixture-of-Experts** — and reads the standard `model.layers.{i}.*` tensor
+names. That covers:
 
 | Family | Status |
 |---|---|
 | Llama 2 / 3 / 3.1 / 3.2 | supported (incl. `llama3` RoPE scaling, GQA, tied embeddings) |
 | Mistral | supported |
 | Qwen2 / Qwen2.5 | supported (incl. the Q/K/V attention biases) |
-| Mixtral / any MoE | **not supported** — errors on the missing expert tensors |
+| Mixtral (and Mixtral-layout MoE) | supported — top-k routing over `block_sparse_moe.experts.*` |
+| Qwen2-MoE / Qwen3-MoE | supported — routed experts + optional sigmoid-gated shared expert |
 | GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
-| Gemma, Qwen3 | **not supported** — they need norm variants dlm does not implement |
+| DeepSeek-V2/V3 (MLA) | **not supported** — needs multi-head latent attention dlm does not implement |
+| Gemma, Qwen3 (dense) | **not supported** — they need norm variants dlm does not implement |
+
+**MoE models** route each token through the top-k experts the router selects
+(softmax over all experts, then top-k, then renormalized — the Mixtral/Qwen
+recipe). On the GPU streaming path only the experts a token actually uses are
+pulled into VRAM, cached per `(layer, expert)` and reused across tokens — so a
+sparse model moves far less over PCIe than its total parameter count implies.
+Because expert choice is data-dependent it can't be prefetched like the layer
+cycle, so a cold expert still costs a stream; quantize (`--quant`) to keep the
+hot set resident. On CPU and host streaming, a layer's experts ride along with
+it. Expert weights honor `--quant` exactly like dense weights.
 
 An unsupported architecture fails with a clear `UnknownTensor` error at load
 rather than producing garbage. A config declaring a `rope_scaling` type dlm does

@@ -472,7 +472,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
 mod tests {
     use super::*;
     use crate::forward::Weights;
-    use crate::forward::{BlockConfig, CpuKernel, LayerTensors};
+    use crate::forward::{BlockConfig, CpuKernel, ExpertFfn, Ffn, LayerTensors};
 
     /// A tiny deterministic model: identity transformer block, one-hot
     /// embedding, and an LM head that shifts the argmax by +1 (mod vocab), so
@@ -487,7 +487,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         // One identity (zero-weight) block: hidden passes through unchanged.
         let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
@@ -608,7 +608,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 32,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         };
         let mut r = SplitMix64::new(42);
         let mut vec = |n: usize| -> Vec<f32> {
@@ -619,9 +619,7 @@ mod tests {
             k_proj: Weights::from_f32(vec(cfg.kv_dim() * hidden)),
             v_proj: Weights::from_f32(vec(cfg.kv_dim() * hidden)),
             o_proj: Weights::from_f32(vec(hidden * cfg.q_dim())),
-            gate_proj: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
-            up_proj: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
-            down_proj: Weights::from_f32(vec(hidden * cfg.intermediate_size)),
+            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(vec(cfg.intermediate_size * hidden)), up: Weights::from_f32(vec(cfg.intermediate_size * hidden)), down: Weights::from_f32(vec(hidden * cfg.intermediate_size)) }),
             input_layernorm: std::vec::from_elem(1.0, hidden),
             post_attention_layernorm: std::vec::from_elem(1.0, hidden),
             ..Default::default()

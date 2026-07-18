@@ -71,6 +71,26 @@ struct RawConfig {
     /// to reject formats the dequantizer would otherwise mis-decode silently.
     #[serde(default)]
     quantization_config: Option<QuantizationConfig>,
+    // ── Mixture-of-Experts (MoE) fields; all absent on dense checkpoints. ──
+    /// Mixtral's expert count key.
+    #[serde(default)]
+    num_local_experts: Option<u32>,
+    /// Qwen-MoE's expert count key.
+    #[serde(default)]
+    num_experts: Option<u32>,
+    /// Experts routed per token (top-k). Required when the model is MoE.
+    #[serde(default)]
+    num_experts_per_tok: Option<u32>,
+    /// Per-expert FFN inner width (Qwen). Mixtral reuses `intermediate_size`.
+    #[serde(default)]
+    moe_intermediate_size: Option<u32>,
+    /// Shared-expert FFN inner width (Qwen2-MoE); absent on Qwen3-MoE & Mixtral.
+    #[serde(default)]
+    shared_expert_intermediate_size: Option<u32>,
+    /// Renormalize the top-k gate weights so they sum to 1. Mixtral always does;
+    /// Qwen exposes it as a flag.
+    #[serde(default)]
+    norm_topk_prob: Option<bool>,
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -206,12 +226,89 @@ fn parse_rope_scaling(r: &RawRopeScaling) -> Result<Option<RopeScaling>> {
     }
 }
 
+/// Derive validated [`MoeConfig`] from the raw config, or `None` for a dense
+/// model. Mixtral declares experts under `num_local_experts`, Qwen under
+/// `num_experts`; the presence of either marks the checkpoint MoE and also picks
+/// the tensor naming family. A model that declares experts but omits the top-k
+/// count is refused rather than guessed at — routing every token through the
+/// wrong number of experts is silent garbage, the worst failure mode.
+fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
+    let (num_experts, naming) = match (raw.num_local_experts, raw.num_experts) {
+        (Some(n), _) => (n, MoeNaming::Mixtral),
+        (None, Some(n)) => (n, MoeNaming::Qwen),
+        (None, None) => return Ok(None),
+    };
+    if num_experts == 0 {
+        return Ok(None); // an expert count of 0 is just a dense model
+    }
+    let experts_per_tok = raw.num_experts_per_tok.ok_or_else(|| {
+        DlmError::InvalidConfig(
+            "config declares experts but no num_experts_per_tok; dlm will not guess the \
+             routing top-k, as the wrong count produces plausible-looking garbage."
+                .into(),
+        )
+    })?;
+    if experts_per_tok == 0 || experts_per_tok > num_experts {
+        return Err(DlmError::InvalidConfig(format!(
+            "num_experts_per_tok ({experts_per_tok}) must be in 1..={num_experts}"
+        )));
+    }
+    // Mixtral has no separate expert width — its experts use `intermediate_size`.
+    let moe_intermediate_size = raw
+        .moe_intermediate_size
+        .or(raw.intermediate_size)
+        .ok_or_else(|| {
+            DlmError::InvalidConfig(
+                "MoE config declares neither moe_intermediate_size nor intermediate_size".into(),
+            )
+        })?;
+    Ok(Some(MoeConfig {
+        num_experts,
+        experts_per_tok,
+        moe_intermediate_size,
+        shared_intermediate_size: raw.shared_expert_intermediate_size,
+        // Mixtral always renormalizes; Qwen exposes the flag (default on).
+        norm_topk_prob: raw.norm_topk_prob.unwrap_or(true),
+        naming,
+    }))
+}
+
 /// `eos_token_id` as it appears in `config.json`: one id or a list of them.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum EosField {
     One(u32),
     Many(Vec<u32>),
+}
+
+/// Which family's tensor names an MoE checkpoint uses. Mixtral and Qwen lay the
+/// router and per-expert FFN out under different prefixes; the loader keys off
+/// this to build the right names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeNaming {
+    /// `block_sparse_moe.gate`, `block_sparse_moe.experts.{e}.{w1,w3,w2}`
+    /// (w1=gate, w3=up, w2=down). No shared expert.
+    Mixtral,
+    /// `mlp.gate`, `mlp.experts.{e}.{gate,up,down}_proj`, optional
+    /// `mlp.shared_expert.*` gated by `mlp.shared_expert_gate`.
+    Qwen,
+}
+
+/// Validated MoE geometry, present only on Mixture-of-Experts checkpoints.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeConfig {
+    /// Total routed experts per layer.
+    pub num_experts: u32,
+    /// Experts activated per token (top-k).
+    pub experts_per_tok: u32,
+    /// Per-expert FFN inner width.
+    pub moe_intermediate_size: u32,
+    /// Shared-expert FFN inner width, when the model has one (Qwen2-MoE).
+    pub shared_intermediate_size: Option<u32>,
+    /// Renormalize the top-k gate weights to sum to 1.
+    pub norm_topk_prob: bool,
+    /// Expert tensor naming family.
+    pub naming: MoeNaming,
 }
 
 /// Validated model geometry consumed by the profiler and storage planner.
@@ -250,6 +347,16 @@ pub struct ModelConfig {
     /// rather than as floats. Its codes are decoded as they are — no
     /// re-quantization — so the calibration the export paid for survives.
     pub packed_quant: Option<PackedQuant>,
+    /// Mixture-of-Experts geometry when the checkpoint is sparse; `None` for a
+    /// dense model, which keeps the single-FFN path unchanged.
+    pub moe: Option<MoeConfig>,
+}
+
+impl ModelConfig {
+    /// True when this is a Mixture-of-Experts checkpoint.
+    pub fn is_moe(&self) -> bool {
+        self.moe.is_some()
+    }
 }
 
 impl ModelConfig {
@@ -328,6 +435,8 @@ impl ModelConfig {
             None => None,
         };
 
+        let moe = build_moe_config(&raw)?;
+
         let config = ModelConfig {
             hidden_size: raw.hidden_size,
             num_attention_heads: raw.num_attention_heads,
@@ -353,6 +462,7 @@ impl ModelConfig {
             explicit_head_dim: raw.head_dim,
             quant,
             packed_quant,
+            moe,
         };
 
         config.validate()?;
@@ -411,7 +521,21 @@ impl ModelConfig {
 
         // q (h*h) + o (h*h) + k,v scaled by the GQA ratio (2 * kv_ratio * h*h).
         let attn = (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64;
-        let ffn = 3 * h * inter;
+        // FFN: one dense SwiGLU (3*h*inter), or per layer the full set of expert
+        // FFNs plus an optional shared expert for MoE. The catalog path measures
+        // real per-layer bytes; this estimate only backs the fallback planner.
+        let ffn = match &self.moe {
+            None => 3 * h * inter,
+            Some(m) => {
+                let moe_inter = m.moe_intermediate_size as u64;
+                let experts = 3 * h * moe_inter * m.num_experts as u64;
+                let router = h * m.num_experts as u64;
+                let shared = m
+                    .shared_intermediate_size
+                    .map_or(0, |s| 3 * h * s as u64 + h);
+                experts + router + shared
+            }
+        };
         let per_layer = attn + ffn;
 
         let blocks = per_layer * self.num_layers as u64;
