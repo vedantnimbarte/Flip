@@ -14,7 +14,7 @@ use dlm::cli::{
     Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs,
     PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
 };
-use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
+use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 use dlm::loader::ModelParts;
 use dlm::tokenizer::BpeTokenizer;
@@ -109,7 +109,7 @@ fn tiny_cfg() -> BlockConfig {
         head_dim: 4,
         intermediate_size: 16,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None,
     }
 }
 
@@ -164,9 +164,7 @@ fn gpu_parity_probe() -> Result<f32> {
         k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
         v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
         o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), s)),
-        gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
-        up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
-        down_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+        ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)) }),
         input_layernorm: vec![1.0; cfg.hidden_size],
         post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
     };
@@ -428,7 +426,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         head_dim,
         intermediate_size: args.intermediate_size,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None,
     };
 
     // Small random weights (RMSNorm keeps activations bounded).
@@ -440,9 +438,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
             k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, scale)),
             v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, scale)),
             o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), scale)),
-            gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
-            up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
-            down_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, scale)),
+            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)), down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, scale)) }),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
         })

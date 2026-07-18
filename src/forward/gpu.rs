@@ -62,6 +62,62 @@ extern "C" {
         num_positions: i32,
         position: i32,
     ) -> i32;
+
+    /// MoE layer, part 1: attention sublayer + post-attn norm. Leaves `normed2`
+    /// (the FFN input) in device scratch for [`dlm_moe_matvec`]/[`dlm_apply_expert`]
+    /// to consume on the same stream. See `src/gpu/kernels.cu`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_moe_attn(
+        hidden_size: i32,
+        q_dim: i32,
+        kv_dim: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        q_proj: *const c_void,
+        k_proj: *const c_void,
+        v_proj: *const c_void,
+        o_proj: *const c_void,
+        in_norm: *const f32,
+        post_norm: *const f32,
+        q_bias: *const f32,
+        k_bias: *const f32,
+        v_bias: *const f32,
+        inv_freq: *const f32,
+        x: *mut f32,
+        kv_keys: *mut f32,
+        kv_values: *mut f32,
+        num_positions: i32,
+        position: i32,
+    ) -> i32;
+
+    /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
+    /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
+    pub(crate) fn dlm_moe_matvec(
+        out_dim: i32,
+        hidden_size: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        w: *const c_void,
+        y_host: *mut f32,
+    ) -> i32;
+
+    /// MoE layer, part 3: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_apply_expert(
+        hidden_size: i32,
+        inter: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        gate: *const c_void,
+        up: *const c_void,
+        down: *const c_void,
+        weight: f32,
+        x: *mut f32,
+    ) -> i32;
 }
 
 /// Upload an optional bias, or `None` when the checkpoint has none. The kernel
@@ -105,14 +161,15 @@ struct GpuLayer {
 
 impl GpuLayer {
     fn upload(t: &LayerTensors, kv_buffer_len: usize) -> Result<Self> {
+        let ffn = t.dense_ffn()?;
         Ok(Self {
             q_proj: DeviceBuffer::from_bytes(t.q_proj.as_bytes(), t.q_proj.len())?,
             k_proj: DeviceBuffer::from_bytes(t.k_proj.as_bytes(), t.k_proj.len())?,
             v_proj: DeviceBuffer::from_bytes(t.v_proj.as_bytes(), t.v_proj.len())?,
             o_proj: DeviceBuffer::from_bytes(t.o_proj.as_bytes(), t.o_proj.len())?,
-            gate_proj: DeviceBuffer::from_bytes(t.gate_proj.as_bytes(), t.gate_proj.len())?,
-            up_proj: DeviceBuffer::from_bytes(t.up_proj.as_bytes(), t.up_proj.len())?,
-            down_proj: DeviceBuffer::from_bytes(t.down_proj.as_bytes(), t.down_proj.len())?,
+            gate_proj: DeviceBuffer::from_bytes(ffn.gate.as_bytes(), ffn.gate.len())?,
+            up_proj: DeviceBuffer::from_bytes(ffn.up.as_bytes(), ffn.up.len())?,
+            down_proj: DeviceBuffer::from_bytes(ffn.down.as_bytes(), ffn.down.len())?,
             input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
             post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
             q_bias: upload_bias(t.q_bias.as_ref())?,

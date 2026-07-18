@@ -42,6 +42,26 @@ pub trait LayerSource: Send + Sync {
     /// same layer to repeated callers without copying it — a layer is tens of MB,
     /// so cloning one per VRAM miss would cost as much as re-reading it.
     fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>>;
+
+    /// Materialize a layer's **core** — attention, norms, router and shared
+    /// expert, but *not* the routed experts. The per-expert streaming GPU path
+    /// pulls this so it doesn't drag every expert into host RAM just to run
+    /// attention; the routed experts come from [`load_expert`](Self::load_expert)
+    /// on demand. Defaults to the full [`load_layer`](Self::load_layer) — correct
+    /// for dense models and in-memory test sources, which have no separate experts.
+    fn load_layer_core(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+        self.load_layer(layer)
+    }
+
+    /// Materialize a single routed expert. Only MoE-aware sources implement this;
+    /// the default errors, since a dense or expert-inline source has nothing to
+    /// stream per-expert.
+    fn load_expert(&self, layer: u32, expert: u32) -> Result<Arc<crate::forward::ExpertFfn>> {
+        let _ = (layer, expert);
+        Err(crate::error::DlmError::InvalidConfig(
+            "this layer source does not provide per-expert streaming".into(),
+        ))
+    }
 }
 
 /// A [`LayerSource`] that keeps materialized layers in a byte-budgeted host-RAM
@@ -144,6 +164,18 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
             s.bytes += size;
         }
         Ok(t)
+    }
+
+    // MoE per-expert streaming forwards straight to the inner source. The GPU
+    // kernel keeps its own VRAM caches for cores and experts, so a second host-RAM
+    // tier here would only save re-dequant on a VRAM miss.
+    // ponytail: add a host-RAM expert cache if re-dequant on VRAM eviction shows up.
+    fn load_layer_core(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+        self.inner.load_layer_core(layer)
+    }
+
+    fn load_expert(&self, layer: u32, expert: u32) -> Result<Arc<crate::forward::ExpertFfn>> {
+        self.inner.load_expert(layer, expert)
     }
 }
 
@@ -467,6 +499,7 @@ mod tests {
     use super::*;
     use crate::forward::Weights;
     use crate::forward::CpuKernel;
+    use crate::forward::{ExpertFfn, Ffn};
 
     /// In-memory layer source for tests.
     struct VecSource(Vec<LayerTensors>);
@@ -487,7 +520,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 16,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None,
         }
     }
 
@@ -569,9 +602,7 @@ mod tests {
                     k_proj: Weights::from_f32(vec![s; c.kv_dim() * c.hidden_size]),
                     v_proj: Weights::from_f32(vec![s; c.kv_dim() * c.hidden_size]),
                     o_proj: Weights::from_f32(vec![s; c.hidden_size * c.q_dim()]),
-                    gate_proj: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
-                    up_proj: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
-                    down_proj: Weights::from_f32(vec![s; c.hidden_size * c.intermediate_size]),
+                    ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]), up: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]), down: Weights::from_f32(vec![s; c.hidden_size * c.intermediate_size]) }),
                     input_layernorm: vec![1.0; c.hidden_size],
                     post_attention_layernorm: vec![1.0; c.hidden_size], ..Default::default()
                 }

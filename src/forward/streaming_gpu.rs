@@ -19,7 +19,7 @@
 //! run the `cuda-kernels` suite on a real card before tagging a release.
 
 use crate::error::{DlmError, Result};
-use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
+use crate::forward::cpu::{route_topk, BlockConfig, ExpertFfn, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
 use crate::forward::streaming::{LayerSource, StreamStats};
 use crate::gpu::device::{synchronize_default, DeviceBuffer, Stream};
@@ -30,10 +30,49 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-// The device entry point is declared once in `forward::gpu` and imported here.
+// The device entry points are declared once in `forward::gpu` and imported here.
 // Restating the `extern` block let this path keep calling the old ABI after the
 // kernel signature changed — a silent mismatch the compiler only warns about.
-use crate::forward::gpu::{bias_ptr, dlm_decode_block, upload_bias};
+use crate::forward::gpu::{
+    bias_ptr, dlm_apply_expert, dlm_decode_block, dlm_moe_attn, dlm_moe_matvec, upload_bias,
+};
+
+/// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
+struct GpuExpert {
+    gate: DeviceBuffer,
+    up: DeviceBuffer,
+    down: DeviceBuffer,
+    w_dtype: i32,
+    w_group_size: i32,
+}
+
+impl GpuExpert {
+    fn upload(e: &ExpertFfn) -> Result<Self> {
+        Ok(Self {
+            gate: DeviceBuffer::from_bytes(e.gate.as_bytes(), e.gate.len())?,
+            up: DeviceBuffer::from_bytes(e.up.as_bytes(), e.up.len())?,
+            down: DeviceBuffer::from_bytes(e.down.as_bytes(), e.down.len())?,
+            w_dtype: e.gate.dtype_code(),
+            w_group_size: e.gate.group_size() as i32,
+        })
+    }
+}
+
+/// A layer's feed-forward weights in VRAM: a single dense MLP, or the MoE core
+/// (router + shared expert) — the routed experts stream separately into the
+/// per-`(layer, expert)` cache.
+enum GpuFfn {
+    Dense(GpuExpert),
+    Moe {
+        router: DeviceBuffer,
+        router_dtype: i32,
+        router_group: i32,
+        shared: Option<GpuExpert>,
+        shared_gate: Option<DeviceBuffer>,
+        shared_gate_dtype: i32,
+        shared_gate_group: i32,
+    },
+}
 
 /// One layer's weight buffers, resident in VRAM (no KV — that lives in `GpuKv`).
 struct GpuWeights {
@@ -41,9 +80,7 @@ struct GpuWeights {
     k_proj: DeviceBuffer,
     v_proj: DeviceBuffer,
     o_proj: DeviceBuffer,
-    gate_proj: DeviceBuffer,
-    up_proj: DeviceBuffer,
-    down_proj: DeviceBuffer,
+    ffn: GpuFfn,
     input_layernorm: DeviceBuffer,
     post_attention_layernorm: DeviceBuffer,
     /// Attention biases (Qwen2 et al.). Uploaded synchronously — a few KB each,
@@ -51,7 +88,7 @@ struct GpuWeights {
     q_bias: Option<DeviceBuffer>,
     k_bias: Option<DeviceBuffer>,
     v_bias: Option<DeviceBuffer>,
-    /// Native dtype of the projection weights (see `Weights::dtype_code`).
+    /// Native dtype of the attention projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
     w_group_size: i32,
@@ -63,22 +100,23 @@ impl GpuWeights {
     /// checkpoint dtype — they are staged and uploaded verbatim, so a bf16 layer
     /// puts half as many bytes across PCIe as an upsized f32 copy would. The two
     /// norms are f32 (a few KB; not worth a dtype path).
-    fn tensors(t: &LayerTensors) -> [(&[u8], usize); 9] {
+    fn tensors(t: &LayerTensors) -> Result<[(&[u8], usize); 9]> {
         use crate::forward::cpu::bytemuck_cast;
-        [
+        let ffn = t.dense_ffn()?;
+        Ok([
             (t.q_proj.as_bytes(), t.q_proj.len()),
             (t.k_proj.as_bytes(), t.k_proj.len()),
             (t.v_proj.as_bytes(), t.v_proj.len()),
             (t.o_proj.as_bytes(), t.o_proj.len()),
-            (t.gate_proj.as_bytes(), t.gate_proj.len()),
-            (t.up_proj.as_bytes(), t.up_proj.len()),
-            (t.down_proj.as_bytes(), t.down_proj.len()),
+            (ffn.gate.as_bytes(), ffn.gate.len()),
+            (ffn.up.as_bytes(), ffn.up.len()),
+            (ffn.down.as_bytes(), ffn.down.len()),
             (bytemuck_cast(&t.input_layernorm), t.input_layernorm.len()),
             (
                 bytemuck_cast(&t.post_attention_layernorm),
                 t.post_attention_layernorm.len(),
             ),
-        ]
+        ])
     }
 
     /// Total `f32` elements across a layer's weights (to size the staging buffer).
@@ -99,7 +137,7 @@ impl GpuWeights {
     /// wait doesn't stop the GPU. On return the uploads are complete and `staging`
     /// is free to reuse.
     fn upload_async(t: &LayerTensors, stream: &Stream, staging: &mut PinnedBuffer) -> Result<Self> {
-        let tensors = Self::tensors(t);
+        let tensors = Self::tensors(t)?;
         // Phase 1: stage all tensors into pinned memory, recording layout.
         // (byte offset, byte length, element count)
         let mut layout: Vec<(usize, usize, usize)> = Vec::with_capacity(9);
@@ -125,16 +163,67 @@ impl GpuWeights {
         // Wait for the copies (staging becomes reusable; weights are ready).
         stream.synchronize()?;
         let mut it = bufs.into_iter();
+        let q_proj = it.next().unwrap();
+        let k_proj = it.next().unwrap();
+        let v_proj = it.next().unwrap();
+        let o_proj = it.next().unwrap();
+        let gate = it.next().unwrap();
+        let up = it.next().unwrap();
+        let down = it.next().unwrap();
         Ok(Self {
-            q_proj: it.next().unwrap(),
-            k_proj: it.next().unwrap(),
-            v_proj: it.next().unwrap(),
-            o_proj: it.next().unwrap(),
-            gate_proj: it.next().unwrap(),
-            up_proj: it.next().unwrap(),
-            down_proj: it.next().unwrap(),
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            ffn: GpuFfn::Dense(GpuExpert {
+                gate,
+                up,
+                down,
+                w_dtype: t.q_proj.dtype_code(),
+                w_group_size: t.q_proj.group_size() as i32,
+            }),
             input_layernorm: it.next().unwrap(),
             post_attention_layernorm: it.next().unwrap(),
+            q_bias: upload_bias(t.q_bias.as_ref())?,
+            k_bias: upload_bias(t.k_bias.as_ref())?,
+            v_bias: upload_bias(t.v_bias.as_ref())?,
+            w_dtype: t.q_proj.dtype_code(),
+            w_group_size: t.q_proj.group_size() as i32,
+        })
+    }
+
+    /// Upload a MoE layer's **core** (attention, norms, router, shared expert)
+    /// synchronously. The routed experts are not here — they stream on demand
+    /// into the per-`(layer, expert)` cache. Synchronous per-tensor copies keep
+    /// this simple; the async pinned-staging path is a dense-only fast path.
+    ///
+    /// ponytail: MoE core uses plain `from_bytes` uploads, not the pinned async
+    /// staging the dense path uses. Wire the core through staging too if MoE
+    /// core-upload latency shows up in profiles.
+    fn upload_moe_core(t: &LayerTensors) -> Result<Self> {
+        let (router, experts, shared, shared_gate) = t.moe()?;
+        debug_assert!(experts.is_empty(), "GPU core must be loaded without routed experts");
+        let up = |w: &crate::forward::Weights| DeviceBuffer::from_bytes(w.as_bytes(), w.len());
+        let shared_gpu = shared.map(GpuExpert::upload).transpose()?;
+        let (sg_dtype, sg_group) = shared_gate
+            .map(|g| (g.dtype_code(), g.group_size() as i32))
+            .unwrap_or((0, 0));
+        Ok(Self {
+            q_proj: up(&t.q_proj)?,
+            k_proj: up(&t.k_proj)?,
+            v_proj: up(&t.v_proj)?,
+            o_proj: up(&t.o_proj)?,
+            ffn: GpuFfn::Moe {
+                router: up(router)?,
+                router_dtype: router.dtype_code(),
+                router_group: router.group_size() as i32,
+                shared: shared_gpu,
+                shared_gate: shared_gate.map(up).transpose()?,
+                shared_gate_dtype: sg_dtype,
+                shared_gate_group: sg_group,
+            },
+            input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
+            post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
             q_bias: upload_bias(t.q_bias.as_ref())?,
             k_bias: upload_bias(t.k_bias.as_ref())?,
             v_bias: upload_bias(t.v_bias.as_ref())?,
@@ -233,6 +322,59 @@ fn evict_index(order: &VecDeque<u32>, inserting: u32) -> Option<usize> {
     }
 }
 
+/// A bounded VRAM cache of routed MoE experts, keyed `(layer, expert)`.
+///
+/// Unlike the layer window this is a **true LRU**: expert selection is
+/// data-dependent, not a cyclic scan, and consecutive decode tokens reuse the
+/// same experts heavily — so evicting the least-recently-used expert keeps the
+/// hot set resident. A miss streams the expert from the checkpoint on demand;
+/// there is no prefetch, because which experts a token needs isn't known until
+/// its router runs.
+struct GpuExpertCache {
+    capacity: usize,
+    map: HashMap<(u32, u32), Arc<GpuExpert>>,
+    order: VecDeque<(u32, u32)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl GpuExpertCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn touch(&mut self, key: (u32, u32)) {
+        if let Some(pos) = self.order.iter().position(|&k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    fn insert(&mut self, key: (u32, u32), expert: Arc<GpuExpert>) {
+        while self.map.len() >= self.capacity {
+            // True LRU: evict the front (least-recently-used).
+            let Some(evict) = self.order.pop_front() else { break };
+            if evict == key {
+                // Don't evict the entry we're about to insert; try the next.
+                self.order.push_back(evict);
+                if self.order.len() <= 1 {
+                    break;
+                }
+                continue;
+            }
+            self.map.remove(&evict);
+        }
+        self.map.insert(key, expert);
+        self.order.push_back(key);
+    }
+}
+
 /// State shared between the compute thread and the prefetch worker.
 struct GpuShared<S: LayerSource> {
     cfg: BlockConfig,
@@ -244,6 +386,8 @@ struct GpuShared<S: LayerSource> {
     /// Page-locked staging buffer for async H2D. Guarded so concurrent uploaders
     /// (worker + a compute-path miss) don't clobber it mid-transfer.
     staging: Mutex<PinnedBuffer>,
+    /// VRAM cache of routed MoE experts (empty/unused for dense models).
+    experts: Mutex<GpuExpertCache>,
 }
 
 impl<S: LayerSource> GpuShared<S> {
@@ -264,14 +408,22 @@ impl<S: LayerSource> GpuShared<S> {
             }
             cache.loading.insert(layer);
             drop(cache);
-            // Expensive part — host load (disk + dequant) then async VRAM upload —
-            // runs with the cache lock released, so it overlaps the compute thread.
-            // The upload is enqueued on the non-blocking copy stream, so the PCIe
-            // transfer itself overlaps the default-stream kernel.
-            let uploaded = self.source.load_layer(layer).and_then(|t| {
-                let mut staging = self.staging.lock().unwrap();
-                GpuWeights::upload_async(&t, &self.copy_stream, &mut staging).map(Arc::new)
-            });
+            // Expensive part — host load (disk + dequant) then VRAM upload — runs
+            // with the cache lock released, so it overlaps the compute thread. The
+            // dense path stages through pinned memory on the non-blocking copy
+            // stream so the PCIe transfer overlaps the default-stream kernel; the
+            // MoE path uploads just the layer *core* (attention + router + shared),
+            // its routed experts streaming separately per `(layer, expert)`.
+            let uploaded = if self.cfg.moe.is_some() {
+                self.source
+                    .load_layer_core(layer)
+                    .and_then(|t| GpuWeights::upload_moe_core(&t).map(Arc::new))
+            } else {
+                self.source.load_layer(layer).and_then(|t| {
+                    let mut staging = self.staging.lock().unwrap();
+                    GpuWeights::upload_async(&t, &self.copy_stream, &mut staging).map(Arc::new)
+                })
+            };
             let mut cache = self.weights.lock().unwrap();
             cache.loading.remove(&layer);
             self.ready.notify_all();
@@ -297,6 +449,28 @@ impl<S: LayerSource> GpuShared<S> {
             cache.stats.misses += 1;
         }
         self.ensure(layer, false)
+    }
+
+    /// Ensure routed expert `(layer, expert)` is VRAM-resident, streaming it from
+    /// the checkpoint on a miss. Records hit/miss on the expert cache.
+    fn ensure_expert(&self, layer: u32, expert: u32) -> Result<Arc<GpuExpert>> {
+        {
+            let mut cache = self.experts.lock().unwrap();
+            if let Some(e) = cache.map.get(&(layer, expert)) {
+                let e = Arc::clone(e);
+                cache.hits += 1;
+                cache.touch((layer, expert));
+                return Ok(e);
+            }
+            cache.misses += 1;
+        }
+        // Load + upload without the cache lock. A rare concurrent double-load just
+        // uploads twice; both return a valid expert and the cache keeps the last.
+        let host = self.source.load_expert(layer, expert)?;
+        let gpu = Arc::new(GpuExpert::upload(&host)?);
+        let mut cache = self.experts.lock().unwrap();
+        cache.insert((layer, expert), Arc::clone(&gpu));
+        Ok(gpu)
     }
 }
 
@@ -339,6 +513,16 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         }
         // Page-locked staging sized to one layer's weights (all layers same size).
         let staging_bytes = GpuWeights::f32_count(&cfg) * std::mem::size_of::<f32>();
+        // Expert cache capacity: hold enough routed experts that per-token reuse
+        // hits rather than re-streams. Heuristic — a few tokens' worth across the
+        // resident window, capped at what the window could actually reference.
+        // ponytail: static heuristic. Make it a `--expert-cache-gb` budget if the
+        // hit rate is poor on real fine-grained (128-expert) models.
+        let expert_capacity = cfg.moe.map_or(1, |m| {
+            let per_tok = m.experts_per_tok as usize;
+            (per_tok * resident_layers.max(1) * 4)
+                .clamp(per_tok.max(1), m.num_experts as usize * resident_layers.max(1))
+        });
         let shared = Arc::new(GpuShared {
             cfg,
             source,
@@ -346,6 +530,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             ready: Condvar::new(),
             copy_stream: Stream::new_nonblocking()?,
             staging: Mutex::new(PinnedBuffer::with_len(staging_bytes)?),
+            experts: Mutex::new(GpuExpertCache::new(expert_capacity)),
         });
         let (tx, rx) = channel::<u32>();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -383,6 +568,150 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         let mut s = self.shared.weights.lock().unwrap().stats;
         s.depth = 1;
         s
+    }
+
+    /// The MoE FFN for one layer on the device: attention + router on the resident
+    /// core, then per-expert application streaming only the top-k experts a token
+    /// selects. Mirrors `moe_ffn` in `src/forward/cpu.rs`; the three device calls
+    /// share `normed2` via scratch on the in-order default stream.
+    fn run_moe_block(
+        &self,
+        layer: u32,
+        w: &GpuWeights,
+        dkv: &GpuKv,
+        d_hidden: &DeviceBuffer,
+        num_positions: usize,
+        position: usize,
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        let cfg = &self.shared.cfg;
+        let m = cfg.moe.expect("run_moe_block on a dense model");
+        let GpuFfn::Moe {
+            router,
+            router_dtype,
+            router_group,
+            shared,
+            shared_gate,
+            shared_gate_dtype,
+            shared_gate_group,
+        } = &w.ffn
+        else {
+            unreachable!("run_moe_block on a dense layer");
+        };
+
+        // 1. Attention sublayer + post-attn norm; leaves normed2 in device scratch.
+        let code = unsafe {
+            dlm_moe_attn(
+                cfg.hidden_size as i32,
+                cfg.q_dim() as i32,
+                cfg.kv_dim() as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                self.inv_freq.as_ptr(),
+                d_hidden.as_mut_ptr(),
+                dkv.keys.as_mut_ptr(),
+                dkv.values.as_mut_ptr(),
+                num_positions as i32,
+                position as i32,
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu { api: "dlm_moe_attn", code });
+        }
+
+        // 2. Router logits → host, then top-k + softmax on the host (matches CPU).
+        let n_exp = m.num_experts as usize;
+        let mut logits = vec![0f32; n_exp];
+        let code = unsafe {
+            dlm_moe_matvec(
+                n_exp as i32,
+                cfg.hidden_size as i32,
+                *router_dtype,
+                *router_group,
+                router.as_ptr() as *const c_void,
+                logits.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu { api: "dlm_moe_matvec", code });
+        }
+
+        // 3. Stream + apply each selected expert, scaled by its gate weight.
+        let inter = m.moe_intermediate_size as i32;
+        for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+            let expert = self.shared.ensure_expert(layer, e as u32)?;
+            let code = unsafe {
+                dlm_apply_expert(
+                    cfg.hidden_size as i32,
+                    inter,
+                    expert.w_dtype,
+                    expert.w_group_size,
+                    expert.gate.as_ptr() as *const c_void,
+                    expert.up.as_ptr() as *const c_void,
+                    expert.down.as_ptr() as *const c_void,
+                    weight,
+                    d_hidden.as_mut_ptr(),
+                )
+            };
+            if code != 0 {
+                return Err(DlmError::Gpu { api: "dlm_apply_expert", code });
+            }
+        }
+
+        // 4. Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
+        if let Some(sh) = shared {
+            let weight = match shared_gate {
+                Some(g) => {
+                    let mut logit = [0f32; 1];
+                    let code = unsafe {
+                        dlm_moe_matvec(
+                            1,
+                            cfg.hidden_size as i32,
+                            *shared_gate_dtype,
+                            *shared_gate_group,
+                            g.as_ptr() as *const c_void,
+                            logit.as_mut_ptr(),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu { api: "dlm_moe_matvec", code });
+                    }
+                    1.0 / (1.0 + (-logit[0]).exp())
+                }
+                None => 1.0,
+            };
+            let sinter = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as i32;
+            let code = unsafe {
+                dlm_apply_expert(
+                    cfg.hidden_size as i32,
+                    sinter,
+                    sh.w_dtype,
+                    sh.w_group_size,
+                    sh.gate.as_ptr() as *const c_void,
+                    sh.up.as_ptr() as *const c_void,
+                    sh.down.as_ptr() as *const c_void,
+                    weight,
+                    d_hidden.as_mut_ptr(),
+                )
+            };
+            if code != 0 {
+                return Err(DlmError::Gpu { api: "dlm_apply_expert", code });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -443,45 +772,49 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         // resident (this window) and KV lives on-device.
         let d_hidden = DeviceBuffer::from_slice(hidden)?;
 
-        // SAFETY: all pointers are live device allocations sized as the kernel
-        // expects; the KV buffers have capacity for `num_positions + 1`.
-        let code = unsafe {
-            dlm_decode_block(
-                cfg.hidden_size as i32,
-                cfg.q_dim() as i32,
-                kv_dim as i32,
-                cfg.num_heads as i32,
-                cfg.num_kv_heads as i32,
-                cfg.head_dim as i32,
-                cfg.intermediate_size as i32,
-                cfg.rms_eps,
-                w.w_dtype,
-                w.w_group_size,
-                w.q_proj.as_ptr() as *const std::ffi::c_void,
-                w.k_proj.as_ptr() as *const std::ffi::c_void,
-                w.v_proj.as_ptr() as *const std::ffi::c_void,
-                w.o_proj.as_ptr() as *const std::ffi::c_void,
-                w.gate_proj.as_ptr() as *const std::ffi::c_void,
-                w.up_proj.as_ptr() as *const std::ffi::c_void,
-                w.down_proj.as_ptr() as *const std::ffi::c_void,
-                w.input_layernorm.as_ptr(),
-                w.post_attention_layernorm.as_ptr(),
-                bias_ptr(&w.q_bias),
-                bias_ptr(&w.k_bias),
-                bias_ptr(&w.v_bias),
-                self.inv_freq.as_ptr(),
-                d_hidden.as_mut_ptr(),
-                dkv.keys.as_mut_ptr(),
-                dkv.values.as_mut_ptr(),
-                num_positions as i32,
-                position as i32,
-            )
-        };
-        if code != 0 {
-            return Err(DlmError::Gpu {
-                api: "dlm_decode_block",
-                code,
-            });
+        match &w.ffn {
+            GpuFfn::Dense(f) => {
+                // SAFETY: all pointers are live device allocations sized as the
+                // kernel expects; the KV buffers have capacity for `num_positions + 1`.
+                let code = unsafe {
+                    dlm_decode_block(
+                        cfg.hidden_size as i32,
+                        cfg.q_dim() as i32,
+                        kv_dim as i32,
+                        cfg.num_heads as i32,
+                        cfg.num_kv_heads as i32,
+                        cfg.head_dim as i32,
+                        cfg.intermediate_size as i32,
+                        cfg.rms_eps,
+                        w.w_dtype,
+                        w.w_group_size,
+                        w.q_proj.as_ptr() as *const std::ffi::c_void,
+                        w.k_proj.as_ptr() as *const std::ffi::c_void,
+                        w.v_proj.as_ptr() as *const std::ffi::c_void,
+                        w.o_proj.as_ptr() as *const std::ffi::c_void,
+                        f.gate.as_ptr() as *const std::ffi::c_void,
+                        f.up.as_ptr() as *const std::ffi::c_void,
+                        f.down.as_ptr() as *const std::ffi::c_void,
+                        w.input_layernorm.as_ptr(),
+                        w.post_attention_layernorm.as_ptr(),
+                        bias_ptr(&w.q_bias),
+                        bias_ptr(&w.k_bias),
+                        bias_ptr(&w.v_bias),
+                        self.inv_freq.as_ptr(),
+                        d_hidden.as_mut_ptr(),
+                        dkv.keys.as_mut_ptr(),
+                        dkv.values.as_mut_ptr(),
+                        num_positions as i32,
+                        position as i32,
+                    )
+                };
+                if code != 0 {
+                    return Err(DlmError::Gpu { api: "dlm_decode_block", code });
+                }
+            }
+            GpuFfn::Moe { .. } => {
+                self.run_moe_block(layer, &w, dkv, &d_hidden, num_positions, position)?;
+            }
         }
         // Wait only for the default (compute) stream, not the whole device, so an
         // in-flight weight upload on the copy stream keeps overlapping.

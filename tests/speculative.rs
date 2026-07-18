@@ -3,7 +3,7 @@
 use dlm::forward::Weights;
 use dlm::batching::BatchScheduler;
 use dlm::cache::KvCacheConfig;
-use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::forward::{BlockConfig, CpuKernel, ExpertFfn, Ffn, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 use dlm::speculative::{SpeculativeDecoder, SpeculativeSession};
 
@@ -37,7 +37,7 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None,
     };
     let mut rng = Rng::new(seed);
     let s = 0.05;
@@ -46,9 +46,7 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
         k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
         v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
         o_proj: Weights::from_f32(rng.vec(hidden * cfg.q_dim(), s)),
-        gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
-        up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
-        down_proj: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)),
+        ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)) }),
         input_layernorm: vec![1.0; hidden],
         post_attention_layernorm: vec![1.0; hidden], ..Default::default()
     }];

@@ -8,7 +8,7 @@
 use dlm::memory::{page_size, PinnedBuffer};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 use dlm::memory::PinKind;
-use dlm::model::{ModelConfig, QuantScheme};
+use dlm::model::{ModelConfig, MoeNaming, QuantScheme};
 use dlm::pipeline::{
     fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, MmapWeightSource,
     TieredWeightSource, WeightSource,
@@ -182,6 +182,46 @@ fn parses_eos_token_id_as_scalar_or_array() {
     let none = format!("{{{base}}}");
     let c = ModelConfig::from_json_bytes(none.as_bytes(), QuantScheme::Fp16).unwrap();
     assert!(c.eos_token_ids.is_empty());
+}
+
+#[test]
+fn detects_moe_families_and_dense() {
+    let base = r#""hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":128,"intermediate_size":32"#;
+
+    // Dense: no expert keys → moe is None.
+    let dense = format!("{{{base}}}");
+    let c = ModelConfig::from_json_bytes(dense.as_bytes(), QuantScheme::Fp16).unwrap();
+    assert!(!c.is_moe());
+
+    // Mixtral: num_local_experts, experts reuse intermediate_size, always renorm.
+    let mixtral = format!("{{{base},\"num_local_experts\":8,\"num_experts_per_tok\":2}}");
+    let m = ModelConfig::from_json_bytes(mixtral.as_bytes(), QuantScheme::Fp16)
+        .unwrap()
+        .moe
+        .expect("mixtral is moe");
+    assert_eq!(m.naming, MoeNaming::Mixtral);
+    assert_eq!(m.num_experts, 8);
+    assert_eq!(m.experts_per_tok, 2);
+    assert_eq!(m.moe_intermediate_size, 32); // falls back to intermediate_size
+    assert!(m.norm_topk_prob);
+    assert!(m.shared_intermediate_size.is_none());
+
+    // Qwen: num_experts + moe_intermediate_size + shared expert + explicit flag.
+    let qwen = format!(
+        "{{{base},\"num_experts\":60,\"num_experts_per_tok\":4,\"moe_intermediate_size\":8,\"shared_expert_intermediate_size\":20,\"norm_topk_prob\":false}}"
+    );
+    let q = ModelConfig::from_json_bytes(qwen.as_bytes(), QuantScheme::Fp16)
+        .unwrap()
+        .moe
+        .expect("qwen is moe");
+    assert_eq!(q.naming, MoeNaming::Qwen);
+    assert_eq!(q.moe_intermediate_size, 8);
+    assert_eq!(q.shared_intermediate_size, Some(20));
+    assert!(!q.norm_topk_prob);
+
+    // Experts declared but no top-k → refused, not guessed.
+    let bad = format!("{{{base},\"num_experts\":8}}");
+    assert!(ModelConfig::from_json_bytes(bad.as_bytes(), QuantScheme::Fp16).is_err());
 }
 
 #[test]
@@ -816,7 +856,7 @@ fn orchestrator_runs_real_cpu_block_autoregressively() {
         head_dim: 2,
         intermediate_size: 6,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None,
     };
     // Two zero-weight (identity) layers → hidden passes through unchanged.
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg); 2]).unwrap();

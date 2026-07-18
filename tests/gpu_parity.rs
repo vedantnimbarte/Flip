@@ -12,8 +12,8 @@
 use dlm::forward::Weights;
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::forward::{
-    BlockConfig, ComputeKernel, CpuKernel, ForwardOrchestrator, GpuKernel, KvLayerCache,
-    LayerSource, LayerTensors, StreamingGpuKernel,
+    BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, ForwardOrchestrator, GpuKernel,
+    KvLayerCache, LayerSource, LayerTensors, StreamingGpuKernel,
 };
 
 /// An in-memory layer source for the streaming GPU kernel.
@@ -60,9 +60,7 @@ fn random_layers(cfg: &BlockConfig, num_layers: u32, seed: u64) -> Vec<LayerTens
             k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
             v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
             o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), s)),
-            gate_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
-            up_proj: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
-            down_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)) }),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
         })
@@ -78,7 +76,7 @@ fn gpu_run_block_matches_cpu() {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None,
     };
     let num_layers = 2u32;
 
@@ -181,7 +179,7 @@ fn gpu_matches_cpu_with_int4_weights() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None,
+        rope_scaling: None, moe: None,
     };
     // Quantize the same random weights both kernels would otherwise share.
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
@@ -195,9 +193,11 @@ fn gpu_matches_cpu_with_int4_weights() {
             l.k_proj = q(&l.k_proj);
             l.v_proj = q(&l.v_proj);
             l.o_proj = q(&l.o_proj);
-            l.gate_proj = q(&l.gate_proj);
-            l.up_proj = q(&l.up_proj);
-            l.down_proj = q(&l.down_proj);
+            if let Ffn::Dense(f) = &mut l.ffn {
+                f.gate = q(&f.gate);
+                f.up = q(&f.up);
+                f.down = q(&f.down);
+            }
             l
         })
         .collect();
@@ -218,7 +218,7 @@ fn gpu_matches_cpu_with_int8_weights() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None,
+        rope_scaling: None, moe: None,
     };
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
         .into_iter()
@@ -232,9 +232,11 @@ fn gpu_matches_cpu_with_int8_weights() {
             l.k_proj = q(&l.k_proj);
             l.v_proj = q(&l.v_proj);
             l.o_proj = q(&l.o_proj);
-            l.gate_proj = q(&l.gate_proj);
-            l.up_proj = q(&l.up_proj);
-            l.down_proj = q(&l.down_proj);
+            if let Ffn::Dense(f) = &mut l.ffn {
+                f.gate = q(&f.gate);
+                f.up = q(&f.up);
+                f.down = q(&f.down);
+            }
             l
         })
         .collect();
@@ -255,7 +257,7 @@ fn gpu_matches_cpu_at_realistic_hidden_size() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None,
+        rope_scaling: None, moe: None,
     };
     let layers = random_layers(&cfg, 2, 0xA11CE);
     assert_gpu_matches_cpu(cfg, layers, 2e-3, "hidden_size=2048");
@@ -272,7 +274,7 @@ fn gpu_matches_cpu_with_qkv_biases() {
         intermediate_size: 128,
         rope_theta: 1_000_000.0,
         rms_eps: 1e-6,
-        rope_scaling: None,
+        rope_scaling: None, moe: None,
     };
     let mut rng = Rng::new(0xB1A5);
     let mut layers = random_layers(&cfg, 2, 0xB1A5);
@@ -302,6 +304,7 @@ fn gpu_matches_cpu_with_llama3_rope_scaling() {
             high_freq_factor: 4.0,
             original_max_position: 8192.0,
         }),
+        moe: None,
     };
     let layers = random_layers(&cfg, 2, 0x5CA1E);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "llama3 rope scaling");
@@ -315,7 +318,7 @@ fn small_cfg() -> BlockConfig {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None,
     }
 }
 
@@ -361,4 +364,148 @@ fn streaming_gpu_worker_prefetches() {
     k.run_block(0, &mut h, &mut kv, 0).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(80));
     assert!(k.stats().prefetched >= 1, "GPU worker should prefetch a layer: {:?}", k.stats());
+}
+
+// ── Mixture-of-Experts GPU parity ──
+//
+// The streaming GPU MoE path (dlm_moe_attn + router + per-expert dlm_apply_expert,
+// experts streamed per (layer, expert)) must match the CPU oracle's `moe_ffn`.
+
+use dlm::model::{MoeConfig, MoeNaming};
+
+/// In-memory MoE source: holds full layers (experts inline) and serves the GPU
+/// path a core (experts emptied) plus individual experts on demand.
+struct MoeVecSource(Vec<LayerTensors>);
+impl LayerSource for MoeVecSource {
+    fn num_layers(&self) -> u32 {
+        self.0.len() as u32
+    }
+    fn load_layer(&self, layer: u32) -> dlm::Result<std::sync::Arc<LayerTensors>> {
+        Ok(std::sync::Arc::new(self.0[layer as usize].clone()))
+    }
+    fn load_layer_core(&self, layer: u32) -> dlm::Result<std::sync::Arc<LayerTensors>> {
+        let mut t = self.0[layer as usize].clone();
+        if let Ffn::Moe { experts, .. } = &mut t.ffn {
+            experts.clear();
+        }
+        Ok(std::sync::Arc::new(t))
+    }
+    fn load_expert(&self, layer: u32, expert: u32) -> dlm::Result<std::sync::Arc<ExpertFfn>> {
+        match &self.0[layer as usize].ffn {
+            Ffn::Moe { experts, .. } => Ok(std::sync::Arc::new(experts[expert as usize].clone())),
+            Ffn::Dense(_) => panic!("load_expert on dense layer"),
+        }
+    }
+}
+
+fn random_moe_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> {
+    let mut rng = Rng::new(seed);
+    let m = cfg.moe.expect("moe cfg");
+    let h = cfg.hidden_size;
+    let inter = m.moe_intermediate_size as usize;
+    let s = 0.05;
+    let expert = |rng: &mut Rng| ExpertFfn {
+        gate: Weights::from_f32(rng.vec(inter * h, s)),
+        up: Weights::from_f32(rng.vec(inter * h, s)),
+        down: Weights::from_f32(rng.vec(h * inter, s)),
+    };
+    (0..n)
+        .map(|_| {
+            let shared_inter = m.shared_intermediate_size.map(|si| si as usize);
+            let ffn = Ffn::Moe {
+                router: Weights::from_f32(rng.vec(m.num_experts as usize * h, s)),
+                experts: (0..m.num_experts).map(|_| expert(&mut rng)).collect(),
+                shared: shared_inter.map(|si| ExpertFfn {
+                    gate: Weights::from_f32(rng.vec(si * h, s)),
+                    up: Weights::from_f32(rng.vec(si * h, s)),
+                    down: Weights::from_f32(rng.vec(h * si, s)),
+                }),
+                shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+            };
+            LayerTensors {
+                q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * h, s)),
+                k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+                v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+                o_proj: Weights::from_f32(rng.vec(h * cfg.q_dim(), s)),
+                ffn,
+                input_layernorm: vec![1.0; h],
+                post_attention_layernorm: vec![1.0; h],
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
+    let cfg = BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: Some(m),
+    };
+    let num_layers = 6u32;
+    let layers = random_moe_layers(&cfg, num_layers, 0x50FA);
+
+    // Resident CPU (all experts inline) vs streaming GPU (core resident window of
+    // 2, experts streamed per (layer, expert)).
+    let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers), 64, 2).unwrap();
+
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu =
+        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+    let mut orch_gpu =
+        ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+
+    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.02 - 0.3).collect();
+    let mut h_gpu = h_cpu.clone();
+    for step in 0..4 {
+        orch_cpu.decode_token(&mut h_cpu).unwrap();
+        orch_gpu.decode_token(&mut h_gpu).unwrap();
+        let max_diff =
+            h_cpu.iter().zip(&h_gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 2e-3, "{what}: step {step}: GPU MoE diverged by {max_diff}");
+    }
+}
+
+/// Mixtral-style: routed experts, no shared expert.
+#[test]
+fn gpu_moe_matches_cpu_routed_only() {
+    assert_moe_gpu_matches_cpu(
+        MoeConfig {
+            num_experts: 4,
+            experts_per_tok: 2,
+            moe_intermediate_size: 64,
+            shared_intermediate_size: None,
+            norm_topk_prob: true,
+            naming: MoeNaming::Mixtral,
+        },
+        "routed-only",
+    );
+}
+
+/// Qwen-style: routed experts plus a sigmoid-gated shared expert.
+#[test]
+fn gpu_moe_matches_cpu_with_shared_expert() {
+    assert_moe_gpu_matches_cpu(
+        MoeConfig {
+            num_experts: 4,
+            experts_per_tok: 2,
+            moe_intermediate_size: 64,
+            shared_intermediate_size: Some(64),
+            norm_topk_prob: true,
+            naming: MoeNaming::Qwen,
+        },
+        "shared-expert",
+    );
 }

@@ -24,8 +24,8 @@
 use crate::cache::KvCacheConfig;
 use crate::error::{DlmError, Result};
 use crate::forward::{
-    BlockConfig, CachedLayerSource, CpuKernel, LayerSource, LayerTensors, PipelineParallelKernel,
-    StreamingKernel, Weights,
+    BlockConfig, CachedLayerSource, CpuKernel, ExpertFfn, Ffn, LayerSource, LayerTensors,
+    PipelineParallelKernel, StreamingKernel, Weights,
 };
 use crate::generate::Generator;
 use crate::model::{ModelConfig, PackedQuant, QuantScheme};
@@ -356,6 +356,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         rope_theta: config.rope_theta,
         rms_eps: config.rms_eps,
         rope_scaling: config.rope_scaling,
+        moe: config.moe,
     }
 }
 
@@ -369,20 +370,41 @@ pub(crate) fn load_layer_tensors(
     quant: QuantScheme,
     packed: Option<PackedQuant>,
 ) -> Result<LayerTensors> {
+    load_layer_tensors_opt(store, cfg, layer, quant, packed, true)
+}
+
+/// Like [`load_layer_tensors`], but `include_experts = false` loads only the MoE
+/// **core** (attention, norms, router, shared expert) — the routed experts are
+/// left out for the GPU streaming path to fetch per `(layer, expert)`. No effect
+/// on dense models, which have no separate experts.
+pub(crate) fn load_layer_tensors_opt(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    layer: u32,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+    include_experts: bool,
+) -> Result<LayerTensors> {
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
     let intermediate = cfg.intermediate_size;
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     // load_linear takes (in_features, out_features) of the underlying Linear.
+    let ffn = match cfg.moe {
+        None => Ffn::Dense(ExpertFfn {
+            gate: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate, quant, packed)?,
+            up: load_linear(store, &name("mlp.up_proj"), hidden, intermediate, quant, packed)?,
+            down: load_linear(store, &name("mlp.down_proj"), intermediate, hidden, quant, packed)?,
+        }),
+        Some(_) => load_moe_ffn(store, cfg, layer, quant, packed, include_experts)?,
+    };
     let tensors = LayerTensors {
         q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant, packed)?,
         k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant, packed)?,
         v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
         o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
-        gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate, quant, packed)?,
-        up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate, quant, packed)?,
-        down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden, quant, packed)?,
+        ffn,
         input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
         post_attention_layernorm: load_tensor(
             store,
@@ -396,6 +418,101 @@ pub(crate) fn load_layer_tensors(
     };
     tensors.validate(cfg)?;
     Ok(tensors)
+}
+
+/// Tensor-name prefixes for one layer's MoE block, per family. `router` names the
+/// gating Linear; `expert(e)` the base of expert `e`'s three projections;
+/// `(gate, up, down)` the per-expert projection suffixes; `shared` the shared
+/// expert base and its sigmoid gate (Qwen2-MoE only).
+struct MoeNames {
+    router: String,
+    experts_base: String, // e.g. "…block_sparse_moe.experts" / "…mlp.experts"
+    proj: (&'static str, &'static str, &'static str), // (gate, up, down) suffixes
+    shared: Option<(String, String)>,                 // (shared_expert base, shared_gate)
+}
+
+fn moe_names(naming: crate::model::MoeNaming, layer: u32) -> MoeNames {
+    use crate::model::MoeNaming::*;
+    let p = format!("model.layers.{layer}");
+    match naming {
+        // Mixtral: block_sparse_moe.{gate, experts.N.{w1,w3,w2}}, no shared expert.
+        Mixtral => MoeNames {
+            router: format!("{p}.block_sparse_moe.gate"),
+            experts_base: format!("{p}.block_sparse_moe.experts"),
+            proj: ("w1", "w3", "w2"),
+            shared: None,
+        },
+        // Qwen: mlp.{gate, experts.N.{gate,up,down}_proj, shared_expert.*, shared_expert_gate}.
+        Qwen => MoeNames {
+            router: format!("{p}.mlp.gate"),
+            experts_base: format!("{p}.mlp.experts"),
+            proj: ("gate_proj", "up_proj", "down_proj"),
+            shared: Some((format!("{p}.mlp.shared_expert"), format!("{p}.mlp.shared_expert_gate"))),
+        },
+    }
+}
+
+/// Load one MoE expert's SwiGLU triple.
+fn load_expert(
+    store: &MmapStore,
+    base: &str,
+    proj: (&str, &str, &str),
+    hidden: usize,
+    inter: usize,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+) -> Result<ExpertFfn> {
+    Ok(ExpertFfn {
+        gate: load_linear(store, &format!("{base}.{}", proj.0), hidden, inter, quant, packed)?,
+        up: load_linear(store, &format!("{base}.{}", proj.1), hidden, inter, quant, packed)?,
+        down: load_linear(store, &format!("{base}.{}", proj.2), inter, hidden, quant, packed)?,
+    })
+}
+
+/// Build a layer's [`Ffn::Moe`]: the router, the routed experts (skipped when
+/// `include_experts` is false — the GPU streaming core defers them to its
+/// per-`(layer, expert)` cache), and any shared expert.
+///
+/// ponytail: the router is quantized like the rest under `--quant`. Routers are
+/// small and precision-sensitive; if int4 routing measurably flips top-k on real
+/// models, load it native instead. Left uniform until measured.
+pub(crate) fn load_moe_ffn(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    layer: u32,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+    include_experts: bool,
+) -> Result<Ffn> {
+    let m = cfg.moe.expect("load_moe_ffn requires MoE config");
+    let hidden = cfg.hidden_size;
+    let inter = m.moe_intermediate_size as usize;
+    let names = moe_names(m.naming, layer);
+
+    let router = load_linear(store, &names.router, hidden, m.num_experts as usize, quant, packed)?;
+    let experts = if include_experts {
+        (0..m.num_experts)
+            .map(|e| {
+                let base = format!("{}.{e}", names.experts_base);
+                load_expert(store, &base, names.proj, hidden, inter, quant, packed)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    let (shared, shared_gate) = match (m.shared_intermediate_size, &names.shared) {
+        (Some(si), Some((sbase, sgate))) => {
+            let si = si as usize;
+            let shared = load_expert(store, sbase, names.proj, hidden, si, quant, packed)?;
+            // shared_expert_gate is a Linear(hidden -> 1): weight is [1, hidden].
+            let gate = load_linear(store, sgate, hidden, 1, quant, packed)?;
+            (Some(shared), Some(gate))
+        }
+        _ => (None, None),
+    };
+
+    Ok(Ffn::Moe { router, experts, shared, shared_gate })
 }
 
 /// A [`LayerSource`] that streams layer weights out of a memory-mapped
@@ -417,6 +534,28 @@ impl LayerSource for MmapLayerSource {
     fn load_layer(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
         load_layer_tensors(&self.store, &self.cfg, layer, self.quant, self.packed)
             .map(std::sync::Arc::new)
+    }
+    fn load_layer_core(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
+        // Core only (no routed experts) for the per-expert streaming GPU path.
+        load_layer_tensors_opt(&self.store, &self.cfg, layer, self.quant, self.packed, false)
+            .map(std::sync::Arc::new)
+    }
+    fn load_expert(&self, layer: u32, expert: u32) -> Result<std::sync::Arc<ExpertFfn>> {
+        let m = self.cfg.moe.ok_or_else(|| {
+            DlmError::InvalidConfig("load_expert on a dense model".into())
+        })?;
+        let names = moe_names(m.naming, layer);
+        let base = format!("{}.{expert}", names.experts_base);
+        load_expert(
+            &self.store,
+            &base,
+            names.proj,
+            self.cfg.hidden_size,
+            m.moe_intermediate_size as usize,
+            self.quant,
+            self.packed,
+        )
+        .map(std::sync::Arc::new)
     }
 }
 
