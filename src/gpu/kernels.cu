@@ -205,6 +205,20 @@ __global__ void rope_kernel(float* v, int num_heads, int head_dim, int position,
     v[base + i + half] = a * s + b * c;
 }
 
+// Per-head RMSNorm over `head_dim` (Qwen3 Q/K norm), applied after projection and
+// before RoPE. One block per head; `w` is `[head_dim]` shared across heads.
+// Mirrors `head_rmsnorm` / `rmsnorm` in src/forward/cpu.rs.
+__global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int head_dim,
+                                    float eps) {
+    int h = blockIdx.x;
+    if (h >= num_heads) return;
+    float* head = v + (long)h * head_dim;
+    float ss = 0.0f;
+    for (int i = 0; i < head_dim; ++i) ss += head[i] * head[i];
+    float inv = rsqrtf(ss / (float)head_dim + eps);
+    for (int i = 0; i < head_dim; ++i) head[i] = head[i] * inv * w[i];
+}
+
 // Grouped-query attention over `positions` cached tokens. One thread per query
 // head; online softmax so no per-position scratch is needed.
 // `sliding_window > 0` bounds attention to the last `sliding_window` positions
@@ -337,6 +351,7 @@ extern "C" int dlm_decode_block(
     const void* gate_proj, const void* up_proj, const void* down_proj,
     const float* in_norm, const float* post_norm,
     const float* q_bias, const float* k_bias, const float* v_bias,  // may be NULL
+    const float* q_norm, const float* k_norm,  // Qwen3 per-head Q/K RMSNorm; may be NULL
     const float* inv_freq,                 // [head_dim/2], precomputed host-side
     float* x,                              // [hidden] in/out
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
@@ -375,6 +390,9 @@ extern "C" int dlm_decode_block(
         launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
+        // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
+        if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
+        if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
         rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
 
@@ -438,6 +456,7 @@ extern "C" int dlm_moe_attn(
     const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
     const float* in_norm, const float* post_norm,
     const float* q_bias, const float* k_bias, const float* v_bias,  // may be NULL
+    const float* q_norm, const float* k_norm,  // Qwen3 per-head Q/K RMSNorm; may be NULL
     const float* inv_freq,
     float* x,                              // [hidden] in/out (attn residual folded in)
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
@@ -466,6 +485,9 @@ extern "C" int dlm_moe_attn(
         launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
+        // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
+        if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
+        if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
         rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
