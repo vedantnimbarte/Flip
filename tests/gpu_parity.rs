@@ -250,6 +250,32 @@ fn gpu_sliding_window_matches_cpu() {
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "sliding-window");
 }
 
+/// Qwen3 per-head Q/K RMSNorm must match the CPU oracle: the device
+/// `head_rmsnorm_kernel` and CPU `head_rmsnorm` normalize each head identically
+/// before RoPE.
+#[test]
+fn gpu_qk_norm_matches_cpu() {
+    let cfg = BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: dlm::forward::Activation::Silu,
+    };
+    let mut layers = random_layers(&cfg, 2, 0x9317);
+    for l in &mut layers {
+        l.q_norm = Some((0..cfg.head_dim).map(|i| 0.9 + 0.02 * i as f32).collect());
+        l.k_norm = Some((0..cfg.head_dim).map(|i| 1.1 - 0.02 * i as f32).collect());
+    }
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "qk-norm");
+}
+
 /// Gemma's GeGLU (tanh-GELU gate) must match the CPU oracle: the device
 /// `swiglu_kernel` and CPU `activate()` compute the same tanh-approximate GELU.
 #[test]

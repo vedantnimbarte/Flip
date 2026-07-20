@@ -250,6 +250,15 @@ fn load_i32(store: &MmapStore, name: &str) -> Result<Vec<i32>> {
     crate::storage::bytes_to_i32(shard.tensor_bytes(name)?, info.dtype)
 }
 
+/// Read an optional f32 tensor by its full name, or `None` when absent (e.g.
+/// Qwen3's per-head Q/K norm weights, which most models don't ship).
+fn load_optional(store: &MmapStore, name: &str, len: usize) -> Result<Option<Vec<f32>>> {
+    if store.locate(name).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(load_tensor(store, name, len)?))
+}
+
 /// Read a linear layer's bias (`{base}.bias`) when the checkpoint ships one.
 ///
 /// Llama/Mistral have no attention biases; Qwen2 does. Returning `None` for an
@@ -440,6 +449,9 @@ pub(crate) fn load_layer_tensors_opt(
         q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
         k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
         v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
+        // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3.
+        q_norm: load_optional(store, &name("self_attn.q_norm.weight"), cfg.head_dim)?,
+        k_norm: load_optional(store, &name("self_attn.k_norm.weight"), cfg.head_dim)?,
     };
     tensors.validate(cfg)?;
     Ok(tensors)

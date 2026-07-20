@@ -419,13 +419,15 @@ names. That covers:
 | Family | Status |
 |---|---|
 | Llama 2 / 3 / 3.1 / 3.2 | supported (incl. `llama3` RoPE scaling, GQA, tied embeddings) |
-| Mistral | supported |
+| Mistral | supported (incl. sliding-window attention) |
 | Qwen2 / Qwen2.5 | supported (incl. the Q/K/V attention biases) |
+| Qwen3 (dense) | supported — per-head Q/K RMSNorm |
+| Gemma (v1) | supported — `(1+w)` RMSNorm, GeGLU, `sqrt(hidden)` embedding scaling |
 | Mixtral (and Mixtral-layout MoE) | supported — top-k routing over `block_sparse_moe.experts.*` |
 | Qwen2-MoE / Qwen3-MoE | supported — routed experts + optional sigmoid-gated shared expert |
 | GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
 | DeepSeek-V2/V3 (MLA) | **not supported** — needs multi-head latent attention dlm does not implement |
-| Gemma, Qwen3 (dense) | **not supported** — they need norm variants dlm does not implement |
+| Gemma2 | **not supported** — needs attention logit softcapping + alternating sliding-window layers |
 
 **MoE models** route each token through the top-k experts the router selects
 (softmax over all experts, then top-k, then renormalized — the Mixtral/Qwen

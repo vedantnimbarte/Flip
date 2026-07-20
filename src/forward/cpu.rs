@@ -447,6 +447,10 @@ pub struct LayerTensors {
     pub q_bias: Option<Vec<f32>>, // [q_dim]
     pub k_bias: Option<Vec<f32>>, // [kv_dim]
     pub v_bias: Option<Vec<f32>>, // [kv_dim]
+    /// Per-head Q/K RMSNorm weights (`[head_dim]`), applied after projection and
+    /// before RoPE. Qwen3 ships these (and drops the Qwen2 biases); `None` elsewhere.
+    pub q_norm: Option<Vec<f32>>, // [head_dim]
+    pub k_norm: Option<Vec<f32>>, // [head_dim]
 }
 
 impl LayerTensors {
@@ -519,6 +523,9 @@ impl LayerTensors {
             ("q_bias", self.q_bias.as_ref(), cfg.q_dim()),
             ("k_bias", self.k_bias.as_ref(), cfg.kv_dim()),
             ("v_bias", self.v_bias.as_ref(), cfg.kv_dim()),
+            // Qwen3 per-head Q/K norms are `[head_dim]` (shared across heads).
+            ("q_norm", self.q_norm.as_ref(), cfg.head_dim),
+            ("k_norm", self.k_norm.as_ref(), cfg.head_dim),
         ];
         for (name, bias, expected) in bias_checks {
             if let Some(b) = bias {
@@ -1007,6 +1014,16 @@ pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Apply RMSNorm independently to each `head_dim`-wide head of `v` (Qwen3 Q/K
+/// norm). `weight` is `[head_dim]`, shared across the `num_heads` heads.
+fn head_rmsnorm(v: &mut [f32], num_heads: usize, head_dim: usize, weight: &[f32], eps: f32) {
+    for h in 0..num_heads {
+        let head = &mut v[h * head_dim..(h + 1) * head_dim];
+        let normed = rmsnorm(head, weight, eps);
+        head.copy_from_slice(&normed);
+    }
+}
+
 /// In-place numerically-stable softmax.
 fn softmax_inplace(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -1375,6 +1392,14 @@ fn attention_sublayer(
     add_bias(&mut k, w.k_bias.as_ref());
     add_bias(&mut v, w.v_bias.as_ref());
 
+    // Qwen3 per-head Q/K RMSNorm, applied after projection and before RoPE.
+    if let Some(qn) = &w.q_norm {
+        head_rmsnorm(&mut q, cfg.num_heads, cfg.head_dim, qn, cfg.rms_eps);
+    }
+    if let Some(kn) = &w.k_norm {
+        head_rmsnorm(&mut k, cfg.num_kv_heads, cfg.head_dim, kn, cfg.rms_eps);
+    }
+
     let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
     rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, &inv_freq);
     rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, &inv_freq);
@@ -1552,6 +1577,14 @@ mod tests {
     fn silu_values() {
         assert!((silu(0.0)).abs() < 1e-6);
         assert!(silu(20.0) > 19.9); // ~x for large x
+    }
+
+    #[test]
+    fn head_rmsnorm_normalizes_each_head() {
+        // Two heads of dim 2: [3,4] and [6,8] (= 2×[3,4], so same after norm).
+        let mut v = vec![3.0, 4.0, 6.0, 8.0];
+        head_rmsnorm(&mut v, 2, 2, &[1.0, 1.0], 1e-6);
+        approx(&v, &[0.8485, 1.1314, 0.8485, 1.1314], 1e-3);
     }
 
     #[test]

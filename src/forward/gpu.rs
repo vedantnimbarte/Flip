@@ -55,6 +55,8 @@ extern "C" {
         q_bias: *const f32,
         k_bias: *const f32,
         v_bias: *const f32,
+        q_norm: *const f32,
+        k_norm: *const f32,
         inv_freq: *const f32,
         x: *mut f32,
         kv_keys: *mut f32,
@@ -90,6 +92,8 @@ extern "C" {
         q_bias: *const f32,
         k_bias: *const f32,
         v_bias: *const f32,
+        q_norm: *const f32,
+        k_norm: *const f32,
         inv_freq: *const f32,
         x: *mut f32,
         kv_keys: *mut f32,
@@ -159,6 +163,9 @@ struct GpuLayer {
     q_bias: Option<DeviceBuffer>,
     k_bias: Option<DeviceBuffer>,
     v_bias: Option<DeviceBuffer>,
+    /// Qwen3 per-head Q/K RMSNorm weights (NULL to the kernel when absent).
+    q_norm: Option<DeviceBuffer>,
+    k_norm: Option<DeviceBuffer>,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -181,6 +188,8 @@ impl GpuLayer {
             q_bias: upload_bias(t.q_bias.as_ref())?,
             k_bias: upload_bias(t.k_bias.as_ref())?,
             v_bias: upload_bias(t.v_bias.as_ref())?,
+            q_norm: upload_bias(t.q_norm.as_ref())?,
+            k_norm: upload_bias(t.k_norm.as_ref())?,
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
         })
@@ -309,6 +318,8 @@ impl ComputeKernel for GpuKernel {
                 bias_ptr(&w.q_bias),
                 bias_ptr(&w.k_bias),
                 bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
                 self.inv_freq.as_ptr(),
                 d_hidden.as_mut_ptr(),
                 kv_keys,
