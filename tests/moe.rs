@@ -163,6 +163,29 @@ fn mixtral_moe_loads_and_runs() {
     run_family(Family::Mixtral);
 }
 
+/// Under `--quant int4`, the routed experts are quantized but the router stays in
+/// its native precision — quantizing the router can flip top-k routing, silently
+/// degrading the model, so it is kept exact.
+#[test]
+fn moe_router_stays_native_under_quant() {
+    use dlm::forward::Ffn;
+    let tmp = tempfile::tempdir().unwrap();
+    write_moe_checkpoint(tmp.path(), Family::Mixtral); // writes safetensors + config.json
+    // Re-load the config at int4 (the checkpoint itself is F32 floats on disk).
+    let config_json = std::fs::read(tmp.path().join("config.json")).unwrap();
+    let config = ModelConfig::from_json_bytes(&config_json, QuantScheme::Int4).unwrap();
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let parts = dlm::loader::load_model_parts(&store, &config, 32).unwrap();
+    match &parts.layers[0].ffn {
+        Ffn::Moe { router, experts, .. } => {
+            // dtype_code 3 == Int4. Router must NOT be int4; experts must be.
+            assert_ne!(router.dtype_code(), 3, "router should stay native under --quant int4");
+            assert_eq!(experts[0].gate.dtype_code(), 3, "experts should be quantized to int4");
+        }
+        _ => panic!("expected a MoE layer"),
+    }
+}
+
 #[test]
 fn qwen_moe_with_shared_expert_loads_and_runs() {
     run_family(Family::Qwen);

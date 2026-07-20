@@ -490,7 +490,19 @@ pub(crate) fn load_moe_ffn(
     let inter = m.moe_intermediate_size as usize;
     let names = moe_names(m.naming, layer);
 
-    let router = load_linear(store, &names.router, hidden, m.num_experts as usize, quant, packed)?;
+    // The router is precision-sensitive: quantizing it can flip which experts a
+    // token routes to, silently degrading a sparse model, and it is tiny
+    // (`hidden × num_experts`) so keeping it native costs almost nothing. For a
+    // float checkpoint that `--quant` would quantize, load the router in its
+    // native dtype instead. (A packed GPTQ checkpoint's router keeps its own
+    // calibrated int4 codes — there is no float to fall back to.)
+    let router_quant = if packed.is_none() && matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
+        QuantScheme::Fp16 // sentinel: load_native reads the real dtype, doesn't quantize
+    } else {
+        quant
+    };
+    let router =
+        load_linear(store, &names.router, hidden, m.num_experts as usize, router_quant, packed)?;
     let experts = if include_experts {
         (0..m.num_experts)
             .map(|e| {
