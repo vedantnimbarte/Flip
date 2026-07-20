@@ -119,6 +119,55 @@ extern "C" {
         y_host: *mut f32,
     ) -> i32;
 
+    /// Multi-head Latent Attention sublayer (DeepSeek). All attention-projection
+    /// weights share `w_dtype`. `q_a_proj`/`q_a_layernorm` may be null (no query
+    /// low-rank). `kv_keys` is the per-session cache (width `kv_lora_rank +
+    /// qk_rope`); `x` gets the attention residual folded in. See `src/gpu/kernels.cu`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_mla_attn(
+        hidden_size: i32,
+        num_heads: i32,
+        q_lora_rank: i32,
+        kv_lora_rank: i32,
+        qk_nope: i32,
+        qk_rope: i32,
+        v_head_dim: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        q_a_proj: *const c_void,
+        q_a_layernorm: *const f32,
+        q_b_proj: *const c_void,
+        kv_a_proj: *const c_void,
+        kv_a_layernorm: *const f32,
+        kv_b_proj: *const c_void,
+        o_proj: *const c_void,
+        in_norm: *const f32,
+        inv_freq: *const f32,
+        rope_mscale: f32,
+        x: *mut f32,
+        kv_keys: *mut f32,
+        num_positions: i32,
+        position: i32,
+    ) -> i32;
+
+    /// Dense gated-MLP FFN sublayer on its own (`x += down·(act(gate·norm) ⊙
+    /// up·norm)`), for the MLA path whose attention is a separate call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_dense_ffn(
+        hidden_size: i32,
+        inter: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        gate_proj: *const c_void,
+        up_proj: *const c_void,
+        down_proj: *const c_void,
+        post_norm: *const f32,
+        activation: i32,
+        x: *mut f32,
+    ) -> i32;
+
     /// MoE layer, part 3: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dlm_apply_expert(
@@ -170,23 +219,65 @@ struct GpuLayer {
     /// Qwen3 per-head Q/K RMSNorm weights (NULL to the kernel when absent).
     q_norm: Option<DeviceBuffer>,
     k_norm: Option<DeviceBuffer>,
+    /// MLA (DeepSeek) attention projections; `None` for standard attention (when
+    /// set, `q_proj`/`k_proj`/`v_proj` are unused dummies).
+    mla: Option<GpuMla>,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
     w_group_size: i32,
 }
 
+/// MLA attention projections resident in VRAM.
+struct GpuMla {
+    q_a_proj: Option<DeviceBuffer>,
+    q_a_layernorm: Option<DeviceBuffer>,
+    q_b_proj: DeviceBuffer,
+    kv_a_proj: DeviceBuffer,
+    kv_a_layernorm: DeviceBuffer,
+    kv_b_proj: DeviceBuffer,
+}
+
+impl GpuMla {
+    fn upload(mw: &crate::forward::MlaWeights) -> Result<Self> {
+        let up = |w: &crate::forward::Weights| DeviceBuffer::from_bytes(w.as_bytes(), w.len());
+        Ok(Self {
+            q_a_proj: mw.q_a_proj.as_ref().map(up).transpose()?,
+            q_a_layernorm: upload_bias(mw.q_a_layernorm.as_ref())?,
+            q_b_proj: up(&mw.q_b_proj)?,
+            kv_a_proj: up(&mw.kv_a_proj)?,
+            kv_a_layernorm: DeviceBuffer::from_slice(&mw.kv_a_layernorm)?,
+            kv_b_proj: up(&mw.kv_b_proj)?,
+        })
+    }
+}
+
+/// Upload a weight matrix, or a 1-element dummy for an intentionally-empty one
+/// (MLA layers leave q/k/v empty) — device allocators dislike zero-length buffers.
+fn upload_weight(w: &crate::forward::Weights) -> Result<DeviceBuffer> {
+    if w.is_empty() {
+        DeviceBuffer::from_slice(&[0.0])
+    } else {
+        DeviceBuffer::from_bytes(w.as_bytes(), w.len())
+    }
+}
+
 impl GpuLayer {
     fn upload(t: &LayerTensors) -> Result<Self> {
         let ffn = t.dense_ffn()?;
+        // MLA layers carry their attention dtype on the MLA weights, not q_proj.
+        let (w_dtype, w_group_size) = match &t.mla {
+            Some(mw) => (mw.q_b_proj.dtype_code(), mw.q_b_proj.group_size() as i32),
+            None => (t.q_proj.dtype_code(), t.q_proj.group_size() as i32),
+        };
         Ok(Self {
-            q_proj: DeviceBuffer::from_bytes(t.q_proj.as_bytes(), t.q_proj.len())?,
-            k_proj: DeviceBuffer::from_bytes(t.k_proj.as_bytes(), t.k_proj.len())?,
-            v_proj: DeviceBuffer::from_bytes(t.v_proj.as_bytes(), t.v_proj.len())?,
-            o_proj: DeviceBuffer::from_bytes(t.o_proj.as_bytes(), t.o_proj.len())?,
-            gate_proj: DeviceBuffer::from_bytes(ffn.gate.as_bytes(), ffn.gate.len())?,
-            up_proj: DeviceBuffer::from_bytes(ffn.up.as_bytes(), ffn.up.len())?,
-            down_proj: DeviceBuffer::from_bytes(ffn.down.as_bytes(), ffn.down.len())?,
+            q_proj: upload_weight(&t.q_proj)?,
+            k_proj: upload_weight(&t.k_proj)?,
+            v_proj: upload_weight(&t.v_proj)?,
+            o_proj: upload_weight(&t.o_proj)?,
+            gate_proj: upload_weight(&ffn.gate)?,
+            up_proj: upload_weight(&ffn.up)?,
+            down_proj: upload_weight(&ffn.down)?,
             input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
             post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
             q_bias: upload_bias(t.q_bias.as_ref())?,
@@ -194,8 +285,9 @@ impl GpuLayer {
             v_bias: upload_bias(t.v_bias.as_ref())?,
             q_norm: upload_bias(t.q_norm.as_ref())?,
             k_norm: upload_bias(t.k_norm.as_ref())?,
-            w_dtype: t.q_proj.dtype_code(),
-            w_group_size: t.q_proj.group_size() as i32,
+            mla: t.mla.as_ref().map(GpuMla::upload).transpose()?,
+            w_dtype,
+            w_group_size,
         })
     }
 }
@@ -216,16 +308,21 @@ pub struct GpuKernel {
     /// layer (a synchronizing driver call in the hot path). Sound because a given
     /// kernel instance is driven by a single inference thread, one layer at a time.
     d_hidden: DeviceBuffer,
+    /// MLA decoupled-RoPE frequencies (over `qk_rope_head_dim`); `None` for
+    /// standard attention.
+    mla_inv_freq: Option<DeviceBuffer>,
 }
 
 impl GpuKernel {
     /// Upload a model's weights to the device and allocate per-layer KV history
     /// buffers sized for up to `max_kv_tokens` positions.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>, max_kv_tokens: usize) -> Result<Self> {
-        if cfg.mla.is_some() {
+        // MLA + MoE on GPU (DeepSeek-V2/V3 full) needs the streamed MoE path with
+        // MLA, still pending; the resident kernel supports MLA with a dense FFN.
+        if cfg.mla.is_some() && cfg.moe.is_some() {
             return Err(DlmError::InvalidConfig(
-                "Multi-head Latent Attention (MLA / DeepSeek) is not yet supported on the GPU; \
-                 run MLA models on CPU (--device cpu)."
+                "MLA + MoE (DeepSeek-V2/V3) on the resident GPU kernel is not yet supported; \
+                 run on CPU (--device cpu)."
                     .into(),
             ));
         }
@@ -240,6 +337,15 @@ impl GpuKernel {
             cfg.rope_theta,
             cfg.rope_scaling,
         ))?;
+        // MLA rotates only its qk_rope sub-dimension.
+        let mla_inv_freq = match &cfg.mla {
+            Some(m) => Some(DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
+                m.qk_rope_head_dim as usize,
+                cfg.rope_theta,
+                cfg.rope_scaling,
+            ))?),
+            None => None,
+        };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         Ok(Self {
             cfg,
@@ -247,6 +353,7 @@ impl GpuKernel {
             inv_freq,
             kv_capacity_tokens: cap,
             d_hidden,
+            mla_inv_freq,
         })
     }
 }
@@ -305,48 +412,101 @@ impl ComputeKernel for GpuKernel {
 
         // SAFETY: all pointers are live device allocations of the sizes the
         // kernel expects; kv buffers have capacity for `num_positions + 1`.
-        let code = unsafe {
-            dlm_decode_block(
-                self.cfg.hidden_size as i32,
-                self.cfg.q_dim() as i32,
-                kv_dim as i32,
-                self.cfg.num_heads as i32,
-                self.cfg.num_kv_heads as i32,
-                self.cfg.head_dim as i32,
-                self.cfg.intermediate_size as i32,
-                self.cfg.rms_eps,
-                w.w_dtype,
-                w.w_group_size,
-                w.q_proj.as_ptr() as *const c_void,
-                w.k_proj.as_ptr() as *const c_void,
-                w.v_proj.as_ptr() as *const c_void,
-                w.o_proj.as_ptr() as *const c_void,
-                w.gate_proj.as_ptr() as *const c_void,
-                w.up_proj.as_ptr() as *const c_void,
-                w.down_proj.as_ptr() as *const c_void,
-                w.input_layernorm.as_ptr(),
-                w.post_attention_layernorm.as_ptr(),
-                bias_ptr(&w.q_bias),
-                bias_ptr(&w.k_bias),
-                bias_ptr(&w.v_bias),
-                bias_ptr(&w.q_norm),
-                bias_ptr(&w.k_norm),
-                self.inv_freq.as_ptr(),
-                d_hidden.as_mut_ptr(),
-                kv_keys,
-                kv_values,
-                num_positions as i32,
-                position as i32,
-                self.cfg.sliding_window.unwrap_or(0) as i32,
-                self.cfg.activation.code(),
-                crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
-            )
-        };
-        if code != 0 {
-            return Err(DlmError::Gpu {
-                api: "dlm_decode_block",
-                code,
-            });
+        match (&self.cfg.mla, &w.mla) {
+            (Some(m), Some(mw)) => {
+                // MLA attention (compressed-latent) + a separate dense FFN.
+                let code = unsafe {
+                    dlm_mla_attn(
+                        self.cfg.hidden_size as i32,
+                        self.cfg.num_heads as i32,
+                        m.q_lora_rank.unwrap_or(0) as i32,
+                        m.kv_lora_rank as i32,
+                        m.qk_nope_head_dim as i32,
+                        m.qk_rope_head_dim as i32,
+                        m.v_head_dim as i32,
+                        self.cfg.rms_eps,
+                        w.w_dtype,
+                        w.w_group_size,
+                        mw.q_a_proj.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()) as *const c_void,
+                        bias_ptr(&mw.q_a_layernorm),
+                        mw.q_b_proj.as_ptr() as *const c_void,
+                        mw.kv_a_proj.as_ptr() as *const c_void,
+                        mw.kv_a_layernorm.as_ptr(),
+                        mw.kv_b_proj.as_ptr() as *const c_void,
+                        w.o_proj.as_ptr() as *const c_void,
+                        w.input_layernorm.as_ptr(),
+                        self.mla_inv_freq.as_ref().unwrap().as_ptr(),
+                        crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
+                        d_hidden.as_mut_ptr(),
+                        kv_keys,
+                        num_positions as i32,
+                        position as i32,
+                    )
+                };
+                if code != 0 {
+                    return Err(DlmError::Gpu { api: "dlm_mla_attn", code });
+                }
+                let code = unsafe {
+                    dlm_dense_ffn(
+                        self.cfg.hidden_size as i32,
+                        self.cfg.intermediate_size as i32,
+                        self.cfg.rms_eps,
+                        w.w_dtype,
+                        w.w_group_size,
+                        w.gate_proj.as_ptr() as *const c_void,
+                        w.up_proj.as_ptr() as *const c_void,
+                        w.down_proj.as_ptr() as *const c_void,
+                        w.post_attention_layernorm.as_ptr(),
+                        self.cfg.activation.code(),
+                        d_hidden.as_mut_ptr(),
+                    )
+                };
+                if code != 0 {
+                    return Err(DlmError::Gpu { api: "dlm_dense_ffn", code });
+                }
+            }
+            _ => {
+                let code = unsafe {
+                    dlm_decode_block(
+                        self.cfg.hidden_size as i32,
+                        self.cfg.q_dim() as i32,
+                        kv_dim as i32,
+                        self.cfg.num_heads as i32,
+                        self.cfg.num_kv_heads as i32,
+                        self.cfg.head_dim as i32,
+                        self.cfg.intermediate_size as i32,
+                        self.cfg.rms_eps,
+                        w.w_dtype,
+                        w.w_group_size,
+                        w.q_proj.as_ptr() as *const c_void,
+                        w.k_proj.as_ptr() as *const c_void,
+                        w.v_proj.as_ptr() as *const c_void,
+                        w.o_proj.as_ptr() as *const c_void,
+                        w.gate_proj.as_ptr() as *const c_void,
+                        w.up_proj.as_ptr() as *const c_void,
+                        w.down_proj.as_ptr() as *const c_void,
+                        w.input_layernorm.as_ptr(),
+                        w.post_attention_layernorm.as_ptr(),
+                        bias_ptr(&w.q_bias),
+                        bias_ptr(&w.k_bias),
+                        bias_ptr(&w.v_bias),
+                        bias_ptr(&w.q_norm),
+                        bias_ptr(&w.k_norm),
+                        self.inv_freq.as_ptr(),
+                        d_hidden.as_mut_ptr(),
+                        kv_keys,
+                        kv_values,
+                        num_positions as i32,
+                        position as i32,
+                        self.cfg.sliding_window.unwrap_or(0) as i32,
+                        self.cfg.activation.code(),
+                        crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
+                    )
+                };
+                if code != 0 {
+                    return Err(DlmError::Gpu { api: "dlm_decode_block", code });
+                }
+            }
         }
         // `download` is a blocking cudaMemcpy(D2H), so it already waits for the
         // stack's kernels — no separate synchronize() needed. Only the last layer

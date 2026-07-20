@@ -250,6 +250,62 @@ fn gpu_sliding_window_matches_cpu() {
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "sliding-window");
 }
 
+/// Multi-head Latent Attention (DeepSeek, dense FFN) must match the CPU oracle:
+/// the device `dlm_mla_attn` + `dlm_dense_ffn` reproduce `mla_attention_sublayer`
+/// (compressed-latent KV, on-the-fly reconstruction, decoupled RoPE).
+#[test]
+fn gpu_mla_matches_cpu() {
+    use dlm::forward::MlaWeights;
+    use dlm::model::MlaConfig;
+    let mla = MlaConfig {
+        q_lora_rank: Some(12),
+        kv_lora_rank: 8,
+        qk_nope_head_dim: 4,
+        qk_rope_head_dim: 4,
+        v_head_dim: 4,
+    };
+    let cfg = BlockConfig {
+        hidden_size: 16,
+        num_heads: 2,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 16,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: dlm::forward::Activation::Silu,
+        mla: Some(mla),
+    };
+    let (nh, qk, latent, rope, vdim, ql) = (2usize, 8usize, 8usize, 4usize, 4usize, 12usize);
+    let nope = 4usize;
+    let mut rng = Rng::new(0xDEEB);
+    let s = 0.05;
+    let layers: Vec<LayerTensors> = (0..2)
+        .map(|_| LayerTensors {
+            o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * nh * vdim, s)),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+                up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+                down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+            }),
+            input_layernorm: vec![1.0; cfg.hidden_size],
+            post_attention_layernorm: vec![1.0; cfg.hidden_size],
+            mla: Some(MlaWeights {
+                q_a_proj: Some(Weights::from_f32(rng.vec(ql * cfg.hidden_size, s))),
+                q_a_layernorm: Some(vec![1.0; ql]),
+                q_b_proj: Weights::from_f32(rng.vec(nh * qk * ql, s)),
+                kv_a_proj: Weights::from_f32(rng.vec((latent + rope) * cfg.hidden_size, s)),
+                kv_a_layernorm: vec![1.0; latent],
+                kv_b_proj: Weights::from_f32(rng.vec(nh * (nope + vdim) * latent, s)),
+            }),
+            ..Default::default()
+        })
+        .collect();
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "mla");
+}
+
 /// YaRN RoPE (frequency blend + mscale folded into cos/sin) must match the CPU
 /// oracle: the device `rope_kernel` and CPU `rope_inplace` apply the same scaled
 /// rotation over the shared `rope_inv_freqs`.

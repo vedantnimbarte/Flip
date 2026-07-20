@@ -322,8 +322,11 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // 11 holds `normed2` (the FFN input) so it survives from `dlm_moe_attn` across
 // the router matvec and every per-expert apply on the same stream; 12 is the
 // router/shared-gate matvec output staged for the D2H copy.
-enum { SCRATCH_N = 13 };
+// Slots 13-18 are MLA-only: normed, q (nh*qk), c_q (q_lora), kv_a (latent+rope),
+// c_kv (latent), and the attention context (nh*v_head_dim).
+enum { SCRATCH_N = 19 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
+enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
 static thread_local float* g_scratch[SCRATCH_N] = {0};
 static thread_local int g_scratch_cap[SCRATCH_N] = {0}; // capacity in floats
 
@@ -550,6 +553,208 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
         swiglu_kernel<<<grid_for(inter, B), B>>>(g, u, inter_buf, inter, activation);
         launch_matvec(w_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, w_group_size);
         scaled_add_kernel<<<grid_for(hidden_size, B), B>>>(x, down_out, weight, hidden_size);
+        e = cudaGetLastError();
+    }
+    return (int)e;
+}
+
+// Dense SwiGLU/GeGLU FFN sublayer on its own: `x += down·(act(gate·norm(x)) ⊙
+// up·norm(x))`. Used by the MLA path, whose attention is a separate call (the
+// dense block folds attention + FFN into one `dlm_decode_block`).
+extern "C" int dlm_dense_ffn(int hidden_size, int inter, float rms_eps, int w_dtype, int w_group_size,
+                             const void* gate_proj, const void* up_proj, const void* down_proj,
+                             const float* post_norm, int activation, float* x) {
+    const int B = 256;
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(6, hidden_size)
+    DLM_ALLOC(7, inter)
+    DLM_ALLOC(8, inter)
+    DLM_ALLOC(9, inter)
+    DLM_ALLOC(10, hidden_size)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+    float *normed2 = g_scratch[6], *gate = g_scratch[7], *up = g_scratch[8];
+    float *inter_buf = g_scratch[9], *down = g_scratch[10];
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);
+    launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
+    launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size);
+    swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
+    launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size);
+    add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
+    e = cudaGetLastError();
+    return (int)e;
+}
+
+// ── Multi-head Latent Attention device path (DeepSeek) ──────────────────────
+//
+// Mirrors `mla_attention_sublayer` in src/forward/cpu.rs. The KV cache packs
+// `[c_kv (kv_lora_rank) | k_pe (qk_rope)]` per token; per-head K/V are
+// reconstructed on the fly from the cached latent inside the attention kernel
+// (materializing all of them would need gigabytes of scratch).
+
+// RoPE the rope-part of each query head: q[h*qk + nope .. + qk_rope].
+__global__ void mla_rope_q_kernel(float* q, int num_heads, int qk, int nope, int rope,
+                                  int position, const float* inv_freq) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = rope / 2;
+    if (idx >= num_heads * half) return;
+    int h = idx / half, i = idx % half;
+    int base = h * qk + nope;
+    float ang = (float)position * inv_freq[i];
+    float s = sinf(ang), c = cosf(ang);
+    float a = q[base + i], b = q[base + i + half];
+    q[base + i] = a * c - b * s;
+    q[base + i + half] = a * s + b * c;
+}
+
+// Reconstruct kv_b row `row` (of the `[., latent]` up-projection) dotted with the
+// cached latent `c_kv` — i.e. one element of the on-the-fly K or V reconstruction.
+template <int DT>
+__device__ __forceinline__ float mla_row_dot(const void* kv_b, long row, int latent,
+                                             const float* c_kv, long n, int group) {
+    long base = row * (long)latent;
+    float s = 0.0f;
+    for (int l = 0; l < latent; ++l) s += load_w<DT>(kv_b, base + l, n, group) * c_kv[l];
+    return s;
+}
+
+// One thread per query head. Reconstructs k_nope/v for each cached position from
+// the latent via `kv_b` (dtype DT), scores with the split nope/rope query, and
+// accumulates the value context. Slow but a faithful oracle mirror.
+template <int DT>
+__global__ void mla_attention_kernel(const float* q, const float* kv_keys, const void* kv_b,
+                                     int kv_b_group, float* ctx, int num_heads, int nope, int rope,
+                                     int vdim, int latent, int positions, float scale) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= num_heads) return;
+    int qk = nope + rope;
+    int kv_dim = latent + rope;
+    int per_head = nope + vdim;
+    long kv_b_n = (long)num_heads * per_head * latent;
+    const float* q_nope = q + (long)h * qk;
+    const float* q_rope = q + (long)h * qk + nope;
+    float* out = ctx + (long)h * vdim;
+
+    float maxv = -1e30f;
+    for (int p = 0; p < positions; ++p) {
+        const float* ck = kv_keys + (long)p * kv_dim;
+        const float* kpe = ck + latent;
+        float sc = 0.0f;
+        for (int d = 0; d < nope; ++d)
+            sc += q_nope[d] * mla_row_dot<DT>(kv_b, (long)h * per_head + d, latent, ck, kv_b_n, kv_b_group);
+        for (int d = 0; d < rope; ++d) sc += q_rope[d] * kpe[d];
+        sc *= scale;
+        if (sc > maxv) maxv = sc;
+    }
+    for (int d = 0; d < vdim; ++d) out[d] = 0.0f;
+    float denom = 0.0f;
+    for (int p = 0; p < positions; ++p) {
+        const float* ck = kv_keys + (long)p * kv_dim;
+        const float* kpe = ck + latent;
+        float sc = 0.0f;
+        for (int d = 0; d < nope; ++d)
+            sc += q_nope[d] * mla_row_dot<DT>(kv_b, (long)h * per_head + d, latent, ck, kv_b_n, kv_b_group);
+        for (int d = 0; d < rope; ++d) sc += q_rope[d] * kpe[d];
+        float ex = expf(sc * scale - maxv);
+        denom += ex;
+        for (int d = 0; d < vdim; ++d)
+            out[d] += ex * mla_row_dot<DT>(kv_b, (long)h * per_head + nope + d, latent, ck, kv_b_n, kv_b_group);
+    }
+    for (int d = 0; d < vdim; ++d) out[d] /= denom;
+}
+
+static void launch_mla_attention(int dt, const float* q, const float* kv_keys, const void* kv_b,
+                                 int kv_b_group, float* ctx, int num_heads, int nope, int rope,
+                                 int vdim, int latent, int positions, float scale) {
+    int grid = grid_for(num_heads, 64);
+    switch (dt) {
+        case DLM_W_BF16:
+            mla_attention_kernel<DLM_W_BF16><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
+            break;
+        case DLM_W_F16:
+            mla_attention_kernel<DLM_W_F16><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
+            break;
+        case DLM_W_INT4:
+            mla_attention_kernel<DLM_W_INT4><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
+            break;
+        case DLM_W_INT8:
+            mla_attention_kernel<DLM_W_INT8><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
+            break;
+        default:
+            mla_attention_kernel<DLM_W_F32><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
+            break;
+    }
+}
+
+// One MLA attention sublayer. All attention-projection weights share `w_dtype`.
+// `kv_keys` is the persistent per-session cache (width kv_lora_rank + qk_rope);
+// `kv_values` is unused on this path. `x` gets the attention residual folded in.
+extern "C" int dlm_mla_attn(
+    int hidden_size, int num_heads,
+    int q_lora_rank,          // 0 = direct query projection (no low-rank)
+    int kv_lora_rank, int qk_nope, int qk_rope, int v_head_dim,
+    float rms_eps, int w_dtype, int w_group_size,
+    const void* q_a_proj, const float* q_a_layernorm,  // may be NULL (no q-lora)
+    const void* q_b_proj,     // [num_heads*(qk_nope+qk_rope), q_lora_rank | hidden]
+    const void* kv_a_proj,    // [kv_lora_rank + qk_rope, hidden]
+    const float* kv_a_layernorm,
+    const void* kv_b_proj,    // [num_heads*(qk_nope+v_head_dim), kv_lora_rank]
+    const void* o_proj,       // [hidden, num_heads*v_head_dim]
+    const float* in_norm, const float* inv_freq, float rope_mscale,
+    float* x, float* kv_keys, int num_positions, int position) {
+    const int B = 256;
+    int qk = qk_nope + qk_rope;
+    int nhqk = num_heads * qk;
+    int latent = kv_lora_rank;
+    int kv_dim = latent + qk_rope;
+    int nhv = num_heads * v_head_dim;
+    int total_pos = num_positions + 1;
+
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(MLA_NORMED, hidden_size)
+    DLM_ALLOC(MLA_Q, nhqk)
+    DLM_ALLOC(MLA_CQ, q_lora_rank > 0 ? q_lora_rank : 1)
+    DLM_ALLOC(MLA_KVA, latent + qk_rope)
+    DLM_ALLOC(MLA_CKV, latent)
+    DLM_ALLOC(MLA_CTX, nhv)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+
+    float* normed = g_scratch[MLA_NORMED];
+    float* q = g_scratch[MLA_Q];
+    float* kva = g_scratch[MLA_KVA];
+    float* c_kv = g_scratch[MLA_CKV];
+    float* ctx = g_scratch[MLA_CTX];
+
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    // Query: low-rank (down → norm → up) or direct.
+    if (q_lora_rank > 0 && q_a_proj) {
+        float* c_q = g_scratch[MLA_CQ];
+        launch_matvec(w_dtype, q_a_proj, normed, (const float*)0, c_q, q_lora_rank, hidden_size, w_group_size);
+        rmsnorm_kernel<<<1, RMS_THREADS>>>(c_q, q_a_layernorm, c_q, q_lora_rank, rms_eps);
+        launch_matvec(w_dtype, q_b_proj, c_q, (const float*)0, q, nhqk, q_lora_rank, w_group_size);
+    } else {
+        launch_matvec(w_dtype, q_b_proj, normed, (const float*)0, q, nhqk, hidden_size, w_group_size);
+    }
+    // KV down → [latent | k_pe]; norm the latent, RoPE the shared k_pe + q rope-parts.
+    launch_matvec(w_dtype, kv_a_proj, normed, (const float*)0, kva, latent + qk_rope, hidden_size, w_group_size);
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(kva, kv_a_layernorm, c_kv, latent, rms_eps);
+    mla_rope_q_kernel<<<grid_for(num_heads * (qk_rope / 2), B), B>>>(q, num_heads, qk, qk_nope, qk_rope, position, inv_freq);
+    rope_kernel<<<grid_for(qk_rope / 2, B), B>>>(kva + latent, 1, qk_rope, position, inv_freq, 1.0f);
+    // Append [c_kv ; k_pe] to the cache at slot num_positions.
+    copy_kernel<<<grid_for(latent, B), B>>>(c_kv, kv_keys + (long)num_positions * kv_dim, latent);
+    copy_kernel<<<grid_for(qk_rope, B), B>>>(kva + latent, kv_keys + (long)num_positions * kv_dim + latent, qk_rope);
+    // Attend (reconstructing K/V from each cached latent), then output-project.
+    float scale = rope_mscale * rope_mscale / sqrtf((float)qk);
+    launch_mla_attention(w_dtype, q, kv_keys, kv_b_proj, w_group_size, ctx, num_heads, qk_nope, qk_rope, v_head_dim, latent, total_pos, scale);
+    // o = o_proj · ctx, added into the residual (scratch slot 0 reused for `o`).
+    if (e == cudaSuccess) e = scratch_ensure(0, hidden_size);
+    if (e == cudaSuccess) {
+        float* o = g_scratch[0];
+        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, o, hidden_size, nhv, w_group_size);
+        add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, o, hidden_size);
         e = cudaGetLastError();
     }
     return (int)e;
