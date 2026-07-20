@@ -91,6 +91,10 @@ struct RawConfig {
     /// Qwen exposes it as a flag.
     #[serde(default)]
     norm_topk_prob: Option<bool>,
+    /// Sliding-window attention span (Mistral). A query attends only the last
+    /// `sliding_window` positions; absent/`null` means full causal attention.
+    #[serde(default)]
+    sliding_window: Option<u32>,
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -350,6 +354,8 @@ pub struct ModelConfig {
     /// Mixture-of-Experts geometry when the checkpoint is sparse; `None` for a
     /// dense model, which keeps the single-FFN path unchanged.
     pub moe: Option<MoeConfig>,
+    /// Sliding-window attention span (Mistral); `None` is full causal attention.
+    pub sliding_window: Option<u32>,
 }
 
 impl ModelConfig {
@@ -463,6 +469,9 @@ impl ModelConfig {
             quant,
             packed_quant,
             moe,
+            // A window >= the model's own max context is the same as full
+            // attention; keep it as declared and let the kernel no-op it.
+            sliding_window: raw.sliding_window.filter(|&w| w > 0),
         };
 
         config.validate()?;
@@ -630,6 +639,23 @@ mod tests {
         // Core = attn (q,o = h*h each; k,v full since MHA) + router (h*8) + 2 norms.
         let expected_core = 4 * h * h + h * 8 + 2 * h;
         assert_eq!(core, expected_core);
+    }
+
+    #[test]
+    fn parses_sliding_window() {
+        let with = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64,"sliding_window":4096}"#;
+        assert_eq!(
+            ModelConfig::from_json_bytes(with, QuantScheme::Fp16).unwrap().sliding_window,
+            Some(4096)
+        );
+        // Absent → full attention; a zero window is treated as absent.
+        let without = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64}"#;
+        assert_eq!(
+            ModelConfig::from_json_bytes(without, QuantScheme::Fp16).unwrap().sliding_window,
+            None
+        );
     }
 
     #[test]

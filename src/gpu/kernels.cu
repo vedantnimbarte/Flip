@@ -207,9 +207,12 @@ __global__ void rope_kernel(float* v, int num_heads, int head_dim, int position,
 
 // Grouped-query attention over `positions` cached tokens. One thread per query
 // head; online softmax so no per-position scratch is needed.
+// `sliding_window > 0` bounds attention to the last `sliding_window` positions
+// (Mistral); `0` is full causal attention. Mirrors `attention()` in
+// src/forward/cpu.rs (start = positions - window).
 __global__ void attention_kernel(const float* q, const float* keys, const float* values,
                                  float* ctx, int num_heads, int num_kv_heads, int head_dim,
-                                 int positions) {
+                                 int positions, int sliding_window) {
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= num_heads) return;
     int group = num_heads / num_kv_heads;
@@ -218,9 +221,12 @@ __global__ void attention_kernel(const float* q, const float* keys, const float*
     float scale = rsqrtf((float)head_dim);
     const float* qh = q + h * head_dim;
     float* out = ctx + h * head_dim;
+    int start = (sliding_window > 0 && positions > sliding_window)
+                    ? positions - sliding_window
+                    : 0;
 
     float maxv = -1e30f;
-    for (int p = 0; p < positions; ++p) {
+    for (int p = start; p < positions; ++p) {
         const float* kh = keys + (long)p * kv_dim + kvh * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
@@ -229,7 +235,7 @@ __global__ void attention_kernel(const float* q, const float* keys, const float*
     }
     for (int d = 0; d < head_dim; ++d) out[d] = 0.0f;
     float denom = 0.0f;
-    for (int p = 0; p < positions; ++p) {
+    for (int p = start; p < positions; ++p) {
         const float* kh = keys + (long)p * kv_dim + kvh * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
@@ -322,7 +328,8 @@ extern "C" int dlm_decode_block(
     const float* inv_freq,                 // [head_dim/2], precomputed host-side
     float* x,                              // [hidden] in/out
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
-    int num_positions, int position)
+    int num_positions, int position,
+    int sliding_window)                    // 0 = full causal attention (Mistral SWA otherwise)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
@@ -363,7 +370,7 @@ extern "C" int dlm_decode_block(
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
 
         // Attend over history + this token, reading the persistent buffers directly.
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos);
+        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window);
         launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
@@ -421,7 +428,8 @@ extern "C" int dlm_moe_attn(
     const float* inv_freq,
     float* x,                              // [hidden] in/out (attn residual folded in)
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
-    int num_positions, int position)
+    int num_positions, int position,
+    int sliding_window)                    // 0 = full causal attention (Mistral SWA otherwise)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
@@ -449,7 +457,7 @@ extern "C" int dlm_moe_attn(
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos);
+        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window);
         launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
         // FFN input, reused by the router matvec and every expert.

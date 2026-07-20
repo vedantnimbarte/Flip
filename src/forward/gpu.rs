@@ -61,6 +61,8 @@ extern "C" {
         kv_values: *mut f32,
         num_positions: i32,
         position: i32,
+        // Sliding-window span (Mistral); 0 = full causal attention.
+        sliding_window: i32,
     ) -> i32;
 
     /// MoE layer, part 1: attention sublayer + post-attn norm. Leaves `normed2`
@@ -92,6 +94,8 @@ extern "C" {
         kv_values: *mut f32,
         num_positions: i32,
         position: i32,
+        // Sliding-window span (Mistral); 0 = full causal attention.
+        sliding_window: i32,
     ) -> i32;
 
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
@@ -307,6 +311,7 @@ impl ComputeKernel for GpuKernel {
                 kv_values,
                 num_positions as i32,
                 position as i32,
+                self.cfg.sliding_window.unwrap_or(0) as i32,
             )
         };
         if code != 0 {

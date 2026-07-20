@@ -357,6 +357,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         rms_eps: config.rms_eps,
         rope_scaling: config.rope_scaling,
         moe: config.moe,
+        sliding_window: config.sliding_window.map(|w| w as usize),
     }
 }
 
