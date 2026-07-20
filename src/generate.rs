@@ -412,17 +412,30 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// Resume generation from a prior session's [`KvSnapshot`], prefilling only
-    /// the `suffix` tokens that follow the snapshotted prefix. The result is
-    /// identical to [`start_session`](Self::start_session) on the full
-    /// `prefix + suffix` prompt, but skips re-running the shared prefix — the
-    /// basis for cross-request prefix caching. `suffix` must be non-empty (the
-    /// session needs a last hidden state to produce the first token).
+    /// the tokens of `prompt` that follow the snapshotted prefix. The result is
+    /// identical to [`start_session`](Self::start_session) on the full `prompt`,
+    /// but skips re-running the shared prefix — the basis for cross-request prefix
+    /// caching.
+    ///
+    /// `prompt` is the **whole** prompt (the cached prefix plus the new suffix);
+    /// the snapshot's position marks where the prefix ends. Passing the full
+    /// prompt lets the repetition penalty cover the cached prefix's tokens too —
+    /// otherwise a resumed request would penalize only its suffix and drift from
+    /// the same request run without the cache. The suffix (`prompt[position..]`)
+    /// must be non-empty (the session needs a last hidden state).
     pub fn resume_session(
         &self,
         snapshot: crate::forward::KvSnapshot,
-        suffix: &[u32],
+        prompt: &[u32],
         sampler: Sampler,
     ) -> Result<GenerationSession<'_, K>> {
+        let start = snapshot.position();
+        if start > prompt.len() {
+            return Err(DlmError::InvalidConfig(
+                "resume snapshot is longer than the prompt it should prefix".into(),
+            ));
+        }
+        let suffix = &prompt[start..];
         if suffix.is_empty() {
             return Err(DlmError::InvalidConfig("resume suffix must be non-empty".into()));
         }
@@ -439,11 +452,10 @@ impl<K: ComputeKernel> Generator<K> {
             last_hidden: hidden,
             rng: SplitMix64::new(sampler.seed()),
             sampler,
-            // Only the suffix is known here — the snapshot carries KV state, not
-            // the prefix token ids — so the repetition penalty won't cover the
-            // cached prefix. Thread the prefix ids through the snapshot when
-            // resume_session is wired into the server with sampling.
-            seen: suffix.iter().copied().collect(),
+            // The full prompt (cached prefix + suffix), so the repetition penalty
+            // covers the cached prefix — a resumed request matches the same request
+            // run without the prefix cache.
+            seen: prompt.iter().copied().collect(),
         })
     }
 }
@@ -659,7 +671,6 @@ mod tests {
     fn resume_from_snapshot_matches_full_prefill() {
         let gen = attention_generator();
         let prefix = [1u32, 2, 3];
-        let suffix = [4u32, 5];
         let full_prompt = [1u32, 2, 3, 4, 5];
         let n = 6;
 
@@ -667,16 +678,49 @@ mod tests {
         let mut full = gen.start_session(&full_prompt, Sampler::Greedy).unwrap();
         let tokens_full: Vec<u32> = (0..n).map(|_| full.step().unwrap()).collect();
 
-        // Snapshot after the prefix, resume prefilling only the suffix.
+        // Snapshot after the prefix, resume passing the whole prompt (resume
+        // derives the suffix from the snapshot position).
         let prefix_sess = gen.start_session(&prefix, Sampler::Greedy).unwrap();
         let snap = prefix_sess.snapshot();
         assert_eq!(snap.position(), prefix.len());
-        let mut resumed = gen.resume_session(snap, &suffix, Sampler::Greedy).unwrap();
+        let mut resumed = gen.resume_session(snap, &full_prompt, Sampler::Greedy).unwrap();
         let tokens_resumed: Vec<u32> = (0..n).map(|_| resumed.step().unwrap()).collect();
 
         // Resuming from the shared prefix is bit-for-bit identical to prefilling
         // the full prompt — the correctness property a prefix cache relies on.
         assert_eq!(tokens_full, tokens_resumed);
+    }
+
+    /// With a repetition penalty, a resumed session must match the same request
+    /// run without the prefix cache — i.e. the penalty covers the cached *prefix*
+    /// tokens, not just the suffix. Before the fix, `seen` held only the suffix,
+    /// so a resumed request penalized fewer tokens and drifted.
+    #[test]
+    fn resume_repetition_penalty_covers_cached_prefix() {
+        let gen = attention_generator();
+        let prefix = [1u32, 2, 3];
+        let full_prompt = [1u32, 2, 3, 4, 5];
+        let n = 6;
+        let sampler = Sampler::TopPK {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 4.0, // strong, so prefix coverage visibly matters
+            seed: 7,
+        };
+
+        let mut full = gen.start_session(&full_prompt, sampler).unwrap();
+        let tokens_full: Vec<u32> = (0..n).map(|_| full.step().unwrap()).collect();
+
+        let snap = gen.start_session(&prefix, sampler).unwrap().snapshot();
+        let mut resumed = gen.resume_session(snap, &full_prompt, sampler).unwrap();
+        let tokens_resumed: Vec<u32> = (0..n).map(|_| resumed.step().unwrap()).collect();
+
+        assert_eq!(
+            tokens_full, tokens_resumed,
+            "resumed penalty must cover the cached prefix, matching a full run"
+        );
     }
 
     #[test]

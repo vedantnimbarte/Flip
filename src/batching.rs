@@ -305,9 +305,10 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         .and_then(|c| c.longest_prefix(&p.prompt));
                     let session = match resume {
                         Some(snap) => {
-                            let suffix = &p.prompt[snap.position()..];
                             self.resume_hits += 1;
-                            self.generator.resume_session(snap, suffix, p.sampler)?
+                            // Pass the whole prompt so the repetition penalty covers
+                            // the cached prefix too (resume derives the suffix).
+                            self.generator.resume_session(snap, &p.prompt, p.sampler)?
                         }
                         None => self.generator.start_session(&p.prompt, p.sampler)?,
                     };
