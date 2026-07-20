@@ -42,10 +42,21 @@ struct HfAddedToken {
 
 #[derive(Deserialize)]
 struct HfModel {
+    /// "BPE" or "Unigram"; absent on older files (then inferred from shape).
+    #[serde(default, rename = "type")]
+    model_type: Option<String>,
+    /// BPE: object `{piece: id}`. Unigram: array `[[piece, score], ...]`. Parsed
+    /// per model type, so it is kept as a raw value until then.
     #[serde(default)]
-    vocab: HashMap<String, u32>,
+    vocab: serde_json::Value,
     #[serde(default)]
     merges: Vec<HfMerge>,
+    /// Unigram unknown-token id.
+    #[serde(default)]
+    unk_id: Option<u32>,
+    /// Unigram: decompose unmatched chars into `<0xNN>` byte pieces.
+    #[serde(default)]
+    byte_fallback: bool,
 }
 
 /// Merges are `"a b"` in older files, `["a","b"]` in newer ones.
@@ -104,7 +115,29 @@ pub struct BpeTokenizer {
     special_encoder: HashMap<String, u32>,
     /// Id → special-token literal.
     special_decoder: HashMap<u32, String>,
+    /// SentencePiece **Unigram** mode (Gemma, Llama-spm): when set, encode/decode
+    /// use Viterbi segmentation over a scored vocabulary instead of BPE merges.
+    /// `None` keeps the byte-level BPE path unchanged.
+    unigram: Option<UnigramState>,
 }
+
+/// State for the SentencePiece Unigram model: per-piece log-prob scores plus the
+/// knobs its Viterbi segmentation needs.
+#[derive(Debug, Clone)]
+struct UnigramState {
+    /// Piece string → log-probability score (higher = more likely).
+    scores: HashMap<String, f32>,
+    /// Longest piece length in Unicode chars (bounds the Viterbi inner loop).
+    max_piece_len: usize,
+    /// Decompose an unmatched character into `<0xNN>` byte pieces (Gemma/Llama).
+    byte_fallback: bool,
+    /// Unknown-token id, used when a char matches no piece and byte-fallback is
+    /// off or incomplete.
+    unk_id: Option<u32>,
+}
+
+/// SentencePiece whitespace marker (▁, U+2581): spaces become this before Viterbi.
+const SPM_SPACE: char = '\u{2581}';
 
 impl BpeTokenizer {
     /// Build from an explicit vocabulary and an ordered merge list (rank = index).
@@ -124,6 +157,7 @@ impl BpeTokenizer {
             byte_decoder,
             special_encoder: HashMap::new(),
             special_decoder: HashMap::new(),
+            unigram: None,
         }
     }
 
@@ -157,6 +191,36 @@ impl BpeTokenizer {
             byte_decoder,
             special_encoder: HashMap::new(),
             special_decoder: HashMap::new(),
+            unigram: None,
+        }
+    }
+
+    /// Build a SentencePiece **Unigram** tokenizer from a scored vocabulary
+    /// (`pieces[i]` has id `i`), as shipped in a `tokenizer.json` Unigram model.
+    /// `byte_fallback` decomposes unmatched characters into `<0xNN>` byte pieces
+    /// (Gemma/Llama); `unk_id` is the last resort.
+    pub fn from_unigram(pieces: Vec<(String, f32)>, byte_fallback: bool, unk_id: Option<u32>) -> Self {
+        let mut encoder = HashMap::new();
+        let mut decoder = HashMap::new();
+        let mut scores = HashMap::new();
+        let mut max_piece_len = 1;
+        for (id, (piece, score)) in pieces.into_iter().enumerate() {
+            let id = id as u32;
+            encoder.insert(piece.clone(), id);
+            decoder.insert(id, piece.clone());
+            max_piece_len = max_piece_len.max(piece.chars().count());
+            scores.insert(piece, score);
+        }
+        let (byte_encoder, byte_decoder) = byte_to_unicode();
+        Self {
+            encoder,
+            decoder,
+            merges: HashMap::new(),
+            byte_encoder,
+            byte_decoder,
+            special_encoder: HashMap::new(),
+            special_decoder: HashMap::new(),
+            unigram: Some(UnigramState { scores, max_piece_len, byte_fallback, unk_id }),
         }
     }
 
@@ -203,12 +267,32 @@ impl BpeTokenizer {
                 context: "tokenizer.json".to_string(),
                 source,
             })?;
-        if !hf.model.vocab.is_empty() && hf.model.merges.is_empty() {
-            // A vocab with no merges is almost certainly a Unigram model.
-            return Err(DlmError::Tokenizer(
-                "tokenizer.json has no BPE merges (Unigram/SentencePiece unsupported)".into(),
-            ));
+        let specials: Vec<(String, u32)> = hf
+            .added_tokens
+            .into_iter()
+            .filter(|t| t.special)
+            .map(|t| (t.content, t.id))
+            .collect();
+
+        // SentencePiece Unigram: `type: "Unigram"`, or a scored-array vocab.
+        if hf.model.model_type.as_deref() == Some("Unigram") || hf.model.vocab.is_array() {
+            let pieces: Vec<(String, f32)> =
+                serde_json::from_value(hf.model.vocab).map_err(|source| DlmError::Json {
+                    context: "tokenizer.json Unigram vocab".to_string(),
+                    source,
+                })?;
+            return Ok(
+                Self::from_unigram(pieces, hf.model.byte_fallback, hf.model.unk_id)
+                    .with_special(specials),
+            );
         }
+
+        // Byte-level BPE.
+        let vocab: HashMap<String, u32> =
+            serde_json::from_value(hf.model.vocab).map_err(|source| DlmError::Json {
+                context: "tokenizer.json BPE vocab".to_string(),
+                source,
+            })?;
         let merges_list = hf
             .model
             .merges
@@ -221,13 +305,7 @@ impl BpeTokenizer {
                 }
             })
             .collect();
-        let specials: Vec<(String, u32)> = hf
-            .added_tokens
-            .into_iter()
-            .filter(|t| t.special)
-            .map(|t| (t.content, t.id))
-            .collect();
-        Ok(Self::new(hf.model.vocab, merges_list).with_special(specials))
+        Ok(Self::new(vocab, merges_list).with_special(specials))
     }
 
     /// Load a tokenizer from a model directory: prefer HF `tokenizer.json`, else
@@ -252,19 +330,126 @@ impl BpeTokenizer {
         for seg in self.split_special(text) {
             match seg {
                 Seg::Special(id) => ids.push(id),
-                Seg::Text(chunk_text) => {
-                    for chunk in pretokenize(&chunk_text) {
-                        for symbol in self.bpe(chunk.as_bytes()) {
-                            let id = self.encoder.get(&symbol).ok_or_else(|| {
-                                DlmError::Tokenizer(format!("token {symbol:?} not in vocabulary"))
-                            })?;
-                            ids.push(*id);
+                Seg::Text(chunk_text) => match &self.unigram {
+                    // SentencePiece Unigram: Viterbi over the whole text segment.
+                    Some(u) => self.encode_unigram(u, &chunk_text, &mut ids)?,
+                    // Byte-level BPE: pre-tokenize into chunks, merge each.
+                    None => {
+                        for chunk in pretokenize(&chunk_text) {
+                            for symbol in self.bpe(chunk.as_bytes()) {
+                                let id = self.encoder.get(&symbol).ok_or_else(|| {
+                                    DlmError::Tokenizer(format!("token {symbol:?} not in vocabulary"))
+                                })?;
+                                ids.push(*id);
+                            }
                         }
+                    }
+                },
+            }
+        }
+        Ok(ids)
+    }
+
+    /// SentencePiece Unigram encode: escape whitespace (space → ▁) with a leading
+    /// dummy prefix, then Viterbi-segment the text to maximize the summed piece
+    /// score. An unmatched character falls back to `<0xNN>` byte pieces
+    /// (`byte_fallback`) or the unknown token. Appends ids to `out`.
+    fn encode_unigram(&self, u: &UnigramState, text: &str, out: &mut Vec<u32>) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        // Normalize: spaces → ▁, and prepend one ▁ (add_dummy_prefix).
+        let norm: Vec<char> = std::iter::once(SPM_SPACE)
+            .chain(text.chars().map(|c| if c == ' ' { SPM_SPACE } else { c }))
+            .collect();
+        let n = norm.len();
+
+        // Viterbi: best[i] = max summed score of a segmentation of norm[..i].
+        // back[i] = (start, ids emitted for the piece ending at i).
+        let neg = f32::NEG_INFINITY;
+        let mut best = vec![neg; n + 1];
+        best[0] = 0.0;
+        let mut back: Vec<(usize, Vec<u32>)> = vec![(0, Vec::new()); n + 1];
+
+        for i in 1..=n {
+            // Multi-char vocab pieces ending at i.
+            let lo = i.saturating_sub(u.max_piece_len);
+            for j in lo..i {
+                if best[j] == neg {
+                    continue;
+                }
+                let piece: String = norm[j..i].iter().collect();
+                if let (Some(&score), Some(&id)) = (u.scores.get(&piece), self.encoder.get(&piece)) {
+                    let cand = best[j] + score;
+                    if cand > best[i] {
+                        best[i] = cand;
+                        back[i] = (j, vec![id]);
+                    }
+                }
+            }
+            // Single-character fallback (byte pieces or unk), so best[i] is always
+            // reachable even for out-of-vocab characters. Heavily penalized so it
+            // only wins when no real piece covers the character.
+            if best[i - 1] != neg {
+                let ch = norm[i - 1];
+                if let Some(fallback) = self.unigram_char_fallback(u, ch) {
+                    let cand = best[i - 1] - 10.0 + fallback.1; // penalty + byte scores
+                    if cand > best[i] {
+                        best[i] = cand;
+                        back[i] = (i - 1, fallback.0);
                     }
                 }
             }
         }
-        Ok(ids)
+
+        if best[n] == neg {
+            return Err(DlmError::Tokenizer(
+                "unigram tokenizer could not segment input (no byte fallback or unk token)".into(),
+            ));
+        }
+        // Reconstruct forward order.
+        let mut pieces_rev: Vec<u32> = Vec::new();
+        let mut i = n;
+        while i > 0 {
+            let (j, ref step_ids) = back[i];
+            for &id in step_ids.iter().rev() {
+                pieces_rev.push(id);
+            }
+            i = j;
+        }
+        pieces_rev.reverse();
+        out.extend(pieces_rev);
+        Ok(())
+    }
+
+    /// Ids covering a single unmatched character `ch`, plus their summed score:
+    /// its `<0xNN>` byte pieces when `byte_fallback` and all are present, else the
+    /// unk token. `None` if neither is available.
+    fn unigram_char_fallback(&self, u: &UnigramState, ch: char) -> Option<(Vec<u32>, f32)> {
+        if u.byte_fallback {
+            let mut buf = [0u8; 4];
+            let bytes = ch.encode_utf8(&mut buf).as_bytes();
+            let mut ids = Vec::with_capacity(bytes.len());
+            let mut score = 0.0;
+            let mut ok = true;
+            for &b in bytes {
+                let piece = format!("<0x{b:02X}>");
+                match (self.encoder.get(&piece), u.scores.get(&piece)) {
+                    (Some(&id), Some(&s)) => {
+                        ids.push(id);
+                        score += s;
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return Some((ids, score));
+            }
+        }
+        u.unk_id.map(|id| (vec![id], 0.0))
     }
 
     /// Split `text` on registered special tokens (longest-match wins).
@@ -306,6 +491,9 @@ impl BpeTokenizer {
     /// Decode token ids back into text (lossy on invalid UTF-8). Special-token
     /// ids render as their literal text; runs of byte tokens are byte-decoded.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        if self.unigram.is_some() {
+            return self.decode_unigram(ids);
+        }
         let mut result = String::new();
         let mut run = String::new();
         for &id in ids {
@@ -322,6 +510,35 @@ impl BpeTokenizer {
         }
         self.flush_byte_run(&mut run, &mut result)?;
         Ok(result)
+    }
+
+    /// SentencePiece Unigram decode: concatenate pieces (byte-fallback `<0xNN>`
+    /// pieces reassemble into UTF-8), turn ▁ back into spaces, and drop the single
+    /// leading space added as the dummy prefix at encode time.
+    fn decode_unigram(&self, ids: &[u32]) -> Result<String> {
+        let mut pieces = String::new();
+        let mut byte_run: Vec<u8> = Vec::new();
+        for &id in ids {
+            if let Some(sp) = self.special_decoder.get(&id) {
+                flush_bytes(&mut byte_run, &mut pieces);
+                pieces.push_str(sp);
+                continue;
+            }
+            let piece = self
+                .decoder
+                .get(&id)
+                .ok_or_else(|| DlmError::Tokenizer(format!("unknown token id {id}")))?;
+            match parse_byte_piece(piece) {
+                Some(b) => byte_run.push(b),
+                None => {
+                    flush_bytes(&mut byte_run, &mut pieces);
+                    pieces.push_str(piece);
+                }
+            }
+        }
+        flush_bytes(&mut byte_run, &mut pieces);
+        let text = pieces.replace(SPM_SPACE, " ");
+        Ok(text.strip_prefix(' ').unwrap_or(&text).to_string())
     }
 
     /// Byte-decode an accumulated run of byte-level tokens into `out`, clearing
@@ -381,6 +598,26 @@ impl BpeTokenizer {
             symbols = merged;
         }
         symbols
+    }
+}
+
+/// Flush accumulated byte-fallback bytes into `out` as UTF-8 (lossy), clearing
+/// the run. Used by the SentencePiece Unigram decode path.
+fn flush_bytes(byte_run: &mut Vec<u8>, out: &mut String) {
+    if !byte_run.is_empty() {
+        out.push_str(&String::from_utf8_lossy(byte_run));
+        byte_run.clear();
+    }
+}
+
+/// Parse a SentencePiece byte-fallback piece `<0xNN>` into its byte; `None` for
+/// any ordinary piece.
+fn parse_byte_piece(piece: &str) -> Option<u8> {
+    let hex = piece.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() == 2 {
+        u8::from_str_radix(hex, 16).ok()
+    } else {
+        None
     }
 }
 
@@ -534,12 +771,52 @@ mod tests {
         assert_eq!(tok.decode(&[2, 5]).unwrap(), "ab<|end|>");
     }
 
+    /// SentencePiece Unigram: Viterbi picks the highest-scoring segmentation, and
+    /// decode inverts the ▁-escaping + dummy prefix, so text round-trips.
     #[test]
-    fn rejects_unigram_tokenizer_json() {
+    fn unigram_round_trips() {
+        let pieces = vec![
+            ("<unk>".to_string(), 0.0),
+            ("\u{2581}hello".to_string(), -1.0),
+            ("\u{2581}world".to_string(), -1.0),
+            ("\u{2581}".to_string(), -5.0),
+        ];
+        let tok = BpeTokenizer::from_unigram(pieces, false, Some(0));
+        let ids = tok.encode("hello world").unwrap();
+        // Two whole-word pieces (▁hello, ▁world) beat any finer split.
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(tok.decode(&ids).unwrap(), "hello world");
+    }
+
+    /// A character with no vocab piece decomposes into `<0xNN>` byte pieces when
+    /// byte-fallback is on, and those reassemble on decode.
+    #[test]
+    fn unigram_byte_fallback_round_trips() {
+        let pieces = vec![
+            ("<unk>".to_string(), 0.0),
+            ("\u{2581}hi".to_string(), -1.0),
+            ("<0x21>".to_string(), -5.0), // '!' = 0x21
+        ];
+        let tok = BpeTokenizer::from_unigram(pieces, true, Some(0));
+        let ids = tok.encode("hi!").unwrap();
+        assert_eq!(tok.decode(&ids).unwrap(), "hi!");
+        // The '!' had no piece, so it came through the byte-fallback token.
+        assert!(ids.contains(&2), "expected the <0x21> byte piece: {ids:?}");
+    }
+
+    /// A `tokenizer.json` declaring a Unigram model (array vocab) loads through the
+    /// same entry point as BPE and tokenizes.
+    #[test]
+    fn loads_unigram_tokenizer_json() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("tokenizer.json");
-        // Vocab present, no merges → Unigram/SentencePiece → unsupported.
-        std::fs::write(&path, r#"{"model": {"vocab": {"a": 0}, "merges": []}}"#).unwrap();
-        assert!(BpeTokenizer::from_hf_json(&path).is_err());
+        std::fs::write(
+            &path,
+            r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,
+                "vocab":[["<unk>",0.0],["▁hello",-1.0],["▁world",-1.0]]}}"#,
+        )
+        .unwrap();
+        let tok = BpeTokenizer::from_hf_json(&path).unwrap();
+        assert_eq!(tok.decode(&tok.encode("hello world").unwrap()).unwrap(), "hello world");
     }
 }
