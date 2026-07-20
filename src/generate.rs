@@ -15,7 +15,7 @@
 
 use crate::cache::{KvCacheConfig, PagedKvCache};
 use crate::error::{DlmError, Result};
-use crate::forward::cpu::{matvec, rmsnorm};
+use crate::forward::cpu::{matvec, rmsnorm, KvLayerCache};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
 
 /// Index of the largest logit (greedy pick; first max wins on ties).
@@ -345,6 +345,93 @@ impl<K: ComputeKernel> Generator<K> {
     fn logits(&self, hidden: &[f32]) -> Vec<f32> {
         let normed = rmsnorm(hidden, &self.final_norm, self.rms_eps);
         matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size)
+    }
+
+    /// Greedy-decode a **batch** of prompts together, advancing all sequences
+    /// through each layer in one [`run_block_batched`](ComputeKernel::run_block_batched)
+    /// call — so a GPU kernel fuses the per-sequence projections into batched
+    /// GEMMs. Each sequence's output is identical to decoding it alone (the batch
+    /// is a throughput optimization, not a semantic change).
+    ///
+    /// Prompts may differ in length (each carries its own position and KV). A
+    /// sequence that hits EOS stops emitting but still rides the batch until the
+    /// longest finishes (a scheduler would retire it; this is the simple form).
+    pub fn generate_batch(
+        &self,
+        prompts: &[&[u32]],
+        cfg: &GenerationConfig,
+    ) -> Result<Vec<Vec<u32>>> {
+        let b = prompts.len();
+        if b == 0 {
+            return Ok(Vec::new());
+        }
+        for p in prompts {
+            if p.is_empty() {
+                return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
+            }
+        }
+        let nl = self.kernel.num_layers() as usize;
+        let kv_dim = self.kernel.kv_dim();
+        // Per-sequence KV (one cache per layer) + hidden + absolute position.
+        let mut kvs: Vec<Vec<KvLayerCache>> = (0..b)
+            .map(|_| (0..nl).map(|_| KvLayerCache::new_quant(kv_dim, self.kv_quant)).collect())
+            .collect();
+        let mut hidden = vec![vec![0.0f32; self.hidden_size]; b];
+        let mut position = vec![0usize; b];
+
+        // Prefill each sequence (per-sequence — prompts differ in length). After
+        // the loop `hidden[s]` holds the last prompt token's stack output (what the
+        // first decode step samples from) and `position[s]` is the next position.
+        for (s, prompt) in prompts.iter().enumerate() {
+            for &tok in *prompt {
+                let mut h = self.embed(tok)?;
+                for (l, kv) in kvs[s].iter_mut().enumerate() {
+                    self.kernel.run_block(l as u32, &mut h, kv, position[s])?;
+                }
+                hidden[s] = h;
+                position[s] += 1;
+            }
+        }
+
+        let mut rngs: Vec<SplitMix64> = (0..b).map(|_| SplitMix64::new(cfg.sampler.seed())).collect();
+        let penalty = cfg.sampler.repetition_penalty();
+        let mut seen: Vec<std::collections::HashSet<u32>> =
+            prompts.iter().map(|p| p.iter().copied().collect()).collect();
+        let mut out = vec![Vec::with_capacity(cfg.max_new_tokens); b];
+        let mut done = vec![false; b];
+
+        for _ in 0..cfg.max_new_tokens {
+            // Sample the next token for each live sequence from its current hidden.
+            for s in 0..b {
+                if done[s] {
+                    continue;
+                }
+                let mut logits = self.logits(&hidden[s]);
+                apply_repetition_penalty(&mut logits, &seen[s], penalty);
+                let next = cfg.sampler.sample(&logits, &mut rngs[s]);
+                out[s].push(next);
+                seen[s].insert(next);
+                if cfg.eos_token == Some(next) {
+                    done[s] = true;
+                    continue;
+                }
+                hidden[s] = self.embed(next)?;
+            }
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            // Advance every sequence through the stack, one batched call per layer.
+            for l in 0..nl {
+                let mut hs: Vec<&mut [f32]> = hidden.iter_mut().map(|h| h.as_mut_slice()).collect();
+                let mut ks: Vec<&mut KvLayerCache> =
+                    kvs.iter_mut().map(|seq| &mut seq[l]).collect();
+                self.kernel.run_block_batched(l as u32, &mut hs, &mut ks, &position)?;
+            }
+            for p in &mut position {
+                *p += 1;
+            }
+        }
+        Ok(out)
     }
 
     /// Generate a continuation for `prompt`, returning the newly produced token
@@ -682,6 +769,20 @@ mod tests {
                 .unwrap();
             assert_eq!(out.len(), 5, "{quant:?}");
         }
+    }
+
+    #[test]
+    fn generate_batch_matches_individual() {
+        // Each sequence in a batch must decode identically to running it alone —
+        // batching is a throughput optimization, not a semantic change.
+        let gen = attention_generator();
+        let cfg = GenerationConfig { max_new_tokens: 5, eos_token: None, sampler: Sampler::Greedy };
+        let p1: &[u32] = &[1, 2, 3];
+        let p2: &[u32] = &[4, 5];
+        let batched = gen.generate_batch(&[p1, p2], &cfg).unwrap();
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[0], gen.generate(p1, &cfg).unwrap());
+        assert_eq!(batched[1], gen.generate(p2, &cfg).unwrap());
     }
 
     #[test]
