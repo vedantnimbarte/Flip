@@ -41,6 +41,18 @@ pub enum RopeScaling {
     /// Linear position interpolation (`rope_type: "linear"`): every frequency is
     /// divided by `factor`.
     Linear { factor: f32 },
+    /// YaRN (`rope_type: "yarn"`, DeepSeek / Qwen2.5-1M): interpolate low
+    /// frequencies by `factor` while extrapolating (keeping) high ones, ramping
+    /// between the correction dims set by `beta_fast`/`beta_slow`, plus an
+    /// attention temperature `mscale` folded into the rotation.
+    Yarn {
+        factor: f32,
+        original_max_position: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        /// Attention scaling `mscale` (`0.1·ln(factor)+1`), applied to cos/sin.
+        mscale: f32,
+    },
 }
 
 /// Shape + hyperparameters of one decoder block.
@@ -1231,12 +1243,43 @@ where
 /// resulting device array — so the two paths cannot drift apart, and a new
 /// scaling type is implemented in exactly one place.
 pub fn rope_inv_freqs(head_dim: usize, theta: f32, scaling: Option<RopeScaling>) -> Vec<f32> {
+    // YaRN correction range (constant across dims): the index band over which the
+    // ramp blends extrapolation (keep) into interpolation (÷factor). Mirrors HF
+    // `_compute_yarn_parameters`.
+    let yarn = if let Some(RopeScaling::Yarn {
+        factor,
+        original_max_position,
+        beta_fast,
+        beta_slow,
+        ..
+    }) = scaling
+    {
+        let find_dim = |num_rot: f32| {
+            head_dim as f32 * (original_max_position / (num_rot * 2.0 * std::f32::consts::PI)).ln()
+                / (2.0 * theta.ln())
+        };
+        let low = find_dim(beta_fast).floor().max(0.0);
+        let high = find_dim(beta_slow).ceil().min(head_dim as f32 - 1.0);
+        Some((factor, low, high))
+    } else {
+        None
+    };
     (0..head_dim / 2)
         .map(|i| {
             let base = theta.powf(-2.0 * i as f32 / head_dim as f32);
             match scaling {
                 None => base,
                 Some(RopeScaling::Linear { factor }) => base / factor,
+                Some(RopeScaling::Yarn { .. }) => {
+                    let (factor, low, high) = yarn.unwrap();
+                    let ramp = if (high - low).abs() < 1e-6 {
+                        if (i as f32) < low { 0.0 } else { 1.0 }
+                    } else {
+                        ((i as f32 - low) / (high - low)).clamp(0.0, 1.0)
+                    };
+                    // ramp: 0 (high-freq, keep) → 1 (low-freq, interpolate ÷factor).
+                    (base / factor) * ramp + base * (1.0 - ramp)
+                }
                 Some(RopeScaling::Llama3 {
                     factor,
                     low_freq_factor,
@@ -1264,15 +1307,27 @@ pub fn rope_inv_freqs(head_dim: usize, theta: f32, scaling: Option<RopeScaling>)
         .collect()
 }
 
+/// The YaRN attention temperature `mscale`, folded into cos/sin (1.0 for every
+/// other scaling). Scaling both cos and sin by `mscale` scales q and k by
+/// `mscale`, so attention logits pick up `mscale²` — exactly YaRN's attention
+/// factor. Kept as the single source of truth so CPU and GPU agree.
+pub fn rope_mscale(scaling: Option<RopeScaling>) -> f32 {
+    match scaling {
+        Some(RopeScaling::Yarn { mscale, .. }) => mscale,
+        _ => 1.0,
+    }
+}
+
 /// Apply rotary position embedding in place to a `[num_heads × head_dim]`
 /// vector at absolute `position` (NeoX split-half convention), using
-/// precomputed [`rope_inv_freqs`].
+/// precomputed [`rope_inv_freqs`]. `mscale` (YaRN) scales cos/sin; pass 1.0 otherwise.
 fn rope_inplace(
     vec: &mut [f32],
     num_heads: usize,
     head_dim: usize,
     position: usize,
     inv_freq: &[f32],
+    mscale: f32,
 ) {
     let half = head_dim / 2;
     for h in 0..num_heads {
@@ -1280,6 +1335,7 @@ fn rope_inplace(
         for i in 0..half {
             let angle = position as f32 * inv_freq[i];
             let (sin, cos) = angle.sin_cos();
+            let (sin, cos) = (sin * mscale, cos * mscale);
             let a = vec[base + i];
             let b = vec[base + i + half];
             vec[base + i] = a * cos - b * sin;
@@ -1401,8 +1457,9 @@ fn attention_sublayer(
     }
 
     let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
-    rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, &inv_freq);
-    rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, &inv_freq);
+    let mscale = rope_mscale(cfg.rope_scaling);
+    rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, &inv_freq, mscale);
+    rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, &inv_freq, mscale);
 
     kv.append(&k, &v)?;
     let ctx = attention(cfg, &q, kv);
@@ -1598,17 +1655,41 @@ mod tests {
     }
 
     #[test]
+    fn yarn_blends_frequencies_within_bounds_and_sets_mscale() {
+        let (head_dim, theta) = (64, 10000.0f32);
+        let factor = 4.0f32;
+        let scaling = Some(RopeScaling::Yarn {
+            factor,
+            original_max_position: 4096.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            mscale: 0.1 * factor.ln() + 1.0,
+        });
+        let none = rope_inv_freqs(head_dim, theta, None);
+        let yarn = rope_inv_freqs(head_dim, theta, scaling);
+        // Every YaRN frequency is a convex blend of extrapolation (`none[i]`) and
+        // interpolation (`none[i]/factor`), so it lies between the two.
+        for i in 0..head_dim / 2 {
+            let (lo, hi) = (none[i] / factor - 1e-9, none[i] + 1e-6);
+            assert!(yarn[i] >= lo && yarn[i] <= hi, "yarn[{i}]={} not in [{lo},{hi}]", yarn[i]);
+        }
+        assert_ne!(yarn, none, "YaRN must actually change some frequencies");
+        assert!((rope_mscale(scaling) - (0.1 * factor.ln() + 1.0)).abs() < 1e-6);
+        assert_eq!(rope_mscale(None), 1.0);
+    }
+
+    #[test]
     fn rope_preserves_norm_and_is_identity_at_zero() {
         let inv = rope_inv_freqs(4, 10000.0, None);
         let mut v = vec![1.0, 2.0, 3.0, 4.0];
         let before: f32 = v.iter().map(|x| x * x).sum();
-        rope_inplace(&mut v, 1, 4, 5, &inv);
+        rope_inplace(&mut v, 1, 4, 5, &inv, 1.0);
         let after: f32 = v.iter().map(|x| x * x).sum();
         assert!((before - after).abs() < 1e-3, "rotation preserves norm");
 
         // Position 0 → no rotation.
         let mut w = vec![1.0, 2.0, 3.0, 4.0];
-        rope_inplace(&mut w, 1, 4, 0, &inv);
+        rope_inplace(&mut w, 1, 4, 0, &inv, 1.0);
         approx(&w, &[1.0, 2.0, 3.0, 4.0], 1e-6);
     }
 

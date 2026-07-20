@@ -637,6 +637,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 num_positions as i32,
                 position as i32,
                 cfg.sliding_window.unwrap_or(0) as i32,
+                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
             )
         };
         if code != 0 {
@@ -825,6 +826,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         position as i32,
                         cfg.sliding_window.unwrap_or(0) as i32,
                         cfg.activation.code(),
+                        crate::forward::cpu::rope_mscale(cfg.rope_scaling),
                     )
                 };
                 if code != 0 {

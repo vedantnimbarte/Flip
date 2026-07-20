@@ -233,6 +233,14 @@ struct RawRopeScaling {
     high_freq_factor: Option<f32>,
     #[serde(default)]
     original_max_position_embeddings: Option<u32>,
+    // YaRN.
+    #[serde(default)]
+    beta_fast: Option<f32>,
+    #[serde(default)]
+    beta_slow: Option<f32>,
+    /// Explicit YaRN attention temperature; when absent it's `0.1·ln(factor)+1`.
+    #[serde(default)]
+    attention_factor: Option<f32>,
 }
 
 /// Convert a declared `rope_scaling` block into the [`RopeScaling`] the block
@@ -255,9 +263,21 @@ fn parse_rope_scaling(r: &RawRopeScaling) -> Result<Option<RopeScaling>> {
             high_freq_factor: r.high_freq_factor.unwrap_or(4.0),
             original_max_position: r.original_max_position_embeddings.unwrap_or(8192) as f32,
         })),
+        "yarn" => Ok(Some(RopeScaling::Yarn {
+            factor,
+            original_max_position: r.original_max_position_embeddings.unwrap_or(4096) as f32,
+            beta_fast: r.beta_fast.unwrap_or(32.0),
+            beta_slow: r.beta_slow.unwrap_or(1.0),
+            // HF: default attention factor is `0.1·ln(factor)+1` (1.0 if no scaling).
+            mscale: r.attention_factor.unwrap_or(if factor > 1.0 {
+                0.1 * factor.ln() + 1.0
+            } else {
+                1.0
+            }),
+        })),
         other => Err(DlmError::InvalidConfig(format!(
-            "rope_scaling type {other:?} is not implemented; dlm supports \"linear\" and \
-             \"llama3\". Running this model without its trained RoPE scaling would produce \
+            "rope_scaling type {other:?} is not implemented; dlm supports \"linear\", \"llama3\", \
+             and \"yarn\". Running this model without its trained RoPE scaling would produce \
              incoherent output, so it is refused rather than silently mis-run."
         ))),
     }
@@ -727,6 +747,25 @@ mod tests {
         let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
             "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
         assert!(ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).is_err());
+    }
+
+    #[test]
+    fn parses_yarn_rope_scaling() {
+        use crate::forward::cpu::RopeScaling;
+        let json = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64,
+            "rope_scaling":{"rope_type":"yarn","factor":4.0,
+                "original_max_position_embeddings":4096,"beta_fast":32,"beta_slow":1}}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        match c.rope_scaling {
+            Some(RopeScaling::Yarn { factor, original_max_position, mscale, .. }) => {
+                assert_eq!(factor, 4.0);
+                assert_eq!(original_max_position, 4096.0);
+                // Default attention factor = 0.1·ln(4)+1.
+                assert!((mscale - (0.1 * 4.0f32.ln() + 1.0)).abs() < 1e-6);
+            }
+            other => panic!("expected YaRN, got {other:?}"),
+        }
     }
 
     #[test]

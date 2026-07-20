@@ -188,8 +188,9 @@ static void launch_matvec(int dt, const void* W, const float* x, const float* bi
 // function the CPU block uses. Computing the frequency here instead (powf) would
 // duplicate the formula and let the GPU silently drift from the CPU oracle the
 // moment a RoPE scaling type is added.
+// `mscale` (YaRN attention temperature) scales cos/sin; pass 1.0 otherwise.
 __global__ void rope_kernel(float* v, int num_heads, int head_dim, int position,
-                            const float* inv_freq) {
+                            const float* inv_freq, float mscale) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = head_dim / 2;
     int total = num_heads * half;
@@ -198,7 +199,7 @@ __global__ void rope_kernel(float* v, int num_heads, int head_dim, int position,
     int i = idx % half;
     int base = h * head_dim;
     float ang = (float)position * inv_freq[i];
-    float s = sinf(ang), c = cosf(ang);
+    float s = sinf(ang) * mscale, c = cosf(ang) * mscale;
     float a = v[base + i];
     float b = v[base + i + half];
     v[base + i] = a * c - b * s;
@@ -357,7 +358,8 @@ extern "C" int dlm_decode_block(
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
     int num_positions, int position,
     int sliding_window,                    // 0 = full causal attention (Mistral SWA otherwise)
-    int activation)                        // DLM_ACT_* gate activation (SiLU / GELU)
+    int activation,                        // DLM_ACT_* gate activation (SiLU / GELU)
+    float rope_mscale)                     // YaRN attention temperature (1.0 otherwise)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
@@ -393,8 +395,8 @@ extern "C" int dlm_decode_block(
         // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
-        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
-        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
+        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, rope_mscale);
+        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
 
         // Append this token's K/V into the persistent history at slot num_positions.
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
@@ -461,7 +463,8 @@ extern "C" int dlm_moe_attn(
     float* x,                              // [hidden] in/out (attn residual folded in)
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
     int num_positions, int position,
-    int sliding_window)                    // 0 = full causal attention (Mistral SWA otherwise)
+    int sliding_window,                    // 0 = full causal attention (Mistral SWA otherwise)
+    float rope_mscale)                     // YaRN attention temperature (1.0 otherwise)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
@@ -488,8 +491,8 @@ extern "C" int dlm_moe_attn(
         // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
-        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
-        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
+        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, rope_mscale);
+        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
         attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window);

@@ -250,6 +250,34 @@ fn gpu_sliding_window_matches_cpu() {
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "sliding-window");
 }
 
+/// YaRN RoPE (frequency blend + mscale folded into cos/sin) must match the CPU
+/// oracle: the device `rope_kernel` and CPU `rope_inplace` apply the same scaled
+/// rotation over the shared `rope_inv_freqs`.
+#[test]
+fn gpu_yarn_rope_matches_cpu() {
+    let cfg = BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: Some(dlm::forward::RopeScaling::Yarn {
+            factor: 4.0,
+            original_max_position: 4096.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            mscale: 0.1 * 4.0f32.ln() + 1.0,
+        }),
+        moe: None,
+        sliding_window: None,
+        activation: dlm::forward::Activation::Silu,
+    };
+    let layers = random_layers(&cfg, 2, 0x7A54);
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "yarn-rope");
+}
+
 /// Qwen3 per-head Q/K RMSNorm must match the CPU oracle: the device
 /// `head_rmsnorm_kernel` and CPU `head_rmsnorm` normalize each head identically
 /// before RoPE.
