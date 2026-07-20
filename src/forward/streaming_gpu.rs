@@ -627,6 +627,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 kv_values,
                 num_positions as i32,
                 position as i32,
+                cfg.sliding_window.unwrap_or(0) as i32,
             )
         };
         if code != 0 {
@@ -809,6 +810,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         kv_values,
                         num_positions as i32,
                         position as i32,
+                        cfg.sliding_window.unwrap_or(0) as i32,
                     )
                 };
                 if code != 0 {

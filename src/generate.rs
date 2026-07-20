@@ -487,7 +487,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         // One identity (zero-weight) block: hidden passes through unchanged.
         let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
@@ -608,7 +608,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 32,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         let mut r = SplitMix64::new(42);
         let mut vec = |n: usize| -> Vec<f32> {

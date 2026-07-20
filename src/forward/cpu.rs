@@ -66,6 +66,10 @@ pub struct BlockConfig {
     /// is routed: `intermediate_size` still describes any dense/shared FFN, while
     /// [`MoeConfig::moe_intermediate_size`] sizes each routed expert.
     pub moe: Option<MoeConfig>,
+    /// Sliding-window attention span (Mistral): a query attends only the last
+    /// `window` positions. `None` is full causal attention. Bounds only the
+    /// attention *read*, not KV storage.
+    pub sliding_window: Option<usize>,
 }
 
 impl BlockConfig {
@@ -1242,23 +1246,30 @@ fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
     let scale = 1.0 / (d as f32).sqrt();
     let group = cfg.group_size();
     let positions = kv.len();
+    // Sliding-window attention (Mistral): a query attends only the most recent
+    // `window` positions (itself included). `None` — or a window at least as long
+    // as the history — is ordinary full causal attention.
+    let start = match cfg.sliding_window {
+        Some(w) if w > 0 => positions.saturating_sub(w),
+        _ => 0,
+    };
     let mut context = vec![0.0f32; cfg.q_dim()];
 
     for h in 0..cfg.num_heads {
         let kv_head = h / group;
         let qh = &q[h * d..(h + 1) * d];
 
-        // Scores over every cached position, then softmax.
-        let mut scores = vec![0.0f32; positions];
-        for (p, score) in scores.iter_mut().enumerate() {
-            *score = kv.key_head_dot(p, kv_head, d, qh) * scale;
+        // Scores over the attended window `[start, positions)`, then softmax.
+        let mut scores = vec![0.0f32; positions - start];
+        for (j, score) in scores.iter_mut().enumerate() {
+            *score = kv.key_head_dot(start + j, kv_head, d, qh) * scale;
         }
         softmax_inplace(&mut scores);
 
-        // Weighted sum of values → this head's context.
+        // Weighted sum of the windowed values → this head's context.
         let out = &mut context[h * d..(h + 1) * d];
-        for (p, &w) in scores.iter().enumerate() {
-            kv.value_head_accumulate(p, kv_head, d, w, out);
+        for (j, &w) in scores.iter().enumerate() {
+            kv.value_head_accumulate(start + j, kv_head, d, w, out);
         }
     }
     context
@@ -1424,6 +1435,49 @@ mod tests {
     use super::*;
     use crate::model::MoeNaming;
 
+    /// Sliding-window attention must attend *only* the last `window` positions:
+    /// a windowed run equals full attention computed over just that tail, and a
+    /// window at least as long as the history is identical to full attention.
+    #[test]
+    fn sliding_window_attends_only_recent_positions() {
+        let base = BlockConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 2,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+        };
+        // Four cached positions with distinct K/V.
+        let fill = |from: usize| {
+            let mut kv = KvLayerCache::new(2);
+            for i in from..4 {
+                kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+            }
+            kv
+        };
+        let kv_all = fill(0);
+        let q = [1.0f32, 0.0];
+
+        let full = attention(&base, &q, &kv_all);
+        let mut win2 = base;
+        win2.sliding_window = Some(2);
+        let windowed = attention(&win2, &q, &kv_all);
+        assert_ne!(full, windowed, "window of 2 over 4 positions should differ from full");
+
+        // window=2 over all 4 positions == full attention over just the last 2.
+        approx(&windowed, &attention(&base, &q, &fill(2)), 1e-6);
+
+        // A window >= the history is exactly full attention.
+        let mut win_big = base;
+        win_big.sliding_window = Some(10);
+        approx(&attention(&win_big, &q, &kv_all), &full, 1e-6);
+    }
+
     fn approx(a: &[f32], b: &[f32], eps: f32) {
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b) {
@@ -1533,7 +1587,7 @@ mod tests {
             intermediate_size: 6,
             rope_theta: 10000.0,
             rms_eps: 1e-5,
-            rope_scaling: None, moe: None,
+            rope_scaling: None, moe: None, sliding_window: None,
         };
         let hidden = vec![1.5, -2.0, 0.5, 3.0];
 
@@ -1569,7 +1623,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
@@ -1587,7 +1641,7 @@ mod tests {
             head_dim: 1,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
@@ -1605,7 +1659,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 6,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1639,7 +1693,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
@@ -1680,7 +1734,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
@@ -1705,7 +1759,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1725,7 +1779,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             rope_scaling: None,
-            moe: Some(m),
+            moe: Some(m), sliding_window: None,
         }
     }
 
