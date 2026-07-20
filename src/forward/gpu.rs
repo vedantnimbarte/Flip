@@ -67,6 +67,8 @@ extern "C" {
         sliding_window: i32,
         // Gate activation (DLM_ACT_*): SiLU (0) or GELU (1, Gemma).
         activation: i32,
+        // YaRN attention temperature folded into cos/sin; 1.0 otherwise.
+        rope_mscale: f32,
     ) -> i32;
 
     /// MoE layer, part 1: attention sublayer + post-attn norm. Leaves `normed2`
@@ -102,6 +104,8 @@ extern "C" {
         position: i32,
         // Sliding-window span (Mistral); 0 = full causal attention.
         sliding_window: i32,
+        // YaRN attention temperature folded into cos/sin; 1.0 otherwise.
+        rope_mscale: f32,
     ) -> i32;
 
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
@@ -328,6 +332,7 @@ impl ComputeKernel for GpuKernel {
                 position as i32,
                 self.cfg.sliding_window.unwrap_or(0) as i32,
                 self.cfg.activation.code(),
+                crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
             )
         };
         if code != 0 {
