@@ -1049,3 +1049,60 @@ fn gpu_mla_dense_streaming_matches_cpu() {
     let layers = random_mla_layers(&cfg, sh, 6, 0xD5F0, None);
     assert_mla_dense_streaming(cfg, layers, "mla+dense");
 }
+
+/// GPU prefix caching: a session resumed from a cached snapshot must decode
+/// identically to one that prefilled the whole prompt itself.
+///
+/// This is the regression guard for the round trip that makes prefix caching
+/// work on GPU at all — `snapshot_synced` pulls the real K/V out of VRAM (the
+/// host cache holds only length placeholders there), and `gpu_kv` re-uploads it
+/// when the snapshot is resumed. Before that, a resumed prefix attended over a
+/// freshly-zeroed device buffer and silently produced wrong output, which is why
+/// `--prefix-cache-size` used to be refused with `--device gpu`.
+#[test]
+fn gpu_resumed_prefix_matches_full_prefill() {
+    let cfg = small_cfg();
+    let num_layers = 3u32;
+    let layers = random_layers(&cfg, num_layers, 0x9E7C);
+    let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+
+    // Decode `steps` tokens, optionally snapshotting after `split` of them and
+    // resuming from that snapshot — the two must agree step for step.
+    let run = |split: Option<usize>| -> Vec<Vec<f32>> {
+        let mut orch = ForwardOrchestrator::new(
+            &gpu,
+            PagedKvCache::new(kv_cfg, 16),
+            dlm::forward::KvQuant::None,
+        );
+        let mut h: Vec<f32> = (0..cfg.hidden_size).map(|i| (i as f32) * 0.02 - 0.3).collect();
+        let mut out = Vec::new();
+        for step in 0..6 {
+            if Some(step) == split {
+                // Round-trip the session through a synced snapshot.
+                let snap = orch.snapshot_synced().unwrap();
+                orch = ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap)
+                    .unwrap();
+            }
+            orch.decode_token(&mut h).unwrap();
+            out.push(h.clone());
+        }
+        out
+    };
+
+    let straight = run(None);
+    // Resume mid-sequence, where there is real history to carry across.
+    let resumed = run(Some(3));
+    for (step, (a, b)) in straight.iter().zip(&resumed).enumerate() {
+        let max_diff = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "step {step}: resumed prefix diverged from full prefill by {max_diff}"
+        );
+    }
+}

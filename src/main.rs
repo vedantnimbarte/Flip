@@ -599,18 +599,12 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // refuse it rather than mislead. (Multi-GPU runs the CPU kernel with
             // per-device dispatch, so its host KV is real and prefix caching is
             // fine there.)
-            if args.multi_gpu_ids.is_empty()
-                && device == Device::Gpu
-                && args.prefix_cache_size > 0
-            {
-                return Err(DlmError::InvalidConfig(
-                    "--prefix-cache-size is not supported with --device gpu: the prefix KV \
-                     snapshot is host-side, but the GPU keeps K/V in VRAM, so a resumed prefix \
-                     would read empty history and silently produce wrong output. Omit \
-                     --prefix-cache-size on the GPU."
-                        .into(),
-                ));
-            }
+            // (Prefix caching used to be refused here: the snapshot is host-side
+            // while the GPU keeps K/V in VRAM, so it captured only the length
+            // placeholders. The scheduler now takes the snapshot through
+            // `snapshot_synced`, which copies the device K/V back to the host
+            // first, and `gpu_kv` re-uploads it when a snapshot is resumed — so
+            // the GPU path is supported.)
 
             // Streaming path: keep only a window of layers resident and stream the
             // rest from disk, so a model can exceed the resident budget. Streams to

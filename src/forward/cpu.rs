@@ -998,10 +998,37 @@ impl KvLayerCache {
         if self.gpu.is_none() {
             let len = capacity_tokens * self.kv_dim.max(1);
             let values_len = if needs_values { len } else { 1 };
-            self.gpu = Some(GpuKvHandle {
+            let handle = GpuKvHandle {
                 keys: crate::gpu::device::DeviceBuffer::new(len)?,
                 values: crate::gpu::device::DeviceBuffer::new(values_len)?,
-            });
+            };
+            // A cache that already holds history is a **resumed prefix** (see
+            // `sync_from_device`): seed the device with it, or the kernel would
+            // attend over a freshly-zeroed buffer while `len()` claims the tokens
+            // are there. A fresh session has `len() == 0` and skips this.
+            let n = self.len();
+            if n > 0 {
+                let d = self.kv_dim;
+                if n > capacity_tokens {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "resumed prefix has {n} tokens but GPU KV capacity is {capacity_tokens}"
+                    )));
+                }
+                let mut keys = vec![0.0f32; n * d];
+                let mut values = vec![0.0f32; n * d];
+                for (i, (k, v)) in keys
+                    .chunks_exact_mut(d)
+                    .zip(values.chunks_exact_mut(d))
+                    .enumerate()
+                {
+                    self.row_f32(i, k, v);
+                }
+                handle.keys.upload(&keys)?;
+                if needs_values {
+                    handle.values.upload(&values)?;
+                }
+            }
+            self.gpu = Some(handle);
         }
         let h = self.gpu.as_ref().unwrap();
         Ok((h.keys.as_mut_ptr(), h.values.as_mut_ptr()))
@@ -1133,6 +1160,76 @@ impl KvLayerCache {
                     .sum()
             }
         }
+    }
+
+    /// Read cached row `pos` back as `f32` (dequantizing int8/int4), into
+    /// `key_out`/`value_out` of length `kv_dim`. The inverse of [`append`], used
+    /// to move a session's history onto the device when a prefix snapshot is
+    /// resumed on the GPU path.
+    ///
+    /// [`append`]: Self::append
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
+    fn row_f32(&self, pos: usize, key_out: &mut [f32], value_out: &mut [f32]) {
+        let d = self.kv_dim;
+        match &self.store {
+            KvStore::Full { keys, values } => {
+                let base = pos * d;
+                key_out.copy_from_slice(&keys[base..base + d]);
+                value_out.copy_from_slice(&values[base..base + d]);
+            }
+            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+                let base = pos * d;
+                let (ks, vs) = (key_scales[pos], value_scales[pos]);
+                for (j, o) in key_out.iter_mut().enumerate() {
+                    *o = keys[base + j] as f32 * ks;
+                }
+                for (j, o) in value_out.iter_mut().enumerate() {
+                    *o = values[base + j] as f32 * vs;
+                }
+            }
+            KvStore::Int4 { keys, key_scales, values, value_scales } => {
+                let byte_base = pos * d.div_ceil(2);
+                let (ks, vs) = (key_scales[pos], value_scales[pos]);
+                for (j, o) in key_out.iter_mut().enumerate() {
+                    *o = read_i4(keys, byte_base, j) * ks;
+                }
+                for (j, o) in value_out.iter_mut().enumerate() {
+                    *o = read_i4(values, byte_base, j) * vs;
+                }
+            }
+        }
+    }
+
+    /// Copy this session's **device** K/V back into the host store, replacing the
+    /// length placeholders the GPU path writes there.
+    ///
+    /// On the GPU kernels the real history lives in VRAM and the host cache holds
+    /// only zeros to keep lengths in step. A prefix-cache snapshot is host-side,
+    /// so without this it would capture those zeros and a resumed prefix would
+    /// attend over empty history — silently wrong output. Call before snapshotting.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub fn sync_from_device(&mut self) -> Result<()> {
+        let n = self.len();
+        let Some(h) = &self.gpu else { return Ok(()) };
+        if n == 0 {
+            return Ok(());
+        }
+        let d = self.kv_dim;
+        let mut keys = vec![0.0f32; n * d];
+        h.keys.download(&mut keys)?;
+        // MLA reconstructs V from the cached latent and allocates no value
+        // buffer, so there is nothing to read back for it.
+        let mut values = vec![0.0f32; n * d];
+        if h.values.len() >= n * d {
+            h.values.download(&mut values)?;
+        }
+        // Rewrite through `append` so every quantization variant is handled by
+        // the one code path that already knows how to store a row.
+        self.truncate(0);
+        for i in 0..n {
+            self.append(&keys[i * d..(i + 1) * d], &values[i * d..(i + 1) * d])?;
+        }
+        Ok(())
     }
 
     /// Add `w × value_head(pos)` into `out` (dequantized inline for int8/4).
@@ -2013,6 +2110,47 @@ mod tests {
         let mut win_big = base;
         win_big.sliding_window = Some(10);
         approx(&attention(&win_big, &q, &kv_all), &full, 1e-6);
+    }
+
+    /// `row_f32` is the inverse of `append` and the hinge of GPU prefix caching:
+    /// a resumed snapshot's history is read back through it and re-uploaded to
+    /// the device. If it disagreed with `append`'s storage layout, a resumed
+    /// prefix would attend over corrupted history — so round-trip every KV
+    /// precision, including the int4 nibble packing.
+    #[test]
+    fn kv_row_round_trips_through_every_precision() {
+        let d = 6usize;
+        let rows: Vec<(Vec<f32>, Vec<f32>)> = (0..3)
+            .map(|i| {
+                let k: Vec<f32> = (0..d).map(|j| (i as f32 + 1.0) * 0.3 - j as f32 * 0.11).collect();
+                let v: Vec<f32> = (0..d).map(|j| (j as f32) * 0.07 - (i as f32) * 0.19).collect();
+                (k, v)
+            })
+            .collect();
+
+        for (quant, tol) in [
+            (KvQuant::None, 1e-6f32),
+            // Quantized stores are lossy by construction; the tolerance tracks
+            // the per-row scale, not an arbitrary fudge.
+            (KvQuant::Int8, 0.01),
+            (KvQuant::Int4, 0.12),
+        ] {
+            let mut kv = KvLayerCache::new_quant(d, quant);
+            for (k, v) in &rows {
+                kv.append(k, v).unwrap();
+            }
+            assert_eq!(kv.len(), rows.len());
+            for (i, (k, v)) in rows.iter().enumerate() {
+                let (mut gk, mut gv) = (vec![0.0; d], vec![0.0; d]);
+                kv.row_f32(i, &mut gk, &mut gv);
+                for (a, b) in gk.iter().zip(k) {
+                    assert!((a - b).abs() <= tol, "{quant:?} key row {i}: {a} vs {b}");
+                }
+                for (a, b) in gv.iter().zip(v) {
+                    assert!((a - b).abs() <= tol, "{quant:?} value row {i}: {a} vs {b}");
+                }
+            }
+        }
     }
 
     /// Gemma2 alternates local and global layers: with a period of 2 the even

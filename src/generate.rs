@@ -589,6 +589,14 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
         self.orchestrator.snapshot()
     }
 
+    /// Snapshot for the prefix cache, pulling device-resident K/V back to the
+    /// host first so the snapshot is real on the GPU kernels too (where the host
+    /// caches otherwise hold only length placeholders). See
+    /// [`ForwardOrchestrator::snapshot_synced`](crate::forward::ForwardOrchestrator::snapshot_synced).
+    pub fn snapshot_synced(&mut self) -> Result<crate::forward::KvSnapshot> {
+        self.orchestrator.snapshot_synced()
+    }
+
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
         let mut logits = self.generator.logits(&self.last_hidden);

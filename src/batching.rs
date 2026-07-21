@@ -303,7 +303,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         .prefix_cache
                         .as_ref()
                         .and_then(|c| c.longest_prefix(&p.prompt));
-                    let session = match resume {
+                    let mut session = match resume {
                         Some(snap) => {
                             self.resume_hits += 1;
                             // Pass the whole prompt so the repetition penalty covers
@@ -313,7 +313,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         None => self.generator.start_session(&p.prompt, p.sampler)?,
                     };
                     if let Some(cache) = self.prefix_cache.as_mut() {
-                        cache.insert(p.prompt.clone(), session.snapshot());
+                        // `_synced`: on the GPU kernels the real K/V is in VRAM,
+                        // so an unsynced snapshot would cache zeros.
+                        cache.insert(p.prompt.clone(), session.snapshot_synced()?);
                     }
                     Decoder::Plain(session)
                 }
