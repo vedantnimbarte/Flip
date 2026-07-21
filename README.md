@@ -429,7 +429,7 @@ names. That covers:
 | Mixtral (and Mixtral-layout MoE) | supported — top-k routing over `block_sparse_moe.experts.*` |
 | Qwen2-MoE / Qwen3-MoE | supported — routed experts + optional sigmoid-gated shared expert |
 | GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
-| DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN). GPU covers MLA + a dense FFN; MLA + MoE and streamed-MLA on GPU still run on CPU |
+| DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU. MLA + MoE runs on the streaming GPU path (the resident kernel holds no routed experts, so `--no-stream` refuses it) |
 | Gemma2 | **not supported** — needs attention logit softcapping + alternating sliding-window layers |
 
 **MoE models** route each token through the top-k experts the router selects

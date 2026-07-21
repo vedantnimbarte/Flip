@@ -781,3 +781,205 @@ fn gpu_moe_matches_cpu_with_shared_expert() {
         "shared-expert",
     );
 }
+
+// ── MLA on the streaming GPU kernel ──────────────────────────────────────────
+//
+// The resident kernel covers MLA + a dense FFN (`gpu_mla_matches_cpu` above).
+// DeepSeek-V2/V3 is MLA + **MoE**, which only the streaming kernel can run (it
+// alone caches routed experts per `(layer, expert)`). These two cases pin the
+// streaming MLA path against the CPU oracle, whose `decode_block` branches
+// attention on `w.mla` and the FFN on `w.ffn` independently — the exact split
+// the GPU path mirrors with `dlm_mla_attn` + (`dlm_dense_ffn` | `dlm_moe_norm`
+// then the router/expert calls).
+
+/// MLA dims used by both streaming cases: `head_dim == qk_nope + qk_rope`.
+fn mla_test_config(moe: Option<MoeConfig>) -> (BlockConfig, MlaShape) {
+    use dlm::model::MlaConfig;
+    let shape = MlaShape { nh: 2, nope: 4, rope: 4, latent: 8, vdim: 4, ql: 12 };
+    let cfg = BlockConfig {
+        hidden_size: 16,
+        num_heads: shape.nh,
+        num_kv_heads: shape.nh,
+        head_dim: shape.nope + shape.rope,
+        intermediate_size: 16,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe,
+        sliding_window: None,
+        activation: dlm::forward::Activation::Silu,
+        mla: Some(MlaConfig {
+            q_lora_rank: Some(shape.ql as u32),
+            kv_lora_rank: shape.latent as u32,
+            qk_nope_head_dim: shape.nope as u32,
+            qk_rope_head_dim: shape.rope as u32,
+            v_head_dim: shape.vdim as u32,
+        }),
+    };
+    (cfg, shape)
+}
+
+#[derive(Clone, Copy)]
+struct MlaShape {
+    nh: usize,
+    nope: usize,
+    rope: usize,
+    latent: usize,
+    vdim: usize,
+    ql: usize,
+}
+
+/// Build `n` MLA layers carrying `ffn` — dense or MoE (experts inline; the
+/// streaming source empties them for the core and serves them on demand).
+fn random_mla_layers(
+    cfg: &BlockConfig,
+    sh: MlaShape,
+    n: u32,
+    seed: u64,
+    moe: Option<MoeConfig>,
+) -> Vec<LayerTensors> {
+    use dlm::forward::MlaWeights;
+    let mut rng = Rng::new(seed);
+    let h = cfg.hidden_size;
+    let s = 0.05;
+    let qk = sh.nope + sh.rope;
+    (0..n)
+        .map(|_| {
+            let ffn = match moe {
+                None => Ffn::Dense(ExpertFfn {
+                    gate: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
+                    up: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
+                    down: Weights::from_f32(rng.vec(h * cfg.intermediate_size, s)),
+                }),
+                Some(m) => {
+                    let inter = m.moe_intermediate_size as usize;
+                    let shared_inter = m.shared_intermediate_size.map(|si| si as usize);
+                    Ffn::Moe {
+                        router: Weights::from_f32(rng.vec(m.num_experts as usize * h, s)),
+                        experts: (0..m.num_experts)
+                            .map(|_| ExpertFfn {
+                                gate: Weights::from_f32(rng.vec(inter * h, s)),
+                                up: Weights::from_f32(rng.vec(inter * h, s)),
+                                down: Weights::from_f32(rng.vec(h * inter, s)),
+                            })
+                            .collect(),
+                        shared: shared_inter.map(|si| ExpertFfn {
+                            gate: Weights::from_f32(rng.vec(si * h, s)),
+                            up: Weights::from_f32(rng.vec(si * h, s)),
+                            down: Weights::from_f32(rng.vec(h * si, s)),
+                        }),
+                        shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+                    }
+                }
+            };
+            LayerTensors {
+                // MLA's o_proj is num_heads*v_head_dim wide, not q_dim.
+                o_proj: Weights::from_f32(rng.vec(h * sh.nh * sh.vdim, s)),
+                ffn,
+                input_layernorm: vec![1.0; h],
+                post_attention_layernorm: vec![1.0; h],
+                mla: Some(MlaWeights {
+                    q_a_proj: Some(Weights::from_f32(rng.vec(sh.ql * h, s))),
+                    q_a_layernorm: Some(vec![1.0; sh.ql]),
+                    q_b_proj: Weights::from_f32(rng.vec(sh.nh * qk * sh.ql, s)),
+                    kv_a_proj: Weights::from_f32(rng.vec((sh.latent + sh.rope) * h, s)),
+                    kv_a_layernorm: vec![1.0; sh.latent],
+                    kv_b_proj: Weights::from_f32(rng.vec(sh.nh * (sh.nope + sh.vdim) * sh.latent, s)),
+                }),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// MLA + MoE: streamed core (experts served on demand) vs the resident CPU oracle.
+fn assert_mla_moe_streaming(cfg: BlockConfig, layers: Vec<LayerTensors>, what: &str) {
+    let n = layers.len() as u32;
+    let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers), 64, 2, None).unwrap();
+    run_streaming_parity(cfg, n, cpu, gpu, what);
+}
+
+/// MLA + dense: whole layers streamed, vs the resident CPU oracle.
+fn assert_mla_dense_streaming(cfg: BlockConfig, layers: Vec<LayerTensors>, what: &str) {
+    let n = layers.len() as u32;
+    let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+    let gpu = StreamingGpuKernel::new(cfg, VecSource(layers), 64, 2, None).unwrap();
+    run_streaming_parity(cfg, n, cpu, gpu, what);
+}
+
+/// Decode on both from the same start state and assert they track.
+/// `resident_layers = 2` of 6 forces real eviction and re-upload, so the MLA
+/// sync-upload path is exercised repeatedly rather than once.
+fn run_streaming_parity<S: LayerSource + 'static>(
+    cfg: BlockConfig,
+    num_layers: u32,
+    cpu: CpuKernel,
+    gpu: StreamingGpuKernel<S>,
+    what: &str,
+) {
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu =
+        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+    let mut orch_gpu =
+        ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+
+    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.02 - 0.3).collect();
+    let mut h_gpu = h_cpu.clone();
+    for step in 0..4 {
+        orch_cpu.decode_token(&mut h_cpu).unwrap();
+        orch_gpu.decode_token(&mut h_gpu).unwrap();
+        let max_diff =
+            h_cpu.iter().zip(&h_gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 2e-3, "{what}: step {step}: streaming GPU diverged by {max_diff}");
+    }
+}
+
+/// **DeepSeek-V2/V3 shape**: MLA attention + routed MoE on the streaming kernel.
+/// Exercises `dlm_mla_attn` → `dlm_moe_norm` → router → per-expert application,
+/// i.e. that MLA leaves the same `normed2` the standard-attention path does.
+#[test]
+fn gpu_mla_moe_streaming_matches_cpu() {
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 16,
+        shared_intermediate_size: None,
+        norm_topk_prob: true,
+        naming: MoeNaming::Mixtral,
+    };
+    let (cfg, sh) = mla_test_config(Some(m));
+    let layers = random_mla_layers(&cfg, sh, 6, 0xD5EE, Some(m));
+    assert_mla_moe_streaming(cfg, layers, "mla+moe");
+}
+
+/// MLA + a **shared** expert (DeepSeek-V2 uses one): the shared-gate sigmoid must
+/// read the same `normed2` as the routed experts on the MLA path too.
+#[test]
+fn gpu_mla_moe_streaming_matches_cpu_with_shared_expert() {
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 16,
+        shared_intermediate_size: Some(16),
+        norm_topk_prob: true,
+        naming: MoeNaming::Qwen,
+    };
+    let (cfg, sh) = mla_test_config(Some(m));
+    let layers = random_mla_layers(&cfg, sh, 6, 0xD5EF, Some(m));
+    assert_mla_moe_streaming(cfg, layers, "mla+moe+shared");
+}
+
+/// MLA + dense FFN on the *streaming* kernel (the resident equivalent is
+/// `gpu_mla_matches_cpu`). Covers the MLA sync-upload path under eviction.
+#[test]
+fn gpu_mla_dense_streaming_matches_cpu() {
+    let (cfg, sh) = mla_test_config(None);
+    let layers = random_mla_layers(&cfg, sh, 6, 0xD5F0, None);
+    assert_mla_dense_streaming(cfg, layers, "mla+dense");
+}
