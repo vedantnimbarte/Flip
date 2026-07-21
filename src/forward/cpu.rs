@@ -875,13 +875,24 @@ impl KvLayerCache {
     /// position and attends over. Because each session owns its own
     /// [`KvLayerCache`], batched sessions never collide in KV — the fix for
     /// running concurrent requests on the shared GPU kernel.
+    ///
+    /// `needs_values` is false on the **MLA** path, which caches one compressed
+    /// latent per token in `keys` and reconstructs K *and* V from it — there is no
+    /// separate value cache. Allocating one anyway would double the KV footprint
+    /// and give back exactly the memory MLA exists to save, so the returned
+    /// `values` pointer is a 1-element dummy the MLA kernel never reads.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    pub fn gpu_kv(&mut self, capacity_tokens: usize) -> Result<(*mut f32, *mut f32)> {
+    pub fn gpu_kv(
+        &mut self,
+        capacity_tokens: usize,
+        needs_values: bool,
+    ) -> Result<(*mut f32, *mut f32)> {
         if self.gpu.is_none() {
             let len = capacity_tokens * self.kv_dim.max(1);
+            let values_len = if needs_values { len } else { 1 };
             self.gpu = Some(GpuKvHandle {
                 keys: crate::gpu::device::DeviceBuffer::new(len)?,
-                values: crate::gpu::device::DeviceBuffer::new(len)?,
+                values: crate::gpu::device::DeviceBuffer::new(values_len)?,
             });
         }
         let h = self.gpu.as_ref().unwrap();

@@ -13,6 +13,13 @@
 //! layers are allocated up front and persist across weight evictions, so
 //! attention still sees full history.
 //!
+//! It also covers the two shapes the resident kernel can't: **routed MoE** (only
+//! the top-k experts a token selects are materialized, cached per `(layer,
+//! expert)`) and **MLA** (DeepSeek's compressed-latent attention), including the
+//! combination — MLA + MoE is DeepSeek-V2/V3. Attention branches on the layer's
+//! `mla` weights and the FFN on its `ffn`, independently, exactly as the CPU
+//! oracle's `decode_block_streaming_moe` does.
+//!
 //! Validated on-device against the CPU oracle by [`tests/gpu_parity.rs`]
 //! (`streaming_gpu_matches_resident` drives real evictions and asserts the output
 //! equals the fully-resident kernel's). CI has no GPU, so that check is manual —
@@ -34,7 +41,8 @@ use std::thread::JoinHandle;
 // Restating the `extern` block let this path keep calling the old ABI after the
 // kernel signature changed — a silent mismatch the compiler only warns about.
 use crate::forward::gpu::{
-    bias_ptr, dlm_apply_expert, dlm_decode_block, dlm_moe_attn, dlm_moe_matvec, upload_bias,
+    bias_ptr, dlm_apply_expert, dlm_decode_block, dlm_dense_ffn, dlm_mla_attn, dlm_moe_attn,
+    dlm_moe_matvec, dlm_moe_norm, upload_bias, upload_weight, GpuMla,
 };
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -91,6 +99,10 @@ struct GpuWeights {
     /// Qwen3 per-head Q/K RMSNorm weights (NULL to the kernel when absent).
     q_norm: Option<DeviceBuffer>,
     k_norm: Option<DeviceBuffer>,
+    /// MLA (DeepSeek) attention projections; `None` for standard attention. When
+    /// set, `q_proj`/`k_proj`/`v_proj` are unused dummies and attention runs
+    /// through `dlm_mla_attn` instead.
+    mla: Option<GpuMla>,
     /// Native dtype of the attention projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -192,41 +204,60 @@ impl GpuWeights {
             v_bias: upload_bias(t.v_bias.as_ref())?,
             q_norm: upload_bias(t.q_norm.as_ref())?,
             k_norm: upload_bias(t.k_norm.as_ref())?,
+            // The staged fast path is standard-attention only; MLA layers take
+            // `upload_sync` (their projection set doesn't fit this layout).
+            mla: None,
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
         })
     }
 
-    /// Upload a MoE layer's **core** (attention, norms, router, shared expert)
-    /// synchronously. The routed experts are not here — they stream on demand
-    /// into the per-`(layer, expert)` cache. Synchronous per-tensor copies keep
-    /// this simple; the async pinned-staging path is a dense-only fast path.
+    /// Upload a layer **synchronously**, with plain per-tensor copies, for every
+    /// layer shape the pinned-staging fast path can't express:
     ///
-    /// ponytail: MoE core uses plain `from_bytes` uploads, not the pinned async
-    /// staging the dense path uses. Wire the core through staging too if MoE
-    /// core-upload latency shows up in profiles.
-    fn upload_moe_core(t: &LayerTensors) -> Result<Self> {
-        let (router, experts, shared, shared_gate) = t.moe()?;
-        debug_assert!(experts.is_empty(), "GPU core must be loaded without routed experts");
+    /// * **MoE cores** — attention, norms, router, shared expert. The routed
+    ///   experts are not here; they stream on demand into the per-`(layer,
+    ///   expert)` cache.
+    /// * **MLA layers** — a different projection set (`q/k/v` are empty and the
+    ///   compressed `q_a/q_b/kv_a/kv_b` take their place), so the fixed 9-tensor
+    ///   staging layout doesn't fit.
+    ///
+    /// ponytail: plain `from_bytes` uploads, not the pinned async staging the
+    /// dense path uses. Wire these through staging too if their upload latency
+    /// shows up in profiles.
+    fn upload_sync(t: &LayerTensors) -> Result<Self> {
         let up = |w: &crate::forward::Weights| DeviceBuffer::from_bytes(w.as_bytes(), w.len());
-        let shared_gpu = shared.map(GpuExpert::upload).transpose()?;
-        let (sg_dtype, sg_group) = shared_gate
-            .map(|g| (g.dtype_code(), g.group_size() as i32))
-            .unwrap_or((0, 0));
+        let ffn = match &t.ffn {
+            crate::forward::Ffn::Moe { .. } => {
+                let (router, experts, shared, shared_gate) = t.moe()?;
+                debug_assert!(experts.is_empty(), "GPU core must be loaded without routed experts");
+                let (sg_dtype, sg_group) = shared_gate
+                    .map(|g| (g.dtype_code(), g.group_size() as i32))
+                    .unwrap_or((0, 0));
+                GpuFfn::Moe {
+                    router: up(router)?,
+                    router_dtype: router.dtype_code(),
+                    router_group: router.group_size() as i32,
+                    shared: shared.map(GpuExpert::upload).transpose()?,
+                    shared_gate: shared_gate.map(up).transpose()?,
+                    shared_gate_dtype: sg_dtype,
+                    shared_gate_group: sg_group,
+                }
+            }
+            crate::forward::Ffn::Dense(_) => GpuFfn::Dense(GpuExpert::upload(t.dense_ffn()?)?),
+        };
+        // MLA layers carry their attention dtype on the MLA weights, not q_proj
+        // (which is empty for them) — same rule the resident `GpuLayer` uses.
+        let (w_dtype, w_group_size) = match &t.mla {
+            Some(mw) => (mw.q_b_proj.dtype_code(), mw.q_b_proj.group_size() as i32),
+            None => (t.q_proj.dtype_code(), t.q_proj.group_size() as i32),
+        };
         Ok(Self {
-            q_proj: up(&t.q_proj)?,
-            k_proj: up(&t.k_proj)?,
-            v_proj: up(&t.v_proj)?,
-            o_proj: up(&t.o_proj)?,
-            ffn: GpuFfn::Moe {
-                router: up(router)?,
-                router_dtype: router.dtype_code(),
-                router_group: router.group_size() as i32,
-                shared: shared_gpu,
-                shared_gate: shared_gate.map(up).transpose()?,
-                shared_gate_dtype: sg_dtype,
-                shared_gate_group: sg_group,
-            },
+            q_proj: upload_weight(&t.q_proj)?,
+            k_proj: upload_weight(&t.k_proj)?,
+            v_proj: upload_weight(&t.v_proj)?,
+            o_proj: upload_weight(&t.o_proj)?,
+            ffn,
             input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
             post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
             q_bias: upload_bias(t.q_bias.as_ref())?,
@@ -234,8 +265,9 @@ impl GpuWeights {
             v_bias: upload_bias(t.v_bias.as_ref())?,
             q_norm: upload_bias(t.q_norm.as_ref())?,
             k_norm: upload_bias(t.k_norm.as_ref())?,
-            w_dtype: t.q_proj.dtype_code(),
-            w_group_size: t.q_proj.group_size() as i32,
+            mla: t.mla.as_ref().map(GpuMla::upload).transpose()?,
+            w_dtype,
+            w_group_size,
         })
     }
 }
@@ -453,11 +485,17 @@ impl<S: LayerSource> GpuShared<S> {
             // dense path stages through pinned memory on the non-blocking copy
             // stream so the PCIe transfer overlaps the default-stream kernel; the
             // MoE path uploads just the layer *core* (attention + router + shared),
-            // its routed experts streaming separately per `(layer, expert)`.
+            // its routed experts streaming separately per `(layer, expert)`. MLA
+            // layers take the sync path either way — their projection set doesn't
+            // fit the staged dense layout.
             let uploaded = if self.cfg.moe.is_some() {
                 self.source
                     .load_layer_core(layer)
-                    .and_then(|t| GpuWeights::upload_moe_core(&t).map(Arc::new))
+                    .and_then(|t| GpuWeights::upload_sync(&t).map(Arc::new))
+            } else if self.cfg.mla.is_some() {
+                self.source
+                    .load_layer(layer)
+                    .and_then(|t| GpuWeights::upload_sync(&t).map(Arc::new))
             } else {
                 self.source.load_layer(layer).and_then(|t| {
                     let mut staging = self.staging.lock().unwrap();
@@ -537,6 +575,9 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     /// RoPE inverse frequencies (see [`GpuKernel`](crate::forward::GpuKernel)):
     /// computed once by the shared host function, resident for the kernel's life.
     inv_freq: DeviceBuffer,
+    /// MLA decoupled-RoPE frequencies (over `qk_rope_head_dim`); `None` for
+    /// standard attention.
+    mla_inv_freq: Option<DeviceBuffer>,
     /// Persistent device hidden buffer, chained across the streamed layer stack:
     /// uploaded once before layer 0 and downloaded once after the last layer, so
     /// only weights (not the hidden vector) cross the bus per layer. Safe because
@@ -563,19 +604,21 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         resident_layers: usize,
         expert_cache_capacity: Option<usize>,
     ) -> Result<Self> {
-        if cfg.mla.is_some() {
-            return Err(DlmError::InvalidConfig(
-                "Multi-head Latent Attention (MLA / DeepSeek) is not yet supported on the GPU; \
-                 run MLA models on CPU (--device cpu)."
-                    .into(),
-            ));
-        }
         let num_layers = source.num_layers();
         let cap = max_kv_tokens.max(1);
         // KV is per-session (owned by each sequence's KvLayerCache), so the kernel
         // allocates none here — batched sessions keep isolated history.
         // Page-locked staging sized to one layer's weights (all layers same size).
-        let staging_bytes = GpuWeights::f32_count(&cfg) * std::mem::size_of::<f32>();
+        // MLA layers never use the staged path (`upload_sync` instead), so they
+        // need no real staging buffer — and `f32_count`'s dense layout doesn't
+        // describe them anyway. One byte (rounded to a page) rather than zero:
+        // `PinnedBuffer::with_len(0)` is an error, and a spare page is cheaper
+        // than making the field optional for a buffer nothing reads.
+        let staging_bytes = if cfg.mla.is_some() {
+            1
+        } else {
+            GpuWeights::f32_count(&cfg) * std::mem::size_of::<f32>()
+        };
         // Expert cache capacity: prefer the VRAM-budget-derived count the caller
         // passes; else fall back to a per-window count heuristic (tests, dense).
         let expert_capacity = expert_cache_capacity.unwrap_or_else(|| {
@@ -617,12 +660,23 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             cfg.rope_theta,
             cfg.rope_scaling,
         ))?;
+        // MLA rotates only its decoupled qk_rope sub-dimension (same rule as the
+        // resident `GpuKernel`).
+        let mla_inv_freq = match &cfg.mla {
+            Some(m) => Some(DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
+                m.qk_rope_head_dim as usize,
+                cfg.rope_theta,
+                cfg.rope_scaling,
+            ))?),
+            None => None,
+        };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         Ok(Self {
             shared,
             num_layers,
             kv_capacity_tokens: cap,
             inv_freq,
+            mla_inv_freq,
             d_hidden,
             prefetch_tx: Some(tx),
             worker: Some(worker),
@@ -659,19 +713,6 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     ) -> Result<()> {
         use std::ffi::c_void;
         let cfg = &self.shared.cfg;
-        let m = cfg.moe.expect("run_moe_block on a dense model");
-        let GpuFfn::Moe {
-            router,
-            router_dtype,
-            router_group,
-            shared,
-            shared_gate,
-            shared_gate_dtype,
-            shared_gate_group,
-        } = &w.ffn
-        else {
-            unreachable!("run_moe_block on a dense layer");
-        };
 
         // 1. Attention sublayer + post-attn norm; leaves normed2 in device scratch.
         let code = unsafe {
@@ -709,6 +750,31 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         if code != 0 {
             return Err(DlmError::Gpu { api: "dlm_moe_attn", code });
         }
+        self.run_moe_ffn(layer, w, d_hidden)
+    }
+
+    /// The routed-expert FFN half of a MoE layer: router → top-k → per-expert
+    /// application → shared expert. Split out of [`run_moe_block`] because it runs
+    /// unchanged after *either* attention path — standard attention (via
+    /// `dlm_moe_attn`) or MLA (via `dlm_mla_attn` + `dlm_moe_norm`). Both leave
+    /// `normed2` in the same device scratch slot, which is the only state this
+    /// consumes, so DeepSeek-V2/V3's MLA + MoE reuses this verbatim.
+    fn run_moe_ffn(&self, layer: u32, w: &GpuWeights, d_hidden: &DeviceBuffer) -> Result<()> {
+        use std::ffi::c_void;
+        let cfg = &self.shared.cfg;
+        let m = cfg.moe.expect("run_moe_ffn on a dense model");
+        let GpuFfn::Moe {
+            router,
+            router_dtype,
+            router_group,
+            shared,
+            shared_gate,
+            shared_gate_dtype,
+            shared_gate_group,
+        } = &w.ffn
+        else {
+            unreachable!("run_moe_ffn on a dense layer");
+        };
 
         // 2. Router logits → host, then top-k + softmax on the host (matches CPU).
         let n_exp = m.num_experts as usize;
@@ -855,7 +921,9 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         }
         // Per-session K/V (owned by this sequence's KvLayerCache), so batched
         // requests sharing this kernel keep independent history.
-        let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens)?;
+        // MLA reconstructs K and V from one cached latent — no value cache.
+        let (kv_keys, kv_values) =
+            kv.gpu_kv(self.kv_capacity_tokens, self.shared.cfg.mla.is_none())?;
 
         // The hidden stays resident across the streamed stack: upload before the
         // first layer, chain through, download after the last — so only weights
@@ -867,55 +935,138 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
             d_hidden.upload(hidden)?;
         }
 
-        match &w.ffn {
-            GpuFfn::Dense(f) => {
-                // SAFETY: all pointers are live device allocations sized as the
-                // kernel expects; the KV buffers have capacity for `num_positions + 1`.
-                let code = unsafe {
-                    dlm_decode_block(
-                        cfg.hidden_size as i32,
-                        cfg.q_dim() as i32,
-                        kv_dim as i32,
-                        cfg.num_heads as i32,
-                        cfg.num_kv_heads as i32,
-                        cfg.head_dim as i32,
-                        cfg.intermediate_size as i32,
-                        cfg.rms_eps,
-                        w.w_dtype,
-                        w.w_group_size,
-                        w.q_proj.as_ptr() as *const std::ffi::c_void,
-                        w.k_proj.as_ptr() as *const std::ffi::c_void,
-                        w.v_proj.as_ptr() as *const std::ffi::c_void,
-                        w.o_proj.as_ptr() as *const std::ffi::c_void,
-                        f.gate.as_ptr() as *const std::ffi::c_void,
-                        f.up.as_ptr() as *const std::ffi::c_void,
-                        f.down.as_ptr() as *const std::ffi::c_void,
-                        w.input_layernorm.as_ptr(),
-                        w.post_attention_layernorm.as_ptr(),
-                        bias_ptr(&w.q_bias),
-                        bias_ptr(&w.k_bias),
-                        bias_ptr(&w.v_bias),
-                        bias_ptr(&w.q_norm),
-                        bias_ptr(&w.k_norm),
-                        self.inv_freq.as_ptr(),
-                        d_hidden.as_mut_ptr(),
-                        kv_keys,
-                        kv_values,
-                        num_positions as i32,
-                        position as i32,
-                        cfg.sliding_window.unwrap_or(0) as i32,
-                        cfg.activation.code(),
-                        crate::forward::cpu::rope_mscale(cfg.rope_scaling),
-                    )
-                };
-                if code != 0 {
-                    return Err(DlmError::Gpu { api: "dlm_decode_block", code });
+        // MLA (DeepSeek) runs attention as its own device call, then the FFN half —
+        // dense or routed — exactly as the standard-attention paths do. This is the
+        // GPU mirror of `decode_block_streaming_moe`, which branches attention on
+        // `w.mla` and then runs the same MoE FFN.
+        if let (Some(mcfg), Some(mw)) = (&cfg.mla, &w.mla) {
+            // SAFETY: all pointers are live device allocations of the sizes the
+            // kernel expects; `kv_keys` has capacity for `num_positions + 1` rows
+            // of `kv_lora_rank + qk_rope_head_dim` (MLA's `kv_dim`).
+            let code = unsafe {
+                dlm_mla_attn(
+                    cfg.hidden_size as i32,
+                    cfg.num_heads as i32,
+                    mcfg.q_lora_rank.unwrap_or(0) as i32,
+                    mcfg.kv_lora_rank as i32,
+                    mcfg.qk_nope_head_dim as i32,
+                    mcfg.qk_rope_head_dim as i32,
+                    mcfg.v_head_dim as i32,
+                    cfg.rms_eps,
+                    w.w_dtype,
+                    w.w_group_size,
+                    mw.q_a_proj.as_ref().map_or(std::ptr::null(), |b| b.as_ptr())
+                        as *const std::ffi::c_void,
+                    bias_ptr(&mw.q_a_layernorm),
+                    mw.q_b_proj.as_ptr() as *const std::ffi::c_void,
+                    mw.kv_a_proj.as_ptr() as *const std::ffi::c_void,
+                    mw.kv_a_layernorm.as_ptr(),
+                    mw.kv_b_proj.as_ptr() as *const std::ffi::c_void,
+                    w.o_proj.as_ptr() as *const std::ffi::c_void,
+                    w.input_layernorm.as_ptr(),
+                    self.mla_inv_freq
+                        .as_ref()
+                        .expect("mla_inv_freq present whenever cfg.mla is")
+                        .as_ptr(),
+                    crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                    d_hidden.as_mut_ptr(),
+                    kv_keys,
+                    num_positions as i32,
+                    position as i32,
+                )
+            };
+            if code != 0 {
+                return Err(DlmError::Gpu { api: "dlm_mla_attn", code });
+            }
+            match &w.ffn {
+                GpuFfn::Dense(f) => {
+                    let code = unsafe {
+                        dlm_dense_ffn(
+                            cfg.hidden_size as i32,
+                            cfg.intermediate_size as i32,
+                            cfg.rms_eps,
+                            f.w_dtype,
+                            f.w_group_size,
+                            f.gate.as_ptr() as *const std::ffi::c_void,
+                            f.up.as_ptr() as *const std::ffi::c_void,
+                            f.down.as_ptr() as *const std::ffi::c_void,
+                            w.post_attention_layernorm.as_ptr(),
+                            cfg.activation.code(),
+                            d_hidden.as_mut_ptr(),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu { api: "dlm_dense_ffn", code });
+                    }
+                }
+                GpuFfn::Moe { .. } => {
+                    // `dlm_mla_attn` folds the residual but leaves no FFN input;
+                    // this produces the `normed2` the router/experts consume.
+                    let code = unsafe {
+                        dlm_moe_norm(
+                            cfg.hidden_size as i32,
+                            cfg.rms_eps,
+                            w.post_attention_layernorm.as_ptr(),
+                            d_hidden.as_mut_ptr(),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu { api: "dlm_moe_norm", code });
+                    }
+                    self.run_moe_ffn(layer, &w, d_hidden)?;
                 }
             }
-            GpuFfn::Moe { .. } => {
-                self.run_moe_block(
-                    layer, &w, kv_keys, kv_values, d_hidden, num_positions, position,
-                )?;
+        } else {
+            match &w.ffn {
+                GpuFfn::Dense(f) => {
+                    // SAFETY: all pointers are live device allocations sized as the
+                    // kernel expects; the KV buffers have capacity for `num_positions + 1`.
+                    let code = unsafe {
+                        dlm_decode_block(
+                            cfg.hidden_size as i32,
+                            cfg.q_dim() as i32,
+                            kv_dim as i32,
+                            cfg.num_heads as i32,
+                            cfg.num_kv_heads as i32,
+                            cfg.head_dim as i32,
+                            cfg.intermediate_size as i32,
+                            cfg.rms_eps,
+                            w.w_dtype,
+                            w.w_group_size,
+                            w.q_proj.as_ptr() as *const std::ffi::c_void,
+                            w.k_proj.as_ptr() as *const std::ffi::c_void,
+                            w.v_proj.as_ptr() as *const std::ffi::c_void,
+                            w.o_proj.as_ptr() as *const std::ffi::c_void,
+                            f.gate.as_ptr() as *const std::ffi::c_void,
+                            f.up.as_ptr() as *const std::ffi::c_void,
+                            f.down.as_ptr() as *const std::ffi::c_void,
+                            w.input_layernorm.as_ptr(),
+                            w.post_attention_layernorm.as_ptr(),
+                            bias_ptr(&w.q_bias),
+                            bias_ptr(&w.k_bias),
+                            bias_ptr(&w.v_bias),
+                            bias_ptr(&w.q_norm),
+                            bias_ptr(&w.k_norm),
+                            self.inv_freq.as_ptr(),
+                            d_hidden.as_mut_ptr(),
+                            kv_keys,
+                            kv_values,
+                            num_positions as i32,
+                            position as i32,
+                            cfg.sliding_window.unwrap_or(0) as i32,
+                            cfg.activation.code(),
+                            crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu { api: "dlm_decode_block", code });
+                    }
+                }
+                GpuFfn::Moe { .. } => {
+                    self.run_moe_block(
+                        layer, &w, kv_keys, kv_values, d_hidden, num_positions, position,
+                    )?;
+                }
             }
         }
         // Bring the result back only after the last layer. `download` is a blocking

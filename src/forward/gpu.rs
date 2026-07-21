@@ -108,6 +108,17 @@ extern "C" {
         rope_mscale: f32,
     ) -> i32;
 
+    /// Post-attention norm for a MoE layer whose attention ran in a separate call
+    /// (the MLA path). Leaves the FFN input in the same scratch slot
+    /// [`dlm_moe_attn`] would, so the router/expert calls after it are identical
+    /// on either attention path.
+    pub(crate) fn dlm_moe_norm(
+        hidden_size: i32,
+        rms_eps: f32,
+        post_norm: *const f32,
+        x: *mut f32,
+    ) -> i32;
+
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
     /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
     pub(crate) fn dlm_moe_matvec(
@@ -228,18 +239,19 @@ struct GpuLayer {
     w_group_size: i32,
 }
 
-/// MLA attention projections resident in VRAM.
-struct GpuMla {
-    q_a_proj: Option<DeviceBuffer>,
-    q_a_layernorm: Option<DeviceBuffer>,
-    q_b_proj: DeviceBuffer,
-    kv_a_proj: DeviceBuffer,
-    kv_a_layernorm: DeviceBuffer,
-    kv_b_proj: DeviceBuffer,
+/// MLA attention projections resident in VRAM. Shared with the streaming kernel,
+/// which runs the same `dlm_mla_attn` call on a streamed layer core.
+pub(crate) struct GpuMla {
+    pub(crate) q_a_proj: Option<DeviceBuffer>,
+    pub(crate) q_a_layernorm: Option<DeviceBuffer>,
+    pub(crate) q_b_proj: DeviceBuffer,
+    pub(crate) kv_a_proj: DeviceBuffer,
+    pub(crate) kv_a_layernorm: DeviceBuffer,
+    pub(crate) kv_b_proj: DeviceBuffer,
 }
 
 impl GpuMla {
-    fn upload(mw: &crate::forward::MlaWeights) -> Result<Self> {
+    pub(crate) fn upload(mw: &crate::forward::MlaWeights) -> Result<Self> {
         let up = |w: &crate::forward::Weights| DeviceBuffer::from_bytes(w.as_bytes(), w.len());
         Ok(Self {
             q_a_proj: mw.q_a_proj.as_ref().map(up).transpose()?,
@@ -254,7 +266,7 @@ impl GpuMla {
 
 /// Upload a weight matrix, or a 1-element dummy for an intentionally-empty one
 /// (MLA layers leave q/k/v empty) — device allocators dislike zero-length buffers.
-fn upload_weight(w: &crate::forward::Weights) -> Result<DeviceBuffer> {
+pub(crate) fn upload_weight(w: &crate::forward::Weights) -> Result<DeviceBuffer> {
     if w.is_empty() {
         DeviceBuffer::from_slice(&[0.0])
     } else {
@@ -317,12 +329,15 @@ impl GpuKernel {
     /// Upload a model's weights to the device and allocate per-layer KV history
     /// buffers sized for up to `max_kv_tokens` positions.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>, max_kv_tokens: usize) -> Result<Self> {
-        // MLA + MoE on GPU (DeepSeek-V2/V3 full) needs the streamed MoE path with
-        // MLA, still pending; the resident kernel supports MLA with a dense FFN.
+        // The resident kernel has no routed-expert path at all (a `GpuLayer` holds
+        // one dense FFN), so MoE — with MLA or not — belongs to the streaming
+        // kernel, which caches experts per `(layer, expert)`. That path supports
+        // MLA + MoE, so this is a routing error, not a missing capability.
         if cfg.mla.is_some() && cfg.moe.is_some() {
             return Err(DlmError::InvalidConfig(
-                "MLA + MoE (DeepSeek-V2/V3) on the resident GPU kernel is not yet supported; \
-                 run on CPU (--device cpu)."
+                "MLA + MoE (DeepSeek-V2/V3) needs the streaming GPU path, which caches routed \
+                 experts per layer; the resident GPU kernel holds only a dense FFN per layer. \
+                 Run without --no-stream (or on CPU with --device cpu)."
                     .into(),
             ));
         }
@@ -395,7 +410,8 @@ impl ComputeKernel for GpuKernel {
 
         // Per-session K/V (owned by this sequence's KvLayerCache, not the shared
         // kernel), so concurrent batched requests keep independent history.
-        let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens)?;
+        // MLA reconstructs K and V from one cached latent — no value cache.
+        let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens, self.cfg.mla.is_none())?;
 
         // The hidden state stays resident on the device for the whole layer stack:
         // upload the host vector once before the first layer, chain every layer

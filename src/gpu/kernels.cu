@@ -525,6 +525,21 @@ extern "C" int dlm_moe_attn(
     return (int)e;
 }
 
+// Post-attention norm for a MoE layer whose attention ran in a *separate* call —
+// the MLA path, where `dlm_mla_attn` folds the attention residual into `x` but
+// (unlike `dlm_moe_attn`) leaves no FFN input behind. This produces exactly the
+// `normed2` that `dlm_moe_attn` step 1 would have, in the same scratch slot, so
+// the router/expert calls that follow are byte-identical on either attention
+// path. Mirrors the `rmsnorm(&h1, post_attention_layernorm)` that
+// `decode_block_streaming_moe` does between attention and `moe_ffn_streaming`.
+extern "C" int dlm_moe_norm(int hidden_size, float rms_eps, const float* post_norm, float* x)
+{
+    cudaError_t e = scratch_ensure(MOE_NORMED2, hidden_size);
+    if (e != cudaSuccess) return (int)e;
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, g_scratch[MOE_NORMED2], hidden_size, rms_eps);
+    return (int)cudaGetLastError();
+}
+
 // `y_host[0..out_dim] = W · normed2`, copied to the host. Used for the router
 // logits (out_dim = num_experts) and the shared expert's gate (out_dim = 1).
 extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_group_size,
