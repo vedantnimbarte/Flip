@@ -430,7 +430,7 @@ names. That covers:
 | Qwen2-MoE / Qwen3-MoE | supported — routed experts + optional sigmoid-gated shared expert |
 | GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
 | DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU. MLA + MoE runs on the streaming GPU path (the resident kernel holds no routed experts, so `--no-stream` refuses it) |
-| Gemma2 | **not supported** — needs attention logit softcapping + alternating sliding-window layers |
+| Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
 
 **MoE models** route each token through the top-k experts the router selects
 (softmax over all experts, then top-k, then renormalized — the Mixtral/Qwen

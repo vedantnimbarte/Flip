@@ -77,7 +77,8 @@ fn gpu_run_block_matches_cpu() {
         intermediate_size: 64,
         rope_theta: 10000.0,
         rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     let num_layers = 2u32;
 
     // Identical weights to both kernels.
@@ -140,7 +141,8 @@ fn gpu_batched_sessions_keep_independent_kv() {
         rms_eps: 1e-5,
         rope_scaling: None,
         moe: None, sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     let num_layers = 3u32;
     let layers = random_layers(&cfg, num_layers, 0xB0A7);
     // One kernel, shared by both sessions via `&gpu` (as the server shares it).
@@ -245,7 +247,8 @@ fn gpu_sliding_window_matches_cpu() {
         moe: None,
         sliding_window: Some(2),
         activation: dlm::forward::Activation::Silu, mla: None,
-    };
+            ..Default::default()
+        };
     let layers = random_layers(&cfg, 2, 0x5117);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "sliding-window");
 }
@@ -272,7 +275,8 @@ fn gpu_multi_gpu_matches_single_device() {
         sliding_window: None,
         activation: dlm::forward::Activation::Silu,
         mla: None,
-    };
+            ..Default::default()
+        };
     let num_layers = 4u32;
     let layers = random_layers(&cfg, num_layers, 0x11CE);
     let kv_cfg = KvCacheConfig {
@@ -328,7 +332,8 @@ fn gpu_mla_matches_cpu() {
         sliding_window: None,
         activation: dlm::forward::Activation::Silu,
         mla: Some(mla),
-    };
+            ..Default::default()
+        };
     let (nh, qk, latent, rope, vdim, ql) = (2usize, 8usize, 8usize, 4usize, 4usize, 12usize);
     let nope = 4usize;
     let mut rng = Rng::new(0xDEEB);
@@ -380,7 +385,8 @@ fn gpu_yarn_rope_matches_cpu() {
         moe: None,
         sliding_window: None,
         activation: dlm::forward::Activation::Silu, mla: None,
-    };
+            ..Default::default()
+        };
     let layers = random_layers(&cfg, 2, 0x7A54);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "yarn-rope");
 }
@@ -402,7 +408,8 @@ fn gpu_qk_norm_matches_cpu() {
         moe: None,
         sliding_window: None,
         activation: dlm::forward::Activation::Silu, mla: None,
-    };
+            ..Default::default()
+        };
     let mut layers = random_layers(&cfg, 2, 0x9317);
     for l in &mut layers {
         l.q_norm = Some((0..cfg.head_dim).map(|i| 0.9 + 0.02 * i as f32).collect());
@@ -427,7 +434,8 @@ fn gpu_gelu_activation_matches_cpu() {
         moe: None,
         sliding_window: None,
         activation: dlm::forward::Activation::GeluTanh, mla: None,
-    };
+            ..Default::default()
+        };
     let layers = random_layers(&cfg, 2, 0x6E10);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "gelu-activation");
 }
@@ -452,7 +460,8 @@ fn gpu_matches_cpu_with_int4_weights() {
         rope_theta: 10000.0,
         rms_eps: 1e-5,
         rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     // Quantize the same random weights both kernels would otherwise share.
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
         .into_iter()
@@ -491,7 +500,8 @@ fn gpu_matches_cpu_with_int8_weights() {
         rope_theta: 10000.0,
         rms_eps: 1e-5,
         rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
         .into_iter()
         .map(|mut l| {
@@ -530,7 +540,8 @@ fn gpu_matches_cpu_at_realistic_hidden_size() {
         rope_theta: 10000.0,
         rms_eps: 1e-5,
         rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     let layers = random_layers(&cfg, 2, 0xA11CE);
     assert_gpu_matches_cpu(cfg, layers, 2e-3, "hidden_size=2048");
 }
@@ -547,7 +558,8 @@ fn gpu_matches_cpu_with_qkv_biases() {
         rope_theta: 1_000_000.0,
         rms_eps: 1e-6,
         rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     let mut rng = Rng::new(0xB1A5);
     let mut layers = random_layers(&cfg, 2, 0xB1A5);
     for l in layers.iter_mut() {
@@ -577,7 +589,8 @@ fn gpu_matches_cpu_with_llama3_rope_scaling() {
             original_max_position: 8192.0,
         }),
         moe: None, sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     let layers = random_layers(&cfg, 2, 0x5CA1E);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "llama3 rope scaling");
 }
@@ -591,6 +604,7 @@ fn small_cfg() -> BlockConfig {
         intermediate_size: 64,
         rope_theta: 10000.0,
         rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+        ..Default::default()
     }
 }
 
@@ -719,7 +733,8 @@ fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
         rms_eps: 1e-5,
         rope_scaling: None,
         moe: Some(m), sliding_window: None, activation: Default::default(), mla: None,
-    };
+            ..Default::default()
+        };
     let num_layers = 6u32;
     let layers = random_moe_layers(&cfg, num_layers, 0x50FA);
 
@@ -782,6 +797,56 @@ fn gpu_moe_matches_cpu_with_shared_expert() {
     );
 }
 
+/// Gemma2 on the device: attention-logit softcap, a decoupled attention scale,
+/// alternating windowed/global layers, and the norm pair that moves
+/// `post_attention_layernorm` onto the attention *output*. All four are places
+/// the device block could silently disagree with `decode_block`, so this pins
+/// them together against the CPU oracle.
+#[test]
+fn gpu_gemma2_matches_cpu() {
+    let cfg = BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        activation: dlm::forward::Activation::GeluTanh,
+        // Window 2 with period 2 over 4 decoded tokens: layer 0 is windowed and
+        // actually clips, layer 1 sees full history.
+        sliding_window: Some(2),
+        sliding_window_pattern: Some(2),
+        attn_logit_softcap: Some(30.0),
+        query_pre_attn_scalar: Some(144.0),
+        gemma2_norms: true,
+        ..Default::default()
+    };
+    let mut rng = Rng::new(0x6E33A2);
+    let s = 0.05;
+    let h = cfg.hidden_size;
+    let layers: Vec<LayerTensors> = (0..4)
+        .map(|_| LayerTensors {
+            q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * h, s)),
+            k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+            v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+            o_proj: Weights::from_f32(rng.vec(h * cfg.q_dim(), s)),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
+                up: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
+                down: Weights::from_f32(rng.vec(h * cfg.intermediate_size, s)),
+            }),
+            // Non-uniform norms: a norm applied in the wrong place must show up.
+            input_layernorm: (0..h).map(|i| 1.0 + i as f32 * 0.002).collect(),
+            post_attention_layernorm: (0..h).map(|i| 0.8 + i as f32 * 0.003).collect(),
+            pre_feedforward_layernorm: Some((0..h).map(|i| 1.2 - i as f32 * 0.002).collect()),
+            post_feedforward_layernorm: Some((0..h).map(|i| 0.9 + i as f32 * 0.004).collect()),
+            ..Default::default()
+        })
+        .collect();
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "gemma2");
+}
+
 // ── MLA on the streaming GPU kernel ──────────────────────────────────────────
 //
 // The resident kernel covers MLA + a dense FFN (`gpu_mla_matches_cpu` above).
@@ -815,7 +880,8 @@ fn mla_test_config(moe: Option<MoeConfig>) -> (BlockConfig, MlaShape) {
             qk_rope_head_dim: shape.rope as u32,
             v_head_dim: shape.vdim as u32,
         }),
-    };
+            ..Default::default()
+        };
     (cfg, shape)
 }
 

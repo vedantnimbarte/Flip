@@ -242,15 +242,18 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
 // `sliding_window > 0` bounds attention to the last `sliding_window` positions
 // (Mistral); `0` is full causal attention. Mirrors `attention()` in
 // src/forward/cpu.rs (start = positions - window).
+// `scale` is passed in rather than derived from head_dim: Gemma2 decouples it
+// (`query_pre_attn_scalar`). `softcap > 0` squashes each logit through
+// `tanh(s/cap)*cap` before the softmax (Gemma2); 0 disables it. Both mirror
+// `attention()` in src/forward/cpu.rs.
 __global__ void attention_kernel(const float* q, const float* keys, const float* values,
                                  float* ctx, int num_heads, int num_kv_heads, int head_dim,
-                                 int positions, int sliding_window) {
+                                 int positions, int sliding_window, float scale, float softcap) {
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= num_heads) return;
     int group = num_heads / num_kv_heads;
     int kvh = h / group;
     int kv_dim = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
     const float* qh = q + h * head_dim;
     float* out = ctx + h * head_dim;
     int start = (sliding_window > 0 && positions > sliding_window)
@@ -263,6 +266,7 @@ __global__ void attention_kernel(const float* q, const float* keys, const float*
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
         dot *= scale;
+        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
         if (dot > maxv) maxv = dot;
     }
     for (int d = 0; d < head_dim; ++d) out[d] = 0.0f;
@@ -271,7 +275,9 @@ __global__ void attention_kernel(const float* q, const float* keys, const float*
         const float* kh = keys + (long)p * kv_dim + kvh * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
-        float e = expf(dot * scale - maxv);
+        dot *= scale;
+        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
+        float e = expf(dot - maxv);
         denom += e;
         const float* vh = values + (long)p * kv_dim + kvh * head_dim;
         for (int d = 0; d < head_dim; ++d) out[d] += e * vh[d];
@@ -379,10 +385,18 @@ extern "C" int dlm_decode_block(
     int num_positions, int position,
     int sliding_window,                    // 0 = full causal attention (Mistral SWA otherwise)
     int activation,                        // DLM_ACT_* gate activation (SiLU / GELU)
-    float rope_mscale)                     // YaRN attention temperature (1.0 otherwise)
+    float rope_mscale,                     // YaRN attention temperature (1.0 otherwise)
+    float attn_scale,                      // <=0: derive 1/sqrt(head_dim) as usual
+    float attn_softcap,                    // 0 = off (Gemma2 caps attention logits)
+    // Gemma2's extra norm pair; both NULL on every other architecture. When set,
+    // `post_norm` normalizes the *attention output* and `pre_ffn_norm` the FFN
+    // input, matching `decode_block` in src/forward/cpu.rs.
+    const float* pre_ffn_norm, const float* post_ffn_norm)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
+    if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
+    const int gemma2 = (pre_ffn_norm != 0);
 
     // Persistent scratch (allocated once, reused). Any cudaMalloc can fail (OOM is
     // the common case on a small card); bail out with the real error instead of
@@ -423,16 +437,21 @@ extern "C" int dlm_decode_block(
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
 
         // Attend over history + this token, reading the persistent buffers directly.
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window);
+        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
         launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
+        // Gemma2 norms the attention output before the residual add (in place, so
+        // the add below is unchanged); elsewhere it goes in raw.
+        if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
-        // MLP sublayer (SwiGLU).
-        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);
+        // MLP sublayer (SwiGLU). Gemma2 uses its dedicated pre-FFN norm here,
+        // since `post_norm` was already spent on the attention output.
+        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, gemma2 ? pre_ffn_norm : post_norm, normed2, hidden_size, rms_eps);
         launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
         launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size);
         swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
         launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size);
+        if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
         // No blocking cudaDeviceSynchronize here: all kernels run on the in-order
@@ -484,10 +503,13 @@ extern "C" int dlm_moe_attn(
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
     int num_positions, int position,
     int sliding_window,                    // 0 = full causal attention (Mistral SWA otherwise)
-    float rope_mscale)                     // YaRN attention temperature (1.0 otherwise)
+    float rope_mscale,                     // YaRN attention temperature (1.0 otherwise)
+    float attn_scale,                      // <=0: derive 1/sqrt(head_dim) as usual
+    float attn_softcap)                    // 0 = off (Gemma2 caps attention logits)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
+    if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
 
     cudaError_t e = cudaSuccess;
     #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
@@ -515,7 +537,7 @@ extern "C" int dlm_moe_attn(
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window);
+        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
         launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
         // FFN input, reused by the router matvec and every expert.

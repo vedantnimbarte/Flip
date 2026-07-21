@@ -701,8 +701,9 @@ mod tests {
             intermediate_size: 16,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         }
-    }
+}
 
     /// A source that counts how many times it actually materialized a layer.
     struct CountingSource(Vec<LayerTensors>, AtomicU64);

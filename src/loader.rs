@@ -324,12 +324,15 @@ pub struct ModelParts {
     pub kv_blocks: u32,
     /// Embedding scale (Gemma: `sqrt(hidden)`); `None` leaves embeddings unscaled.
     pub embed_scale: Option<f32>,
+    /// Gemma2 final-logit softcap; `None` elsewhere.
+    pub final_logit_softcap: Option<f32>,
 }
 
 impl ModelParts {
     /// Wrap the CPU kernel around these weights and build a generator.
     pub fn into_cpu_generator(self) -> Result<Generator<CpuKernel>> {
         let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
         let kernel = CpuKernel::new(self.cfg, self.layers)?;
         Ok(Generator::new(
             kernel,
@@ -341,7 +344,8 @@ impl ModelParts {
             self.kv_config,
             self.kv_blocks,
         )?
-        .with_embed_scale(embed_scale))
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
     }
 
     /// Upload every layer to VRAM and build a generator over the GPU kernel.
@@ -349,6 +353,7 @@ impl ModelParts {
     pub fn into_gpu_generator(self) -> Result<Generator<crate::forward::GpuKernel>> {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
         let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
         Ok(Generator::new(
             kernel,
@@ -360,7 +365,8 @@ impl ModelParts {
             self.kv_config,
             self.kv_blocks,
         )?
-        .with_embed_scale(embed_scale))
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
     }
 
     /// Split the model's layers across `gpu_ids` and build a generator over a
@@ -374,6 +380,7 @@ impl ModelParts {
     ) -> Result<Generator<crate::forward::MultiGpuKernel>> {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
         let kernel = crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
         Ok(Generator::new(
             kernel,
@@ -385,7 +392,8 @@ impl ModelParts {
             self.kv_config,
             self.kv_blocks,
         )?
-        .with_embed_scale(embed_scale))
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
@@ -399,6 +407,7 @@ impl ModelParts {
         gpu_ids: &[u32],
     ) -> Result<Generator<PipelineParallelKernel<CpuKernel>>> {
         let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
         let kernel = PipelineParallelKernel::new(CpuKernel::new(self.cfg, self.layers)?, gpu_ids)?;
         Ok(Generator::new(
             kernel,
@@ -410,7 +419,8 @@ impl ModelParts {
             self.kv_config,
             self.kv_blocks,
         )?
-        .with_embed_scale(embed_scale))
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
     }
 }
 
@@ -440,6 +450,10 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         sliding_window: config.sliding_window.map(|w| w as usize),
         activation: config.activation,
         mla: config.mla,
+        sliding_window_pattern: config.sliding_window_pattern,
+        attn_logit_softcap: config.attn_logit_softcap,
+        query_pre_attn_scalar: config.query_pre_attn_scalar,
+        gemma2_norms: config.gemma2_norms,
     }
 }
 
@@ -467,6 +481,21 @@ fn load_norm(store: &MmapStore, name: &str, len: usize, add_one: bool) -> Result
         }
     }
     Ok(v)
+}
+
+/// [`load_norm`] for a norm the checkpoint may not ship (Gemma2's FFN norm pair).
+/// Absent is `None`, not an error — but the `(1 + w)` bake still applies when
+/// present, which is why this can't just be [`load_optional`].
+fn load_norm_optional(
+    store: &MmapStore,
+    name: &str,
+    len: usize,
+    add_one: bool,
+) -> Result<Option<Vec<f32>>> {
+    if store.locate(name).is_none() {
+        return Ok(None);
+    }
+    load_norm(store, name, len, add_one).map(Some)
 }
 
 /// Like [`load_layer_tensors`], but `include_experts = false` loads only the MoE
@@ -528,6 +557,19 @@ pub(crate) fn load_layer_tensors_opt(
             q_norm: load_optional(store, &name("self_attn.q_norm.weight"), cfg.head_dim)?,
             k_norm: load_optional(store, &name("self_attn.k_norm.weight"), cfg.head_dim)?,
             mla: None,
+            // Gemma2's extra norm pair; absent on every other architecture.
+            pre_feedforward_layernorm: load_norm_optional(
+                store,
+                &name("pre_feedforward_layernorm.weight"),
+                hidden,
+                norm_add_one,
+            )?,
+            post_feedforward_layernorm: load_norm_optional(
+                store,
+                &name("post_feedforward_layernorm.weight"),
+                hidden,
+                norm_add_one,
+            )?,
         }
     };
     tensors.validate(cfg)?;
@@ -761,6 +803,7 @@ struct StreamingPieces {
     kv_config: KvCacheConfig,
     kv_blocks: u32,
     embed_scale: Option<f32>,
+    final_logit_softcap: Option<f32>,
 }
 
 /// Load the pinned pieces (embedding, final norm, LM head, KV sizing) and bind a
@@ -806,6 +849,7 @@ fn load_streaming_pieces(
         kv_config,
         kv_blocks,
         embed_scale: config.embed_scale,
+        final_logit_softcap: config.final_logit_softcap,
     })
 }
 
@@ -843,7 +887,8 @@ pub fn build_streaming_generator(
         p.kv_config,
         p.kv_blocks,
     )?
-    .with_embed_scale(p.embed_scale))
+    .with_embed_scale(p.embed_scale)
+    .with_final_logit_softcap(p.final_logit_softcap))
 }
 
 /// GPU counterpart of [`build_streaming_generator`]: stream a window of layer
@@ -883,7 +928,8 @@ pub fn build_streaming_gpu_generator(
         p.kv_config,
         p.kv_blocks,
     )?
-    .with_embed_scale(p.embed_scale))
+    .with_embed_scale(p.embed_scale)
+    .with_final_logit_softcap(p.final_logit_softcap))
 }
 
 /// Materialize a checkpoint into [`ModelParts`] (host `f32` weights + shapes).
@@ -944,5 +990,6 @@ pub fn load_model_parts(
         kv_config,
         kv_blocks,
         embed_scale: config.embed_scale,
+        final_logit_softcap: config.final_logit_softcap,
     })
 }

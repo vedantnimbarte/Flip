@@ -119,6 +119,20 @@ struct RawConfig {
     /// `sliding_window` positions; absent/`null` means full causal attention.
     #[serde(default)]
     sliding_window: Option<u32>,
+    /// Gemma2 applies its window to every `n`-th layer rather than all of them.
+    /// HF omits this and hard-codes 2 in the model class, so it is defaulted for
+    /// `model_type == "gemma2"`.
+    #[serde(default)]
+    sliding_window_pattern: Option<u32>,
+    /// Gemma2 attention-logit softcap (`tanh(score/cap)*cap`); typically 50.0.
+    #[serde(default)]
+    attn_logit_softcapping: Option<f32>,
+    /// Gemma2 output-logit softcap applied to the LM head; typically 30.0.
+    #[serde(default)]
+    final_logit_softcapping: Option<f32>,
+    /// Gemma2 decouples the attention scale from `head_dim` (144 on the 27B).
+    #[serde(default)]
+    query_pre_attn_scalar: Option<f32>,
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -485,6 +499,19 @@ pub struct ModelConfig {
     pub embed_scale: Option<f32>,
     /// Gated-MLP activation (SiLU for most, GELU for Gemma).
     pub activation: crate::forward::cpu::Activation,
+    /// Gemma2 windows only every `n`-th layer instead of all of them; `None`
+    /// applies [`sliding_window`](Self::sliding_window) uniformly.
+    pub sliding_window_pattern: Option<u32>,
+    /// Gemma2 attention-logit softcap (`tanh(score/cap)*cap`).
+    pub attn_logit_softcap: Option<f32>,
+    /// Gemma2 LM-head logit softcap, applied to the final logits before sampling.
+    pub final_logit_softcap: Option<f32>,
+    /// Attention-scale divisor when decoupled from `head_dim` (Gemma2).
+    pub query_pre_attn_scalar: Option<f32>,
+    /// Gemma2 carries an extra pre/post-FFN norm pair per layer, which also
+    /// changes where the other two norms apply (see
+    /// [`LayerTensors::is_gemma2_style`](crate::forward::LayerTensors::is_gemma2_style)).
+    pub gemma2_norms: bool,
 }
 
 impl ModelConfig {
@@ -574,16 +601,11 @@ impl ModelConfig {
         let mla = build_mla_config(&raw)?;
 
         // Gemma architecture variants: (1+w) RMSNorm, embedding scaling, GeGLU.
+        // Gemma2 adds logit softcapping, alternating window layers, a decoupled
+        // attention scale, and a second norm pair per layer.
         let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
-        if model_type == "gemma2" {
-            return Err(DlmError::InvalidConfig(
-                "Gemma2 is not yet supported: it needs attention logit softcapping, \
-                 alternating sliding-window layers, and pre/post-FFN norms. Gemma (v1) works \
-                 and other norm variants are refused rather than silently mis-run."
-                    .into(),
-            ));
-        }
-        let is_gemma = model_type == "gemma";
+        let is_gemma2 = model_type == "gemma2";
+        let is_gemma = model_type == "gemma" || is_gemma2;
         let activation = match raw.hidden_activation.as_deref() {
             Some(a) if a.to_ascii_lowercase().contains("gelu") => {
                 crate::forward::cpu::Activation::GeluTanh
@@ -625,6 +647,17 @@ impl ModelConfig {
             norm_add_one: is_gemma,
             embed_scale: is_gemma.then(|| (raw.hidden_size as f32).sqrt()),
             activation,
+            // HF hard-codes the alternation in the Gemma2 model class rather than
+            // the config (`is_sliding = not bool(layer_idx % 2)`), so default it
+            // here instead of requiring a key the checkpoints don't ship.
+            sliding_window_pattern: raw
+                .sliding_window_pattern
+                .or(if is_gemma2 { Some(2) } else { None })
+                .filter(|&n| n > 1),
+            attn_logit_softcap: raw.attn_logit_softcapping.filter(|c| *c > 0.0),
+            final_logit_softcap: raw.final_logit_softcapping.filter(|c| *c > 0.0),
+            query_pre_attn_scalar: raw.query_pre_attn_scalar.filter(|s| *s > 0.0),
+            gemma2_norms: is_gemma2,
         };
 
         config.validate()?;
@@ -807,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma_sets_norm_embed_activation_and_refuses_gemma2() {
+    fn gemma_sets_norm_embed_and_activation() {
         use crate::forward::cpu::Activation;
         let gemma = br#"{"model_type":"gemma","hidden_size":16,"num_attention_heads":4,
             "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64,
@@ -825,10 +858,40 @@ mod tests {
         assert_eq!(c.embed_scale, None);
         assert_eq!(c.activation, Activation::Silu);
 
-        // Gemma2 is refused (needs softcap + alternating windows + extra norms).
+        // Gemma2 inherits the Gemma norm/embed/activation rules.
         let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
             "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
-        assert!(ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).is_err());
+        let c = ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).unwrap();
+        assert!(c.norm_add_one, "Gemma2 also uses (1+w) RMSNorm");
+        assert_eq!(c.embed_scale, Some(4.0));
+        assert_eq!(c.activation, Activation::GeluTanh);
+    }
+
+    /// Gemma2's distinguishing hyperparameters: alternating window layers (HF
+    /// hard-codes the period at 2 rather than shipping a config key), attention
+    /// and final logit softcaps, a decoupled attention scale, and the extra norm
+    /// pair. None of these may leak onto Gemma v1 or Llama.
+    #[test]
+    fn gemma2_sets_softcaps_window_pattern_and_norms() {
+        let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":4,"vocab_size":32,"intermediate_size":64,
+            "sliding_window":4096,"attn_logit_softcapping":50.0,
+            "final_logit_softcapping":30.0,"query_pre_attn_scalar":144.0}"#;
+        let c = ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.sliding_window, Some(4096));
+        assert_eq!(c.sliding_window_pattern, Some(2), "HF hard-codes a period of 2");
+        assert_eq!(c.attn_logit_softcap, Some(50.0));
+        assert_eq!(c.final_logit_softcap, Some(30.0));
+        assert_eq!(c.query_pre_attn_scalar, Some(144.0));
+        assert!(c.gemma2_norms, "Gemma2 carries the pre/post-FFN norm pair");
+
+        // Gemma v1 gets none of it — same family, different block.
+        let gemma = br#"{"model_type":"gemma","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
+        let c = ModelConfig::from_json_bytes(gemma, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.sliding_window_pattern, None);
+        assert_eq!(c.attn_logit_softcap, None);
+        assert!(!c.gemma2_norms);
     }
 
     #[test]

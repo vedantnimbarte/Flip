@@ -103,6 +103,9 @@ struct GpuWeights {
     /// set, `q_proj`/`k_proj`/`v_proj` are unused dummies and attention runs
     /// through `dlm_mla_attn` instead.
     mla: Option<GpuMla>,
+    /// Gemma2's extra FFN norm pair; `None` elsewhere.
+    pre_ffn_norm: Option<DeviceBuffer>,
+    post_ffn_norm: Option<DeviceBuffer>,
     /// Native dtype of the attention projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -207,6 +210,8 @@ impl GpuWeights {
             // The staged fast path is standard-attention only; MLA layers take
             // `upload_sync` (their projection set doesn't fit this layout).
             mla: None,
+            pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
+            post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
         })
@@ -266,6 +271,8 @@ impl GpuWeights {
             q_norm: upload_bias(t.q_norm.as_ref())?,
             k_norm: upload_bias(t.k_norm.as_ref())?,
             mla: t.mla.as_ref().map(GpuMla::upload).transpose()?,
+            pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
+            post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
             w_dtype,
             w_group_size,
         })
@@ -745,6 +752,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 position as i32,
                 cfg.sliding_window.unwrap_or(0) as i32,
                 crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                cfg.attn_scale(),
+                cfg.attn_logit_softcap.unwrap_or(0.0),
             )
         };
         if code != 0 {
@@ -1056,6 +1065,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                             cfg.sliding_window.unwrap_or(0) as i32,
                             cfg.activation.code(),
                             crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                            cfg.attn_scale(),
+                            cfg.attn_logit_softcap.unwrap_or(0.0),
+                            bias_ptr(&w.pre_ffn_norm),
+                            bias_ptr(&w.post_ffn_norm),
                         )
                     };
                     if code != 0 {

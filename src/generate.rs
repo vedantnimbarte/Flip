@@ -250,6 +250,10 @@ pub struct Generator<K: ComputeKernel> {
     /// Scalar applied to each token embedding after lookup (Gemma multiplies by
     /// `sqrt(hidden)`); `None` leaves embeddings unscaled.
     embed_scale: Option<f32>,
+    /// Gemma2 caps the final logits at `tanh(l/cap)*cap` before sampling, which
+    /// changes the distribution (it compresses the tail toward the cap), so it is
+    /// part of correctness rather than a stylistic knob. `None` elsewhere.
+    final_logit_softcap: Option<f32>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -290,6 +294,7 @@ impl<K: ComputeKernel> Generator<K> {
             kv_total_blocks,
             kv_quant: crate::forward::KvQuant::None,
             embed_scale: None,
+            final_logit_softcap: None,
         })
     }
 
@@ -304,6 +309,12 @@ impl<K: ComputeKernel> Generator<K> {
     /// `None` leaves them unscaled.
     pub fn with_embed_scale(mut self, scale: Option<f32>) -> Self {
         self.embed_scale = scale;
+        self
+    }
+
+    /// Cap the final logits at `tanh(l/cap)*cap` before sampling (Gemma2).
+    pub fn with_final_logit_softcap(mut self, cap: Option<f32>) -> Self {
+        self.final_logit_softcap = cap.filter(|c| *c > 0.0);
         self
     }
 
@@ -344,7 +355,13 @@ impl<K: ComputeKernel> Generator<K> {
     /// Project a hidden state to vocabulary logits via final norm + LM head.
     fn logits(&self, hidden: &[f32]) -> Vec<f32> {
         let normed = rmsnorm(hidden, &self.final_norm, self.rms_eps);
-        matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size)
+        let mut out = matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
+        if let Some(cap) = self.final_logit_softcap {
+            for l in out.iter_mut() {
+                *l = (*l / cap).tanh() * cap;
+            }
+        }
+        out
     }
 
     /// Greedy-decode a **batch** of prompts together, advancing all sequences
@@ -604,6 +621,7 @@ mod tests {
             intermediate_size: 4,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         // One identity (zero-weight) block: hidden passes through unchanged.
         let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
@@ -628,6 +646,37 @@ mod tests {
             block_size: 16,
         };
         Generator::new(kernel, embedding, final_norm, lm_head, vocab, 1e-5, kv_config, 8).unwrap()
+    }
+
+    /// Gemma2's final-logit softcap squashes logits through `tanh(l/cap)*cap`
+    /// before sampling. It must compress the spread (that is the whole point —
+    /// it changes the sampled distribution) while leaving the ranking intact,
+    /// since `tanh` is monotonic.
+    #[test]
+    fn final_logit_softcap_compresses_without_reordering() {
+        let hidden = vec![0.4f32, -0.7, 0.15, 0.9];
+        let plain = counting_generator();
+        let raw = plain.logits(&hidden);
+
+        let capped_gen = counting_generator().with_final_logit_softcap(Some(0.5));
+        let capped = capped_gen.logits(&hidden);
+
+        assert_eq!(raw.len(), capped.len());
+        // Every capped logit is inside ±cap, and strictly smaller in magnitude
+        // wherever the raw logit had any real magnitude.
+        for (r, c) in raw.iter().zip(&capped) {
+            assert!(c.abs() <= 0.5 + 1e-6, "logit {c} escaped the cap");
+            if r.abs() > 1e-3 {
+                assert!(c.abs() < r.abs(), "cap should shrink {r} but gave {c}");
+            }
+        }
+        // Monotonic ⇒ argmax (and the whole ranking) is unchanged.
+        assert_eq!(argmax(&raw), argmax(&capped));
+
+        // A non-positive cap is treated as "off", not as a divide-by-zero.
+        let off = counting_generator().with_final_logit_softcap(Some(0.0));
+        assert_eq!(off.logits(&hidden), raw);
+        assert_eq!(counting_generator().with_final_logit_softcap(None).logits(&hidden), raw);
     }
 
     #[test]
@@ -725,6 +774,7 @@ mod tests {
             intermediate_size: 32,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut r = SplitMix64::new(42);
         let mut vec = |n: usize| -> Vec<f32> {
