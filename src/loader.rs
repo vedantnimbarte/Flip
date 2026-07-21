@@ -640,9 +640,10 @@ fn load_expert(
 /// `include_experts` is false — the GPU streaming core defers them to its
 /// per-`(layer, expert)` cache), and any shared expert.
 ///
-/// ponytail: the router is quantized like the rest under `--quant`. Routers are
-/// small and precision-sensitive; if int4 routing measurably flips top-k on real
-/// models, load it native instead. Left uniform until measured.
+/// The router loads in the checkpoint's native precision even under `--quant`
+/// (see below) — it is tiny and precision-sensitive, so quantizing it can flip
+/// top-k routing. A packed GPTQ/AWQ checkpoint is the one exception: its router
+/// ships as calibrated int4 codes with no float to fall back to.
 pub(crate) fn load_moe_ffn(
     store: &MmapStore,
     cfg: &BlockConfig,
