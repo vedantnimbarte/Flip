@@ -69,6 +69,14 @@ extern "C" {
         activation: i32,
         // YaRN attention temperature folded into cos/sin; 1.0 otherwise.
         rope_mscale: f32,
+        // Attention score scale; <= 0 means the usual 1/sqrt(head_dim).
+        attn_scale: f32,
+        // Gemma2 attention-logit softcap; 0 = off.
+        attn_softcap: f32,
+        // Gemma2's extra norm pair; NULL elsewhere. When set they also change
+        // what `post_norm` means — see `decode_block` in cpu.rs.
+        pre_ffn_norm: *const f32,
+        post_ffn_norm: *const f32,
     ) -> i32;
 
     /// MoE layer, part 1: attention sublayer + post-attn norm. Leaves `normed2`
@@ -106,6 +114,10 @@ extern "C" {
         sliding_window: i32,
         // YaRN attention temperature folded into cos/sin; 1.0 otherwise.
         rope_mscale: f32,
+        // Attention score scale; <= 0 means the usual 1/sqrt(head_dim).
+        attn_scale: f32,
+        // Gemma2 attention-logit softcap; 0 = off.
+        attn_softcap: f32,
     ) -> i32;
 
     /// Post-attention norm for a MoE layer whose attention ran in a separate call
@@ -233,6 +245,10 @@ struct GpuLayer {
     /// MLA (DeepSeek) attention projections; `None` for standard attention (when
     /// set, `q_proj`/`k_proj`/`v_proj` are unused dummies).
     mla: Option<GpuMla>,
+    /// Gemma2's extra FFN norm pair; `None` elsewhere. Their presence switches
+    /// the device block to the Gemma2 norm placement.
+    pre_ffn_norm: Option<DeviceBuffer>,
+    post_ffn_norm: Option<DeviceBuffer>,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -298,6 +314,8 @@ impl GpuLayer {
             q_norm: upload_bias(t.q_norm.as_ref())?,
             k_norm: upload_bias(t.k_norm.as_ref())?,
             mla: t.mla.as_ref().map(GpuMla::upload).transpose()?,
+            pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
+            post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
             w_dtype,
             w_group_size,
         })
@@ -517,6 +535,10 @@ impl ComputeKernel for GpuKernel {
                         self.cfg.sliding_window.unwrap_or(0) as i32,
                         self.cfg.activation.code(),
                         crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
+                        self.cfg.attn_scale(),
+                        self.cfg.attn_logit_softcap.unwrap_or(0.0),
+                        bias_ptr(&w.pre_ffn_norm),
+                        bias_ptr(&w.post_ffn_norm),
                     )
                 };
                 if code != 0 {

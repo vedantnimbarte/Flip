@@ -110,6 +110,7 @@ fn tiny_cfg() -> BlockConfig {
         intermediate_size: 16,
         rope_theta: 10000.0,
         rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+        sliding_window_pattern: None, attn_logit_softcap: None, query_pre_attn_scalar: None, gemma2_norms: false,
     }
 }
 
@@ -427,6 +428,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         intermediate_size: args.intermediate_size,
         rope_theta: 10000.0,
         rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+        ..Default::default()
     };
 
     // Small random weights (RMSNorm keeps activations bounded).
@@ -467,6 +469,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         kv_config,
         kv_blocks,
         embed_scale: None,
+        final_logit_softcap: None,
     })
 }
 

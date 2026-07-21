@@ -82,6 +82,24 @@ pub struct BlockConfig {
     /// `window` positions. `None` is full causal attention. Bounds only the
     /// attention *read*, not KV storage.
     pub sliding_window: Option<usize>,
+    /// Gemma2 alternates windowed and global attention layers instead of applying
+    /// [`sliding_window`](Self::sliding_window) to all of them. `Some(n)` means a
+    /// layer is windowed only when `layer % n == 0` (Gemma2 ships `n = 2`, so
+    /// even layers are local and odd layers see full history). `None` applies the
+    /// window uniformly. Resolve per layer with [`Self::window_for_layer`].
+    pub sliding_window_pattern: Option<u32>,
+    /// Gemma2 caps attention logits at `tanh(score / cap) * cap` before the
+    /// softmax, bounding the scores a long context can produce. `None` elsewhere.
+    pub attn_logit_softcap: Option<f32>,
+    /// Divisor for the attention scale, when the model decouples it from
+    /// `head_dim` (Gemma2's `query_pre_attn_scalar` — 144 on the 27B while
+    /// `head_dim` is 128). `None` uses `head_dim`, the usual `1/sqrt(d)`.
+    pub query_pre_attn_scalar: Option<f32>,
+    /// The config declares the Gemma2 norm layout, so every layer **must** carry
+    /// the pre/post-FFN norm pair. Checked in
+    /// [`LayerTensors::validate`]: without it the block would silently fall back
+    /// to the Llama norm placement and produce quietly wrong output.
+    pub gemma2_norms: bool,
     /// Gated-MLP activation: SiLU (SwiGLU) for Llama/Mistral/Qwen, GELU (GeGLU)
     /// for Gemma. Defaults to SiLU.
     pub activation: Activation,
@@ -110,6 +128,40 @@ impl BlockConfig {
     /// Query heads per KV head (the GQA grouping factor).
     pub fn group_size(&self) -> usize {
         self.num_heads / self.num_kv_heads.max(1)
+    }
+
+    /// The sliding window that applies to `layer`, resolving Gemma2's alternating
+    /// pattern. With no pattern the window is uniform (Mistral); with `Some(n)`
+    /// only layers where `layer % n == 0` are windowed and the rest attend the
+    /// full history.
+    ///
+    /// Returned rather than stored so a kernel can specialize its (`Copy`)
+    /// `BlockConfig` per layer without threading a layer index through the whole
+    /// attention path.
+    pub fn window_for_layer(&self, layer: u32) -> Option<usize> {
+        match self.sliding_window_pattern {
+            Some(n) if n > 0 && layer % n != 0 => None,
+            _ => self.sliding_window,
+        }
+    }
+
+    /// This block's `BlockConfig` with the sliding window resolved for `layer`.
+    /// Kernels call this once per `run_block` so everything downstream — CPU
+    /// attention and the device kernels alike — reads one already-correct window.
+    pub fn for_layer(&self, layer: u32) -> Self {
+        Self {
+            sliding_window: self.window_for_layer(layer),
+            // A resolved config must not re-resolve: the window above is final.
+            sliding_window_pattern: None,
+            ..*self
+        }
+    }
+
+    /// Attention score scale: `1/sqrt(query_pre_attn_scalar)` when the model
+    /// decouples it from `head_dim` (Gemma2), else the usual `1/sqrt(head_dim)`.
+    pub fn attn_scale(&self) -> f32 {
+        let d = self.query_pre_attn_scalar.unwrap_or(self.head_dim as f32);
+        1.0 / d.max(1.0).sqrt()
     }
 }
 
@@ -472,6 +524,13 @@ pub struct LayerTensors {
     /// before RoPE. Qwen3 ships these (and drops the Qwen2 biases); `None` elsewhere.
     pub q_norm: Option<Vec<f32>>, // [head_dim]
     pub k_norm: Option<Vec<f32>>, // [head_dim]
+    /// Gemma2's extra pair of FFN norms. Their presence marks the **Gemma2 block
+    /// structure**, which differs from Llama/Gemma1 in where norms sit: Gemma2
+    /// normalizes each sublayer's *output* before the residual add and keeps a
+    /// separate pre-FFN norm, so `post_attention_layernorm` means "after
+    /// attention" here rather than "before the FFN". See [`decode_block`].
+    pub pre_feedforward_layernorm: Option<Vec<f32>>, // [hidden]
+    pub post_feedforward_layernorm: Option<Vec<f32>>, // [hidden]
     /// Multi-head Latent Attention projections (DeepSeek). When set, the attention
     /// sublayer takes the MLA path and `q_proj`/`k_proj`/`v_proj` are unused.
     pub mla: Option<MlaWeights>,
@@ -524,6 +583,22 @@ impl LayerTensors {
             + bias(&self.v_bias)
     }
 
+    /// Whether this layer uses the **Gemma2 block structure** — norms on each
+    /// sublayer's output, plus a dedicated pre-FFN norm — rather than the
+    /// Llama/Gemma1 shape where `post_attention_layernorm` is the pre-FFN norm.
+    /// Keyed on the extra norm pair, which only Gemma2 checkpoints carry.
+    pub fn is_gemma2_style(&self) -> bool {
+        self.pre_feedforward_layernorm.is_some()
+    }
+
+    /// The norm applied to the FFN's input: Gemma2's dedicated
+    /// `pre_feedforward_layernorm`, else `post_attention_layernorm`.
+    pub fn ffn_input_norm(&self) -> &[f32] {
+        self.pre_feedforward_layernorm
+            .as_deref()
+            .unwrap_or(&self.post_attention_layernorm)
+    }
+
     /// The dense FFN triple, or an error if this layer is MoE. Used by GPU paths
     /// that do not yet route experts; the streaming GPU kernel handles MoE
     /// separately via its per-expert cache.
@@ -554,6 +629,39 @@ impl LayerTensors {
 
     /// Validate every matrix against the config's expected dimensions.
     pub fn validate(&self, cfg: &BlockConfig) -> Result<()> {
+        // A Gemma2 config against a checkpoint without the FFN norm pair would
+        // fall back to the Llama norm placement and run quietly wrong, so refuse
+        // rather than guess (and refuse the reverse, which is just as wrong).
+        if cfg.gemma2_norms != self.is_gemma2_style() {
+            return Err(DlmError::InvalidConfig(format!(
+                "config declares gemma2_norms = {} but the layer {} the \
+                 pre/post-FFN norm pair Gemma2 requires; the two norm layouts place \
+                 `post_attention_layernorm` differently and are not interchangeable",
+                cfg.gemma2_norms,
+                if self.is_gemma2_style() { "carries" } else { "lacks" },
+            )));
+        }
+        if self.is_gemma2_style() {
+            for (name, norm) in [
+                ("pre_feedforward_layernorm", &self.pre_feedforward_layernorm),
+                ("post_feedforward_layernorm", &self.post_feedforward_layernorm),
+            ] {
+                match norm {
+                    Some(v) if v.len() == cfg.hidden_size => {}
+                    Some(v) => {
+                        return Err(DlmError::ShapeMismatch {
+                            expected: cfg.hidden_size,
+                            got: v.len(),
+                        })
+                    }
+                    None => {
+                        return Err(DlmError::InvalidConfig(format!(
+                            "Gemma2 layer is missing {name}"
+                        )))
+                    }
+                }
+            }
+        }
         if let Some(m) = &cfg.mla {
             return self.validate_mla(cfg, m);
         }
@@ -1481,7 +1589,7 @@ fn add_bias(v: &mut [f32], bias: Option<&Vec<f32>>) {
 /// Returns the concatenated per-head context (`q_dim` long).
 fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
     let d = cfg.head_dim;
-    let scale = 1.0 / (d as f32).sqrt();
+    let scale = cfg.attn_scale();
     let group = cfg.group_size();
     let positions = kv.len();
     // Sliding-window attention (Mistral): a query attends only the most recent
@@ -1501,6 +1609,12 @@ fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
         let mut scores = vec![0.0f32; positions - start];
         for (j, score) in scores.iter_mut().enumerate() {
             *score = kv.key_head_dot(start + j, kv_head, d, qh) * scale;
+        }
+        // Gemma2 squashes logits into ±cap before the softmax.
+        if let Some(cap) = cfg.attn_logit_softcap {
+            for score in scores.iter_mut() {
+                *score = (*score / cap).tanh() * cap;
+            }
         }
         softmax_inplace(&mut scores);
 
@@ -1632,8 +1746,12 @@ pub fn decode_block(
     };
 
     // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
-    let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
-    let ffn_out = match &w.ffn {
+    // The FFN's input norm is `pre_feedforward_layernorm` on Gemma2 (whose
+    // `post_attention_layernorm` was already spent on the attention output) and
+    // `post_attention_layernorm` everywhere else.
+    let ffn_norm = w.ffn_input_norm();
+    let normed2 = rmsnorm(&h1, ffn_norm, cfg.rms_eps);
+    let mut ffn_out = match &w.ffn {
         Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size, cfg.activation),
         Ffn::Moe { router, experts, shared, shared_gate } => moe_ffn(
             router,
@@ -1645,6 +1763,10 @@ pub fn decode_block(
         )?,
     };
 
+    // Gemma2 also normalizes the FFN output before the residual add.
+    if let Some(post_ffn) = &w.post_feedforward_layernorm {
+        ffn_out = rmsnorm(&ffn_out, post_ffn, cfg.rms_eps);
+    }
     for (h, d) in h1.iter_mut().zip(&ffn_out) {
         *h += *d;
     }
@@ -1692,8 +1814,14 @@ fn attention_sublayer(
 
     kv.append(&k, &v)?;
     let ctx = attention(cfg, &q, kv);
-    let attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
+    let mut attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
 
+    // Gemma2 normalizes the attention *output* before folding it into the
+    // residual; elsewhere `post_attention_layernorm` is the pre-FFN norm and the
+    // attention output goes in raw. See `LayerTensors::pre_feedforward_layernorm`.
+    if w.is_gemma2_style() {
+        attn_out = rmsnorm(&attn_out, &w.post_attention_layernorm, cfg.rms_eps);
+    }
     Ok(hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect())
 }
 
@@ -1725,8 +1853,11 @@ where
         Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
         None => attention_sublayer(cfg, w, hidden, kv, position)?,
     };
-    let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
-    let ffn_out = moe_ffn_streaming(router, shared, shared_gate, &normed2, cfg, fetch_expert)?;
+    let normed2 = rmsnorm(&h1, w.ffn_input_norm(), cfg.rms_eps);
+    let mut ffn_out = moe_ffn_streaming(router, shared, shared_gate, &normed2, cfg, fetch_expert)?;
+    if let Some(post_ffn) = &w.post_feedforward_layernorm {
+        ffn_out = rmsnorm(&ffn_out, post_ffn, cfg.rms_eps);
+    }
     for (h, d) in h1.iter_mut().zip(&ffn_out) {
         *h += *d;
     }
@@ -1781,7 +1912,9 @@ impl ComputeKernel for CpuKernel {
         kv: &mut KvLayerCache,
         position: usize,
     ) -> Result<()> {
-        let out = decode_block(&self.cfg, &self.layers[layer as usize], hidden, kv, position)?;
+        // Resolve Gemma2's alternating window for this layer; a no-op elsewhere.
+        let cfg = self.cfg.for_layer(layer);
+        let out = decode_block(&cfg, &self.layers[layer as usize], hidden, kv, position)?;
         hidden.copy_from_slice(&out);
         Ok(())
     }
@@ -1819,6 +1952,7 @@ mod tests {
             sliding_window: None,
             activation: Default::default(),
             mla: None,
+            ..Default::default()
         };
         approx(&attention(&cfg, &[1.0, 0.0], &kv), &attention(&cfg, &[1.0, 0.0], &fresh), 1e-6);
         kv.truncate(10); // beyond len → no-op
@@ -1853,6 +1987,7 @@ mod tests {
             rope_scaling: None,
             moe: None,
             sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         // Four cached positions with distinct K/V.
         let fill = |from: usize| {
@@ -1878,6 +2013,180 @@ mod tests {
         let mut win_big = base;
         win_big.sliding_window = Some(10);
         approx(&attention(&win_big, &q, &kv_all), &full, 1e-6);
+    }
+
+    /// Gemma2 alternates local and global layers: with a period of 2 the even
+    /// layers are windowed and the odd ones see the whole history. Without a
+    /// pattern the window applies to every layer (Mistral).
+    #[test]
+    fn window_pattern_alternates_layers() {
+        let mut cfg = BlockConfig { sliding_window: Some(128), ..Default::default() };
+        assert_eq!(cfg.window_for_layer(0), Some(128), "uniform: every layer windowed");
+        assert_eq!(cfg.window_for_layer(1), Some(128));
+
+        cfg.sliding_window_pattern = Some(2);
+        assert_eq!(cfg.window_for_layer(0), Some(128), "even layers are local");
+        assert_eq!(cfg.window_for_layer(1), None, "odd layers see full history");
+        assert_eq!(cfg.window_for_layer(2), Some(128));
+        assert_eq!(cfg.window_for_layer(3), None);
+
+        // `for_layer` bakes the decision in and must not re-resolve afterwards.
+        let l1 = cfg.for_layer(1);
+        assert_eq!(l1.sliding_window, None);
+        assert_eq!(l1.window_for_layer(0), None, "already resolved; stays resolved");
+
+        // No window at all: the pattern is irrelevant.
+        let none = BlockConfig { sliding_window_pattern: Some(2), ..Default::default() };
+        assert_eq!(none.window_for_layer(0), None);
+    }
+
+    /// Gemma2 squashes attention logits through `tanh(s/cap)*cap` before the
+    /// softmax. The cap must bound the pre-softmax scores (so extreme logits
+    /// saturate instead of dominating) and must be a no-op when unset.
+    #[test]
+    fn attn_logit_softcap_bounds_scores() {
+        // Large, well-separated keys produce a near one-hot softmax uncapped.
+        let mut kv = KvLayerCache::new(2);
+        kv.append(&[40.0, 0.0], &[1.0, 0.0]).unwrap();
+        kv.append(&[0.0, 0.0], &[0.0, 1.0]).unwrap();
+        let q = [1.0f32, 0.0];
+
+        let plain = BlockConfig {
+            hidden_size: 2, num_heads: 1, num_kv_heads: 1, head_dim: 2,
+            rms_eps: 1e-5, ..Default::default()
+        };
+        let capped = BlockConfig { attn_logit_softcap: Some(1.0), ..plain };
+
+        let a = attention(&plain, &q, &kv);
+        let b = attention(&capped, &q, &kv);
+        // Uncapped, position 0 wins almost totally; capped, the gap is squashed
+        // so position 1 keeps real weight.
+        assert!(a[0] > 0.99, "uncapped should be ~one-hot on position 0, got {a:?}");
+        assert!(b[0] < a[0] - 0.05, "softcap should pull the winner down: {b:?} vs {a:?}");
+        assert!(b[1] > 0.05, "softcap should leave position 1 real weight, got {b:?}");
+
+        // A cap far above the scores changes nothing measurable.
+        let loose = BlockConfig { attn_logit_softcap: Some(1e6), ..plain };
+        approx(&attention(&loose, &q, &kv), &a, 1e-4);
+    }
+
+    /// Build a tiny dense layer; `gemma2` adds the FFN norm pair that switches
+    /// the block to the Gemma2 norm placement.
+    fn tiny_layer(h: usize, inter: usize, gemma2: bool) -> LayerTensors {
+        let lin = |n: usize, seed: f32| {
+            Weights::from_f32((0..n).map(|i| ((i as f32 * seed) % 0.7) - 0.35).collect())
+        };
+        LayerTensors {
+            q_proj: lin(h * h, 0.11),
+            k_proj: lin(h * h, 0.13),
+            v_proj: lin(h * h, 0.17),
+            o_proj: lin(h * h, 0.19),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: lin(inter * h, 0.23),
+                up: lin(inter * h, 0.29),
+                down: lin(h * inter, 0.31),
+            }),
+            input_layernorm: (0..h).map(|i| 1.0 + i as f32 * 0.01).collect(),
+            // Deliberately not all-ones: a norm applied in the wrong place must
+            // change the result, or the test proves nothing.
+            post_attention_layernorm: (0..h).map(|i| 0.7 + i as f32 * 0.03).collect(),
+            pre_feedforward_layernorm: gemma2
+                .then(|| (0..h).map(|i| 1.3 - i as f32 * 0.02).collect()),
+            post_feedforward_layernorm: gemma2
+                .then(|| (0..h).map(|i| 0.9 + i as f32 * 0.05).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// Gemma2 normalizes the **attention output** with `post_attention_layernorm`
+    /// before the residual add, where Llama/Gemma1 feed the attention output in
+    /// raw and spend that norm on the FFN input instead. Pinned against the
+    /// non-Gemma2 run of the same weights.
+    #[test]
+    fn gemma2_norms_the_attention_output() {
+        let (h, inter) = (4usize, 6usize);
+        let cfg = BlockConfig {
+            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
+            intermediate_size: inter, rope_theta: 10000.0, rms_eps: 1e-5,
+            ..Default::default()
+        };
+        let x: Vec<f32> = (0..h).map(|i| 0.2 + i as f32 * 0.1).collect();
+
+        let plain = tiny_layer(h, inter, false);
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let plain_h1 = attention_sublayer(&cfg, &plain, &x, &mut kv, 0).unwrap();
+        // Llama shape folds the attention output in raw, so recover it.
+        let attn_out: Vec<f32> = plain_h1.iter().zip(&x).map(|(a, b)| a - b).collect();
+
+        let g2 = tiny_layer(h, inter, true);
+        let cfg2 = BlockConfig { gemma2_norms: true, ..cfg };
+        let mut kv2 = KvLayerCache::new(cfg2.kv_dim());
+        let g2_h1 = attention_sublayer(&cfg2, &g2, &x, &mut kv2, 0).unwrap();
+
+        // Same attention, but normed before the residual add.
+        let normed = rmsnorm(&attn_out, &g2.post_attention_layernorm, cfg.rms_eps);
+        let expected: Vec<f32> = x.iter().zip(&normed).map(|(a, b)| a + b).collect();
+        approx(&g2_h1, &expected, 1e-5);
+        assert!(
+            g2_h1.iter().zip(&plain_h1).any(|(a, b)| (a - b).abs() > 1e-4),
+            "the two norm layouts must not coincide, or this proves nothing"
+        );
+    }
+
+    /// The FFN half: Gemma2 norms the FFN input with `pre_feedforward_layernorm`
+    /// (not `post_attention_layernorm`, already spent above) and norms the FFN
+    /// *output* before the residual add.
+    #[test]
+    fn gemma2_norms_the_ffn_input_and_output() {
+        let (h, inter) = (4usize, 6usize);
+        let cfg = BlockConfig {
+            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
+            intermediate_size: inter, rope_theta: 10000.0, rms_eps: 1e-5,
+            gemma2_norms: true,
+            ..Default::default()
+        };
+        let w = tiny_layer(h, inter, true);
+        let x: Vec<f32> = (0..h).map(|i| 0.2 + i as f32 * 0.1).collect();
+
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let got = decode_block(&cfg, &w, &x, &mut kv, 0).unwrap();
+
+        // Reference: attention half (checked above), then the FFN in Gemma2 order.
+        let mut kv_ref = KvLayerCache::new(cfg.kv_dim());
+        let h1 = attention_sublayer(&cfg, &w, &x, &mut kv_ref, 0).unwrap();
+        let normed = rmsnorm(&h1, w.pre_feedforward_layernorm.as_ref().unwrap(), cfg.rms_eps);
+        let ffn = swiglu_ffn(w.dense_ffn().unwrap(), &normed, h, inter, cfg.activation);
+        let ffn = rmsnorm(&ffn, w.post_feedforward_layernorm.as_ref().unwrap(), cfg.rms_eps);
+        let expected: Vec<f32> = h1.iter().zip(&ffn).map(|(a, b)| a + b).collect();
+        approx(&got, &expected, 1e-5);
+    }
+
+    /// A Gemma2 config against a checkpoint without the norm pair (or vice versa)
+    /// would run with the wrong norm placement, so it is refused, not guessed.
+    #[test]
+    fn mismatched_gemma2_norm_layout_is_refused() {
+        let (h, inter) = (4usize, 6usize);
+        let cfg = BlockConfig {
+            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
+            intermediate_size: inter, rms_eps: 1e-5, gemma2_norms: true,
+            ..Default::default()
+        };
+        assert!(tiny_layer(h, inter, false).validate(&cfg).is_err(), "gemma2 cfg, plain layer");
+        let plain_cfg = BlockConfig { gemma2_norms: false, ..cfg };
+        assert!(tiny_layer(h, inter, true).validate(&plain_cfg).is_err(), "plain cfg, gemma2 layer");
+        // Matching pairs are fine.
+        assert!(tiny_layer(h, inter, true).validate(&cfg).is_ok());
+        assert!(tiny_layer(h, inter, false).validate(&plain_cfg).is_ok());
+    }
+
+    /// `query_pre_attn_scalar` decouples the attention scale from `head_dim`
+    /// (Gemma2-27B: scale by 144 while head_dim is 128).
+    #[test]
+    fn query_pre_attn_scalar_overrides_head_dim_scale() {
+        let cfg = BlockConfig { head_dim: 4, ..Default::default() };
+        approx(&[cfg.attn_scale()], &[0.5], 1e-6); // 1/sqrt(4)
+        let scaled = BlockConfig { query_pre_attn_scalar: Some(16.0), ..cfg };
+        approx(&[scaled.attn_scale()], &[0.25], 1e-6); // 1/sqrt(16), not 1/sqrt(4)
     }
 
     fn approx(a: &[f32], b: &[f32], eps: f32) {
@@ -2032,6 +2341,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let hidden = vec![1.5, -2.0, 0.5, 3.0];
 
@@ -2068,6 +2378,7 @@ mod tests {
             intermediate_size: 2,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
@@ -2086,6 +2397,7 @@ mod tests {
             intermediate_size: 2,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
@@ -2104,6 +2416,7 @@ mod tests {
             intermediate_size: 6,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -2138,6 +2451,7 @@ mod tests {
             intermediate_size: 8,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
@@ -2179,6 +2493,7 @@ mod tests {
             intermediate_size: 8,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
@@ -2204,6 +2519,7 @@ mod tests {
             intermediate_size: 4,
             rope_theta: 10000.0,
             rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -2224,8 +2540,9 @@ mod tests {
             rms_eps: 1e-5,
             rope_scaling: None,
             moe: Some(m), sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         }
-    }
+}
 
     #[test]
     fn route_topk_selects_highest_and_renormalizes() {
