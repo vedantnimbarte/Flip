@@ -746,7 +746,9 @@ inference engine):
     the weights, the other the KV history.
   - `--prefix-cache-size N` — cache up to `N` prompt-prefix KV snapshots so
     requests sharing a prefix (e.g. a common system prompt) skip re-prefilling it.
-    Each entry holds its prefix's KV in RAM; `0` disables it.
+    Each entry holds its prefix's KV in RAM; `0` disables it. Works on CPU and
+    GPU: snapshots are host-side, so on the GPU path the device K/V is copied back
+    when a snapshot is taken and re-uploaded when one is resumed.
 
   **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a
